@@ -78,6 +78,8 @@ struct AccountStatus {
     reset_7d: Option<u64>,
     #[serde(default)]
     total_tokens: u64,
+    #[serde(default)]
+    cooldown_until_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -512,6 +514,22 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
             lines.push(Line::from(vec![
                 Span::styled("   ", style_dim()),
                 Span::styled(email.as_str(), style_dim()),
+            ]));
+        }
+
+        // Cooldown countdown (only when actively cooling)
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if acc.cooldown_until_ms > now_ms {
+            let remaining_ms = acc.cooldown_until_ms - now_ms;
+            lines.push(Line::from(vec![
+                Span::styled("   ⏸ cooldown  ", style_yellow()),
+                Span::styled(
+                    format!("resumes in {}", fmt_duration_ms(remaining_ms)),
+                    style_yellow(),
+                ),
             ]));
         }
 
