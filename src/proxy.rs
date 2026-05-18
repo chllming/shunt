@@ -879,6 +879,96 @@ pub async fn recovery_watcher(
     }
 }
 
+/// Sends a single lightweight prefetch request for `account` immediately after its
+/// cooldown expires, so the router has fresh rate-limit headers before the next
+/// real request arrives.
+async fn post_cooldown_prefetch(
+    client: &reqwest::Client,
+    account: &crate::config::AccountConfig,
+    token: &str,
+    state: &StateStore,
+    upstream_url: &str,
+) {
+    let Some((path, body)) = account.provider.prefetch_request() else {
+        if let Some(probe_path) = account.provider.auth_probe_get_path() {
+            auth_probe_get(client, probe_path, account, state).await;
+        }
+        return;
+    };
+    let url = format!("{upstream_url}{path}");
+    match prefetch_send(client, &url, &account.provider, token, &body).await {
+        Ok(r) => {
+            if let Some(info) = account.provider.parse_rate_limits(r.headers()) {
+                state.update_rate_limits(&account.name, info);
+                tracing::info!(account = %account.name, "post-cooldown prefetch: quota refreshed");
+            }
+        }
+        Err(e) => warn!(account = %account.name, "post-cooldown prefetch failed: {e}"),
+    }
+}
+
+/// Watches for account cooldowns expiring and triggers a post-cooldown prefetch
+/// so each account re-enters rotation with fresh rate-limit metrics.
+///
+/// Analogous to `recovery_watcher` (which handles `auth_failed` accounts), but
+/// for timed cooldowns (429 / 529 / 401 / 403 backoffs). Sleeps precisely until
+/// the next cooldown deadline rather than polling at a fixed interval.
+pub async fn cooldown_watcher(
+    config: Arc<Config>,
+    state: StateStore,
+    credentials: LiveCredentials,
+) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap_or_default();
+
+    // In-memory: the cooldown_until_ms value we already ran a post-resume for.
+    // Prevents re-triggering on every poll after expiry.
+    let mut last_resumed: HashMap<String, u64> = HashMap::new();
+
+    loop {
+        let states = state.account_states();
+        let now = now_ms();
+        let mut next_wake_ms: Option<u64> = None;
+
+        for account in &config.accounts {
+            let Some(st) = states.get(&account.name) else { continue };
+            if st.disabled { continue; } // auth_failed or permanently disabled
+            let cdl = st.cooldown_until_ms;
+            if cdl == 0 { continue; } // never entered cooldown
+
+            if cdl <= now {
+                // Cooldown expired — skip if we already handled this exact deadline
+                let handled = last_resumed.get(&account.name).map(|&t| t >= cdl).unwrap_or(false);
+                if !handled {
+                    tracing::info!(account = %account.name, "cooldown expired — strong resume prefetch");
+                    let token = {
+                        let creds = credentials.read().await;
+                        creds.get(&account.name).map(|c| c.access_token.clone())
+                    };
+                    if let Some(token) = token {
+                        post_cooldown_prefetch(
+                            &client, account, &token, &state,
+                            &config.server.upstream_url,
+                        ).await;
+                    }
+                    last_resumed.insert(account.name.clone(), cdl);
+                }
+            } else {
+                // Still cooling — schedule wake at expiry
+                next_wake_ms = Some(next_wake_ms.map(|m| m.min(cdl)).unwrap_or(cdl));
+            }
+        }
+
+        // Sleep exactly until the next cooldown expires; fall back to 30s poll
+        let sleep_ms = next_wake_ms
+            .map(|wake| wake.saturating_sub(now_ms()).max(50))
+            .unwrap_or(30_000);
+        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+    }
+}
+
 fn notify_all_accounts_offline() {
     #[cfg(target_os = "macos")]
     {
