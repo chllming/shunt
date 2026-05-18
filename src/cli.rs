@@ -115,6 +115,18 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Watch a remote shunt instance and fire local notifications on account events
+    ///
+    /// Examples:
+    ///   shunt remote http://myserver:8082
+    ///   shunt remote http://myserver:8082 --interval 30
+    Remote {
+        /// Base URL of the remote shunt proxy (e.g. http://myserver:8082)
+        url: String,
+        /// Poll interval in seconds (default: 10)
+        #[arg(long, default_value = "10")]
+        interval: u64,
+    },
     /// Update shunt to the latest release
     Update,
     /// Pin routing to a specific account, or restore automatic routing
@@ -170,6 +182,7 @@ pub async fn run() -> Result<()> {
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
         Command::Logout { config, name, all } => cmd_logout(config, name, all).await,
         Command::Monitor { config } => cmd_monitor(config).await,
+        Command::Remote { url, interval } => cmd_remote(url, interval).await,
         Command::Update => cmd_update().await,
         Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
         Command::Use { config, account } => cmd_use(config, account).await,
@@ -1878,6 +1891,14 @@ async fn cmd_monitor(config_override: Option<PathBuf>) -> Result<()> {
     }
 
     crate::monitor::run_monitor(&base_url).await
+}
+
+// ---------------------------------------------------------------------------
+// remote
+// ---------------------------------------------------------------------------
+
+async fn cmd_remote(url: String, interval: u64) -> Result<()> {
+    crate::remote::run_remote(url, interval).await
 }
 
 // update
