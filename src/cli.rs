@@ -115,17 +115,17 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Watch a remote shunt instance and fire local notifications on account events
+    /// Watch a remote shunt instance and fire local system notifications
+    ///
+    /// Run with no arguments on the machine running shunt to get a watch code,
+    /// then enter that code on another device to receive notifications there.
     ///
     /// Examples:
-    ///   shunt remote http://myserver:8082
-    ///   shunt remote http://myserver:8082 --interval 30
+    ///   shunt remote                  — host: generate a watch code
+    ///   shunt remote RM-a3f2b1c4...  — client: connect with a watch code
     Remote {
-        /// Base URL of the remote shunt proxy (e.g. http://myserver:8082)
-        url: String,
-        /// Poll interval in seconds (default: 10)
-        #[arg(long, default_value = "10")]
-        interval: u64,
+        /// Watch code from `shunt remote` on the host. Omit to start hosting.
+        code: Option<String>,
     },
     /// Update shunt to the latest release
     Update,
@@ -182,7 +182,7 @@ pub async fn run() -> Result<()> {
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
         Command::Logout { config, name, all } => cmd_logout(config, name, all).await,
         Command::Monitor { config } => cmd_monitor(config).await,
-        Command::Remote { url, interval } => cmd_remote(url, interval).await,
+        Command::Remote { code } => cmd_remote(code).await,
         Command::Update => cmd_update().await,
         Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
         Command::Use { config, account } => cmd_use(config, account).await,
@@ -1897,8 +1897,18 @@ async fn cmd_monitor(config_override: Option<PathBuf>) -> Result<()> {
 // remote
 // ---------------------------------------------------------------------------
 
-async fn cmd_remote(url: String, interval: u64) -> Result<()> {
-    crate::remote::run_remote(url, interval).await
+async fn cmd_remote(code: Option<String>) -> Result<()> {
+    // Host mode needs the local shunt URL; client mode only needs the relay URL.
+    let (relay_url, local_url) = if code.is_none() {
+        let config = crate::config::load_config(None)?;
+        let local = format!("http://{}:{}", config.server.host, config.server.port);
+        let relay = config.server.relay_url.clone();
+        (Some(relay), local)
+    } else {
+        let relay_url = std::env::var("SHUNT_RELAY_URL").ok();
+        (relay_url, String::new())
+    };
+    crate::remote::run_remote(code, relay_url, local_url).await
 }
 
 // update

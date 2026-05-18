@@ -40,6 +40,23 @@ pub fn generate_code() -> String {
     format!("SH-{}", hex::encode(bytes))
 }
 
+/// Generate a random remote-watch code like `RM-a3f2b1c4d5e6f7a8b9`.
+pub fn generate_remote_code() -> String {
+    let bytes = crate::oauth::rand_bytes::<9>();
+    format!("RM-{}", hex::encode(bytes))
+}
+
+/// Validate that a remote-watch code looks like what we generated.
+pub fn validate_remote_code(code: &str) -> Result<()> {
+    if !code.starts_with("RM-") || code.len() != 21 {
+        anyhow::bail!("Invalid remote code format. Expected RM-<18 hex chars>.");
+    }
+    if !code[3..].chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("Invalid remote code — must be hex characters after 'RM-'.");
+    }
+    Ok(())
+}
+
 /// Validate that a code looks like what we generated.
 pub fn validate_code(code: &str) -> Result<()> {
     if !code.starts_with("SH-") || code.len() != 21 {
@@ -133,6 +150,37 @@ pub async fn push_to_relay(code: &str, payload: &str, relay_url: &str) -> Result
     }
 
     Ok(())
+}
+
+/// Encrypt arbitrary bytes with the given code; returns a base64 payload string.
+/// Uses the same AES-256-GCM scheme as `encrypt_bundle`.
+pub fn encrypt_bytes(data: &[u8], code: &str) -> Result<String> {
+    let key_bytes = derive_key(code);
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let nonce_bytes = crate::oauth::rand_bytes::<12>();
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, data)
+        .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?;
+    let mut wire = Vec::with_capacity(12 + ciphertext.len());
+    wire.extend_from_slice(&nonce_bytes);
+    wire.extend_from_slice(&ciphertext);
+    Ok(B64.encode(wire))
+}
+
+/// Decrypt a base64 payload into bytes using the given code.
+pub fn decrypt_bytes(payload_b64: &str, code: &str) -> Result<Vec<u8>> {
+    let wire = B64.decode(payload_b64).context("invalid base64 in payload")?;
+    if wire.len() < 12 { anyhow::bail!("payload too short"); }
+    let (nonce_bytes, ciphertext) = wire.split_at(12);
+    let key_bytes = derive_key(code);
+    let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| anyhow::anyhow!("decryption failed — wrong code or corrupted payload"))
 }
 
 /// Download and delete the encrypted payload for the given code from the relay.

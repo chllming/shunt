@@ -1,42 +1,56 @@
-/// `shunt remote <url>` — polls a remote shunt /status endpoint and fires
-/// local system notifications when account state changes (rate limits, reauth
-/// required, cooldown resumed, all offline).
+/// `shunt remote` — relay-based remote account event watcher.
+///
+/// **Host mode** (`shunt remote`):
+///   - Generates a one-time watch code (`RM-…`)
+///   - Polls the local shunt `/status` every 10 s
+///   - Encrypts the snapshot and pushes it to the relay
+///   - Prints the code so the user can enter it on another device
+///
+/// **Client mode** (`shunt remote RM-…`):
+///   - Polls the relay for the latest encrypted snapshot
+///   - Decrypts and diffs against the previous poll
+///   - Fires local system notifications on account events
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use serde::Deserialize;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::term::{bold, cyan, dim, fmt_duration_ms, green, red, yellow};
 
 // ---------------------------------------------------------------------------
-// /status response types (subset of what the server sends)
+// Relay URL default
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Clone)]
-struct AccountStatus {
-    name: String,
+const DEFAULT_RELAY: &str = "https://relay.ramcharan.shop";
+
+// ---------------------------------------------------------------------------
+// Snapshot types (serialized + encrypted over the relay)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AccountStatus {
+    pub name: String,
     #[serde(default)]
-    available: bool,
+    pub available: bool,
     #[serde(default)]
-    disabled: bool,
+    pub disabled: bool,
     #[serde(default)]
-    auth_failed: bool,
+    pub auth_failed: bool,
     #[serde(default)]
-    cooldown_until_ms: u64,
+    pub cooldown_until_ms: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct StatusResponse {
-    #[serde(default)]
+#[derive(Debug, Serialize, Deserialize)]
+struct RemoteSnapshot {
     accounts: Vec<AccountStatus>,
+    ts_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
-// State snapshot for diffing
+// State snapshot for diffing (client side)
 // ---------------------------------------------------------------------------
 
-/// Point-in-time snapshot of a single account, computed at each poll.
 #[derive(Debug, Clone)]
 struct Snap {
     available: bool,
@@ -61,81 +75,170 @@ impl Snap {
 // Thresholds
 // ---------------------------------------------------------------------------
 
-/// Cooldowns shorter than this are transient noise — no notification.
+const POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// Cooldowns shorter than this are transient — skip notification.
 const LONG_COOLDOWN_MS: u64 = 5 * 60_000;
 /// Minimum gap between "all accounts offline" notifications.
 const ALL_OFFLINE_NOTIFY_COOLDOWN: Duration = Duration::from_secs(3_600);
 
 // ---------------------------------------------------------------------------
-// Entry point
+// Entry point — dispatches host vs client
 // ---------------------------------------------------------------------------
 
-pub async fn run_remote(base_url: String, interval_secs: u64) -> Result<()> {
-    let status_url = format!("{}/status", base_url.trim_end_matches('/'));
+pub async fn run_remote(code: Option<String>, relay_url: Option<String>, local_url: String) -> Result<()> {
+    let relay = relay_url.unwrap_or_else(|| DEFAULT_RELAY.to_string());
+    match code {
+        None        => run_host(relay, local_url).await,
+        Some(code)  => run_client(code, relay).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host mode
+// ---------------------------------------------------------------------------
+
+async fn run_host(relay_url: String, local_url: String) -> Result<()> {
+    let code = crate::sync::generate_remote_code();
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    print_header(&base_url, interval_secs);
+    println!();
+    println!("  {}  {}  {}", bold("◆"), bold("shunt"), dim("remote  host"));
+    println!();
+    println!("  {}  {}", dim("code"), cyan(&code));
+    println!("  {}  on another device run:", dim("·"));
+    println!("  {}  {}", dim("·"), bold(&format!("shunt remote {code}")));
+    println!();
+    println!("  {}  watching local accounts — Ctrl-C to stop", dim("·"));
+    println!();
+
+    loop {
+        match fetch_local_status(&client, &local_url).await {
+            Ok(accounts) => {
+                let snapshot = RemoteSnapshot { accounts, ts_ms: now_ms() };
+                let data = serde_json::to_vec(&snapshot)?;
+                let payload = crate::sync::encrypt_bytes(&data, &code)?;
+
+                let push_url = format!("{relay_url}/watch/{code}");
+                match client
+                    .put(&push_url)
+                    .json(&serde_json::json!({ "payload": payload }))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {}
+                    Ok(r) => {
+                        let status = r.status();
+                        eprintln!("  {}  relay push failed: {status}", red("✗"));
+                    }
+                    Err(e) => eprintln!("  {}  relay unreachable: {e}", red("✗")),
+                }
+            }
+            Err(e) => eprintln!("  {}  local shunt unreachable: {e}", red("✗")),
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client mode
+// ---------------------------------------------------------------------------
+
+async fn run_client(code: String, relay_url: String) -> Result<()> {
+    crate::sync::validate_remote_code(&code)
+        .context("invalid remote code")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    println!();
+    println!("  {}  {}  {}", bold("◆"), bold("shunt"), dim("remote  client"));
+    println!("  {}  {}", dim("·"), cyan(&relay_url));
+    println!("  {}  connecting…", dim("·"));
+    println!();
 
     let mut prev: HashMap<String, Snap> = HashMap::new();
     let mut first_poll = true;
-    let mut was_unreachable = false;
+    let mut was_session_missing = false;
 
-    // Throttle state — prevent duplicate notifications for the same event.
-    // Maps account name → cooldown_until_ms we already notified about.
+    // Throttle state
     let mut notified_cooldown: HashMap<String, u64> = HashMap::new();
-    // Accounts we have already fired a "reauth required" notification for.
     let mut notified_auth_failed: HashSet<String> = HashSet::new();
-    // Timestamp of the last "all offline" notification.
     let mut last_all_offline: Option<Instant> = None;
-    // Whether all accounts were unavailable on the previous poll.
     let mut was_all_offline = false;
 
     loop {
-        let now_ms = now_ms();
-
-        match fetch_status(&client, &status_url).await {
-            Ok(status) => {
-                if was_unreachable {
-                    println!("  {}  reconnected to {}", green("✓"), cyan(&base_url));
-                    was_unreachable = false;
+        let poll_url = format!("{relay_url}/watch/{code}");
+        match client.get(&poll_url).send().await {
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                if !was_session_missing {
+                    println!("  {}  session not found — waiting for host…", yellow("⏸"));
+                    was_session_missing = true;
+                }
+            }
+            Ok(resp) if resp.status().is_success() => {
+                if was_session_missing {
+                    println!("  {}  host connected", green("✓"));
+                    was_session_missing = false;
                 }
 
+                let body: serde_json::Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(e) => { eprintln!("  {}  bad relay response: {e}", red("✗")); continue; }
+                };
+
+                let payload = match body["payload"].as_str() {
+                    Some(p) => p.to_owned(),
+                    None => { eprintln!("  {}  relay response missing payload", red("✗")); continue; }
+                };
+
+                let data = match crate::sync::decrypt_bytes(&payload, &code) {
+                    Ok(d) => d,
+                    Err(e) => { eprintln!("  {}  decryption failed: {e}", red("✗")); continue; }
+                };
+
+                let snapshot: RemoteSnapshot = match serde_json::from_slice(&data) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("  {}  snapshot parse error: {e}", red("✗")); continue; }
+                };
+
+                let now = now_ms();
+
                 if first_poll {
-                    // Initialise snapshot; print current state but no notifications.
-                    print_initial_state(&status.accounts, now_ms);
-                    for acc in &status.accounts {
-                        prev.insert(acc.name.clone(), Snap::from_status(acc, now_ms));
+                    print_initial_state(&snapshot.accounts, now);
+                    for acc in &snapshot.accounts {
+                        prev.insert(acc.name.clone(), Snap::from_status(acc, now));
                     }
                     first_poll = false;
                 } else {
                     diff_and_notify(
-                        &status.accounts,
+                        &snapshot.accounts,
                         &prev,
-                        now_ms,
+                        now,
                         &mut notified_cooldown,
                         &mut notified_auth_failed,
                         &mut last_all_offline,
                         &mut was_all_offline,
                     );
-                    // Rebuild snapshot for next cycle.
                     prev.clear();
-                    for acc in &status.accounts {
-                        prev.insert(acc.name.clone(), Snap::from_status(acc, now_ms));
+                    for acc in &snapshot.accounts {
+                        prev.insert(acc.name.clone(), Snap::from_status(acc, now));
                     }
                 }
             }
+            Ok(resp) => {
+                eprintln!("  {}  relay error: {}", red("✗"), resp.status());
+            }
             Err(e) => {
-                if !was_unreachable {
-                    println!("  {}  cannot reach {}  ·  {}", red("✗"), base_url, dim(&e.to_string()));
-                    was_unreachable = true;
-                }
+                eprintln!("  {}  cannot reach relay: {e}", red("✗"));
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -167,7 +270,6 @@ fn diff_and_notify(
             crate::notify::notify("shunt: Reauth Required", &msg, "Basso");
             notified_auth_failed.insert(acc.name.clone());
         }
-        // Clear flag when the account recovers so we can notify again next time.
         if !acc.auth_failed {
             notified_auth_failed.remove(&acc.name);
         }
@@ -179,15 +281,10 @@ fn diff_and_notify(
             let last_cdl = notified_cooldown.get(&acc.name).copied().unwrap_or(0);
             if remaining_ms >= LONG_COOLDOWN_MS && acc.cooldown_until_ms != last_cdl {
                 let mins = remaining_ms / 60_000;
-                let msg = format!(
-                    "Account '{}' hit quota limit — cooling {}m.",
-                    acc.name, mins
-                );
+                let msg = format!("Account '{}' hit quota limit — cooling {}m.", acc.name, mins);
                 println!(
                     "  {}  [{}]  rate limited — cooling {}",
-                    yellow("⏸"),
-                    yellow(&acc.name),
-                    yellow(&fmt_duration_ms(remaining_ms)),
+                    yellow("⏸"), yellow(&acc.name), yellow(&fmt_duration_ms(remaining_ms)),
                 );
                 crate::notify::notify("shunt: Rate Limited", &msg, "Ping");
                 notified_cooldown.insert(acc.name.clone(), acc.cooldown_until_ms);
@@ -205,9 +302,9 @@ fn diff_and_notify(
             notified_cooldown.remove(&acc.name);
         }
 
-        // ── Account came back from disabled/auth_failed ──────────────────────
+        // ── Recovered from auth_failed / disabled ────────────────────────────
         if (p.auth_failed || p.disabled) && acc.available {
-            println!("  {}  [{}]  back online (recovered)", green("✓"), green(&acc.name));
+            println!("  {}  [{}]  recovered", green("✓"), green(&acc.name));
             crate::notify::notify(
                 "shunt: Account Recovered",
                 &format!("Account '{}' is back online.", acc.name),
@@ -231,7 +328,6 @@ fn diff_and_notify(
             *last_all_offline = Some(Instant::now());
         }
     }
-    // Back from all-offline
     if *was_all_offline && !all_unavailable {
         println!("  {}  accounts back online", green("✓"));
     }
@@ -242,23 +338,14 @@ fn diff_and_notify(
 // Display helpers
 // ---------------------------------------------------------------------------
 
-fn print_header(base_url: &str, interval_secs: u64) {
-    println!();
-    println!("  {}  {}  {}", bold("◆"), bold("shunt"), dim("remote"));
-    println!("  {}  {}", dim("·"), cyan(base_url));
-    println!("  {}  polling every {}s  ·  press Ctrl-C to stop", dim("·"), interval_secs);
-    println!();
-}
-
 fn print_initial_state(accounts: &[AccountStatus], now_ms: u64) {
-    println!("  {}  connected — {} account(s)", green("✓"), accounts.len());
+    println!("  {}  {} account(s)", green("✓"), accounts.len());
     for acc in accounts {
         let (sym, label) = if acc.auth_failed || acc.disabled {
             (red("✗"), red(&acc.name))
         } else if acc.cooldown_until_ms > now_ms {
             let rem = fmt_duration_ms(acc.cooldown_until_ms - now_ms);
-            let label = format!("{}  cooling {}", acc.name, rem);
-            (yellow("⏸"), yellow(&label))
+            (yellow("⏸"), yellow(&format!("{}  cooling {}", acc.name, rem)))
         } else {
             (green("✓"), green(&acc.name))
         };
@@ -268,15 +355,23 @@ fn print_initial_state(accounts: &[AccountStatus], now_ms: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP helper
+// HTTP helpers
 // ---------------------------------------------------------------------------
 
-async fn fetch_status(client: &reqwest::Client, url: &str) -> Result<StatusResponse> {
-    Ok(client.get(url).send().await?.json::<StatusResponse>().await?)
+async fn fetch_local_status(
+    client: &reqwest::Client,
+    local_url: &str,
+) -> Result<Vec<AccountStatus>> {
+    let url = format!("{}/status", local_url.trim_end_matches('/'));
+    let resp = client.get(&url).send().await?;
+    let body: serde_json::Value = resp.json().await?;
+    let accounts = serde_json::from_value(body["accounts"].clone())
+        .context("failed to parse accounts from /status")?;
+    Ok(accounts)
 }
 
 // ---------------------------------------------------------------------------
-// Time helper
+// Time
 // ---------------------------------------------------------------------------
 
 fn now_ms() -> u64 {

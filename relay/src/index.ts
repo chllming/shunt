@@ -112,6 +112,52 @@ export default {
       return json({ payload: stored.payload });
     }
 
+    // ---------------------------------------------------------------------------
+    // PUT /watch/:code — host pushes encrypted state snapshot (persistent, TTL refreshed)
+    // ---------------------------------------------------------------------------
+    const putWatchMatch = pathname.match(/^\/watch\/(RM-[0-9a-f]{18})$/);
+    if (method === "PUT" && putWatchMatch) {
+      const code = putWatchMatch[1];
+      let body: { payload?: string };
+      try {
+        body = await request.json();
+      } catch {
+        return err(400, "Invalid JSON body.");
+      }
+      const { payload } = body;
+      if (!payload || typeof payload !== "string") {
+        return err(400, "Missing 'payload'.");
+      }
+      if (payload.length > MAX_PAYLOAD_BYTES) {
+        return err(507, `Payload too large (max ${MAX_PAYLOAD_BYTES} bytes).`);
+      }
+      await env.BUNDLES.put(
+        `watch:${code}`,
+        JSON.stringify({ payload, updated_at: Date.now() }),
+        { expirationTtl: 600 }, // 10 min — expires if host stops pushing
+      );
+      return json({ ok: true });
+    }
+
+    // ---------------------------------------------------------------------------
+    // GET /watch/:code — client polls for latest snapshot (NOT deleted on read)
+    // ---------------------------------------------------------------------------
+    const getWatchMatch = pathname.match(/^\/watch\/(RM-[0-9a-f]{18})$/);
+    if (method === "GET" && getWatchMatch) {
+      const code = getWatchMatch[1];
+      const raw = await env.BUNDLES.get(`watch:${code}`);
+      if (!raw) {
+        return err(404, "Session not found or expired. Is the host still running?");
+      }
+      let stored: { payload: string; updated_at: number };
+      try {
+        stored = JSON.parse(raw);
+      } catch {
+        return err(500, "Corrupted watch entry.");
+      }
+      return json({ payload: stored.payload, updated_at: stored.updated_at });
+    }
+
     return err(404, "Not found.");
   },
 };
