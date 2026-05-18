@@ -102,6 +102,7 @@ async fn run_host(relay_url: String, local_url: String) -> Result<()> {
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(0)
         .build()?;
 
     println!();
@@ -153,6 +154,7 @@ async fn run_client(code: String, relay_url: String) -> Result<()> {
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(0)
         .build()?;
 
     println!();
