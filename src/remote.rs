@@ -76,6 +76,8 @@ impl Snap {
 // ---------------------------------------------------------------------------
 
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// How often the host pushes to the relay even if nothing changed (keeps session alive).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Cooldowns shorter than this are transient — skip notification.
 const LONG_COOLDOWN_MS: u64 = 5 * 60_000;
 /// Minimum gap between "all accounts offline" notifications.
@@ -115,26 +117,40 @@ async fn run_host(relay_url: String, local_url: String) -> Result<()> {
     println!("  {}  watching local accounts — Ctrl-C to stop", dim("·"));
     println!();
 
+    let mut last_push: Option<Instant> = None;
+    let mut last_accounts_json: Option<String> = None;
+
     loop {
         match fetch_local_status(&client, &local_url).await {
             Ok(accounts) => {
-                let snapshot = RemoteSnapshot { accounts, ts_ms: now_ms() };
-                let data = serde_json::to_vec(&snapshot)?;
-                let payload = crate::sync::encrypt_bytes(&data, &code)?;
+                let accounts_json = serde_json::to_string(&accounts).unwrap_or_default();
+                let changed = last_accounts_json.as_deref() != Some(accounts_json.as_str());
+                let heartbeat_due = last_push
+                    .map(|t| t.elapsed() >= HEARTBEAT_INTERVAL)
+                    .unwrap_or(true);
 
-                let push_url = format!("{relay_url}/watch/{code}");
-                match client
-                    .put(&push_url)
-                    .json(&serde_json::json!({ "payload": payload }))
-                    .send()
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => {}
-                    Ok(r) => {
-                        let status = r.status();
-                        eprintln!("  {}  relay push failed: {status}", red("✗"));
+                if changed || heartbeat_due {
+                    let snapshot = RemoteSnapshot { accounts, ts_ms: now_ms() };
+                    let data = serde_json::to_vec(&snapshot)?;
+                    let payload = crate::sync::encrypt_bytes(&data, &code)?;
+
+                    let push_url = format!("{relay_url}/watch/{code}");
+                    match client
+                        .put(&push_url)
+                        .json(&serde_json::json!({ "payload": payload }))
+                        .send()
+                        .await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            last_push = Some(Instant::now());
+                            last_accounts_json = Some(accounts_json);
+                        }
+                        Ok(r) => {
+                            let status = r.status();
+                            eprintln!("  {}  relay push failed: {status}", red("✗"));
+                        }
+                        Err(e) => eprintln!("  {}  relay unreachable: {e}", red("✗")),
                     }
-                    Err(e) => eprintln!("  {}  relay unreachable: {e}", red("✗")),
                 }
             }
             Err(e) => eprintln!("  {}  local shunt unreachable: {e}", red("✗")),
