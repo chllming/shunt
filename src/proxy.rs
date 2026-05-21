@@ -147,7 +147,8 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
         let cooldown_until_ms = acc_state.map(|s| s.cooldown_until_ms).unwrap_or(0);
         let utilization_5h = rl.and_then(|r| r.utilization_5h).unwrap_or(0.0);
         let reset_5h = rl.and_then(|r| r.reset_5h);
-        let total_tokens = quota.map(|q| q.total_tokens()).unwrap_or(0);
+        let utilization_7d = rl.and_then(|r| r.utilization_7d).unwrap_or(0.0);
+        let reset_7d = rl.and_then(|r| r.reset_7d);
         let available = s.state.is_available(&a.name);
 
         json!({
@@ -161,7 +162,8 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
             "cooldown_until_ms": cooldown_until_ms,
             "utilization_5h": utilization_5h,
             "reset_5h": reset_5h,
-            "total_tokens": total_tokens,
+            "utilization_7d": utilization_7d,
+            "reset_7d": reset_7d,
             "window_expires_ms": window_expires_ms,
             "tokens_used": tokens_used,
             "rate_limit": rate_limit,

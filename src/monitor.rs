@@ -77,8 +77,6 @@ struct AccountStatus {
     #[serde(default)]
     reset_7d: Option<u64>,
     #[serde(default)]
-    total_tokens: u64,
-    #[serde(default)]
     cooldown_until_ms: u64,
 }
 
@@ -356,9 +354,10 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>) {
         let sv = s.savings.as_ref()?;
         let today_tok = sv.today_input + sv.today_output;
         if today_tok == 0 && sv.all_time_cost_usd == 0.0 { return None; }
-        let tok_str  = crate::term::fmt_tokens(today_tok);
-        let cost_str = crate::pricing::fmt_cost(sv.today_cost_usd);
-        Some(format!("  ·  today: {tok_str}  {cost_str}"))
+        let tok_str   = crate::term::fmt_tokens(today_tok);
+        let cost_str  = crate::pricing::fmt_cost(sv.today_cost_usd);
+        let week_str  = crate::pricing::fmt_cost(sv.week_cost_usd);
+        Some(format!("  ·  today: {tok_str}  {cost_str}  ·  week: {week_str}"))
     });
 
     let mut spans = vec![
@@ -536,15 +535,7 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
         // 5h bar
         lines.push(util_bar_line("5h", acc.utilization_5h, acc.reset_5h));
         // 7d bar
-        if acc.utilization_7d > 0.0 || acc.reset_7d.is_some() {
-            lines.push(util_bar_line("7d", acc.utilization_7d, acc.reset_7d));
-        }
-
-        let tok_str = fmt_tokens(acc.total_tokens);
-        lines.push(Line::from(vec![
-            Span::styled("   ", style_dim()),
-            Span::styled(format!("{tok_str} tokens this window"), style_dim()),
-        ]));
+        lines.push(util_bar_line("7d", acc.utilization_7d, acc.reset_7d));
 
         lines.push(Line::raw(""));
     }
