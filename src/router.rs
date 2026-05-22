@@ -163,8 +163,12 @@ pub fn pick_account<'a>(
                 (false, true) => std::cmp::Ordering::Greater,
                 (true, true) => ra.cmp(&rb), // most urgent first
                 (false, false) => {
-                    ua.partial_cmp(&ub).unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| state.window_start_ms(&a.name).cmp(&state.window_start_ms(&b.name)))
+                    // Drain most-utilized first (reversed: higher utilization = preferred).
+                    ub.partial_cmp(&ua).unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            // Break ties by Anthropic's actual reset time: soonest expiry first.
+                            ra.unwrap_or(u64::MAX).cmp(&rb.unwrap_or(u64::MAX))
+                        })
                 }
             }
         })?;
@@ -177,4 +181,109 @@ pub fn pick_account<'a>(
     }
 
     Some(chosen)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{RateLimitInfo, StateStore};
+
+    fn make_account(name: &str) -> AccountConfig {
+        AccountConfig {
+            name: name.to_owned(),
+            plan_type: "pro".to_owned(),
+            provider: crate::provider::Provider::Anthropic,
+            credential: None,
+        }
+    }
+
+    fn set_rate_limits(state: &StateStore, name: &str, util_5h: f64, reset_5h_offset_secs: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        state.update_rate_limits(name, RateLimitInfo {
+            utilization_5h: Some(util_5h),
+            reset_5h: Some(now + reset_5h_offset_secs),
+            status_5h: Some("allowed".to_owned()),
+            utilization_7d: None,
+            reset_7d: None,
+            status_7d: None,
+            overage_status: None,
+            overage_disabled_reason: None,
+            representative_claim: None,
+            updated_ms: now * 1000,
+        });
+    }
+
+    #[test]
+    fn test_routing_drains_high_utilization_first() {
+        let accounts = vec![make_account("low"), make_account("high")];
+        let state = StateStore::new_empty();
+
+        // Account "low" at 20%, "high" at 80%, both resetting in 3 hours (not expiring soon)
+        set_rate_limits(&state, "low", 0.2, 3 * 3600);
+        set_rate_limits(&state, "high", 0.8, 3 * 3600);
+
+        let chosen = pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800);
+        assert_eq!(chosen.map(|a| a.name.as_str()), Some("high"),
+            "should drain the high-utilization account first");
+    }
+
+    #[test]
+    fn test_routing_prefers_expiring_soon() {
+        let accounts = vec![make_account("fresh"), make_account("expiring")];
+        let state = StateStore::new_empty();
+
+        // "expiring" has 30% util and resets in 15 min (within 30-min window) — use-it-or-lose-it
+        // "fresh" has 5% util and resets in 4 hours
+        set_rate_limits(&state, "fresh", 0.05, 4 * 3600);
+        set_rate_limits(&state, "expiring", 0.3, 15 * 60);
+
+        let chosen = pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800);
+        assert_eq!(chosen.map(|a| a.name.as_str()), Some("expiring"),
+            "should prefer the account expiring soon (use-it-or-lose-it)");
+    }
+
+    #[test]
+    fn test_routing_equal_utilization_prefers_earlier_reset() {
+        let accounts = vec![make_account("later"), make_account("sooner")];
+        let state = StateStore::new_empty();
+
+        // Both at 50% but different reset times — prefer the one that resets sooner
+        set_rate_limits(&state, "later", 0.5, 5 * 3600);
+        set_rate_limits(&state, "sooner", 0.5, 2 * 3600);
+
+        let chosen = pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800);
+        assert_eq!(chosen.map(|a| a.name.as_str()), Some("sooner"),
+            "equal utilization: should prefer the account whose window resets sooner");
+    }
+
+    #[test]
+    fn test_routing_skips_unavailable() {
+        let accounts = vec![make_account("cooling"), make_account("ready")];
+        let state = StateStore::new_empty();
+        state.set_cooldown("cooling", 60_000);
+
+        let chosen = pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800);
+        assert_eq!(chosen.map(|a| a.name.as_str()), Some("ready"),
+            "should skip accounts on cooldown");
+    }
+
+    #[test]
+    fn test_routing_pinned_account_wins() {
+        let accounts = vec![make_account("a"), make_account("b")];
+        let state = StateStore::new_empty();
+        set_rate_limits(&state, "a", 0.9, 3600);
+        set_rate_limits(&state, "b", 0.1, 3600);
+        state.set_pinned(Some("b".to_owned()));
+
+        let chosen = pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800);
+        assert_eq!(chosen.map(|a| a.name.as_str()), Some("b"),
+            "pinned account should override utilization-based routing");
+    }
 }

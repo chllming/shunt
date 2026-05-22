@@ -485,7 +485,7 @@ async fn tap_usage(
 /// For any account with no rate-limit data yet, make a cheap request directly
 /// to the upstream API so we populate metrics without waiting for a real user
 /// request. Runs as a background task after startup.
-pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore) {
+pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore, live_creds: LiveCredentials) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -538,6 +538,8 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore) {
             if fresh.id_token.is_some() {
                 crate::oauth::write_codex_auth_file(&fresh);
             }
+            // Update live credentials so the proxy uses the fresh token immediately.
+            live_creds.write().await.insert(account.name.clone(), fresh.clone());
 
             match prefetch_send(&client, &url, &account.provider, &fresh.access_token, &body).await {
                 Ok(r2) if r2.status() == reqwest::StatusCode::UNAUTHORIZED => {
