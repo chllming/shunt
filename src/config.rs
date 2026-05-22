@@ -119,6 +119,7 @@ struct RawServer {
     upstream_url: Option<String>,
     remote_key: Option<String>,
     relay_url: Option<String>,
+    pub custom_domain: Option<String>,
     /// Conversation stickiness TTL in minutes (default: 10)
     sticky_ttl_minutes: Option<u64>,
     /// "use-it-or-lose-it" expiry window in minutes (default: 30)
@@ -136,6 +137,7 @@ impl Default for RawServer {
             upstream_url: None,
             remote_key: None,
             relay_url: None,
+            custom_domain: None,
             sticky_ttl_minutes: None,
             expiry_soon_minutes: None,
             request_timeout_secs: None,
@@ -172,6 +174,8 @@ pub struct ServerConfig {
     pub remote_key: Option<String>,
     /// Relay URL for `shunt push` / `shunt login`. Overridable via SHUNT_RELAY_URL.
     pub relay_url: String,
+    /// Custom domain for permanent online sharing (e.g. https://shunt.mysite.com).
+    pub custom_domain: Option<String>,
     /// Conversation stickiness TTL in milliseconds.
     pub sticky_ttl_ms: u64,
     /// Accounts whose 5h window resets within this many seconds are preferred ("use-it-or-lose-it").
@@ -189,6 +193,7 @@ impl Default for ServerConfig {
             upstream_url: "https://api.anthropic.com".into(),
             remote_key: None,
             relay_url: "https://relay.ramcharan.shop".into(),
+            custom_domain: None,
             sticky_ttl_ms: 10 * 60 * 1000,
             expiry_soon_secs: 30 * 60,
             request_timeout_secs: 600,
@@ -268,6 +273,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         upstream_url,
         remote_key: raw.server.remote_key,
         relay_url,
+        custom_domain: raw.server.custom_domain,
         sticky_ttl_ms: raw.server.sticky_ttl_minutes.unwrap_or(10) * 60 * 1000,
         expiry_soon_secs: raw.server.expiry_soon_minutes.unwrap_or(30) * 60,
         request_timeout_secs: raw.server.request_timeout_secs.unwrap_or(600),

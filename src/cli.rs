@@ -1887,22 +1887,30 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
     let mut text = std::fs::read_to_string(&config_p)?;
 
     // If no flags given, show interactive menu
-    let (tunnel, stop) = if !tunnel && !stop {
+    // use an enum to track the chosen mode cleanly
+    #[derive(Debug)]
+    enum ShareMode { Lan, Tunnel, CustomDomain, Stop }
+
+    let mode: ShareMode = if tunnel {
+        ShareMode::Tunnel
+    } else if stop {
+        ShareMode::Stop
+    } else {
         print_splash(&[
             format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
             dim("Remote sharing").to_string(),
             String::new(),
         ]);
-        let items = vec![
+        let top_items = vec![
             term::SelectItem {
                 label: format!("{}  {}", bold("Local network (LAN)"),
                     dim("— same Wi-Fi only, no internet required")),
                 value: "lan".into(),
             },
             term::SelectItem {
-                label: format!("{}  {}", bold("Online (Cloudflare tunnel)"),
-                    dim("— any network, internet required")),
-                value: "tunnel".into(),
+                label: format!("{}  {}", bold("Online"),
+                    dim("— share over the internet")),
+                value: "online".into(),
             },
             term::SelectItem {
                 label: format!("{}  {}", bold("Stop sharing"),
@@ -1910,17 +1918,45 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
                 value: "stop".into(),
             },
         ];
-        match term::select("How do you want to share?", &items, 0).as_deref() {
-            Some("lan")    => (false, false),
-            Some("tunnel") => (true,  false),
-            Some("stop")   => (false, true),
-            _ => return Ok(()), // cancelled
+        match term::select("How do you want to share?", &top_items, 0).as_deref() {
+            Some("lan")    => ShareMode::Lan,
+            Some("stop")   => ShareMode::Stop,
+            Some("online") => {
+                // Sub-menu: temporary vs custom domain
+                let existing_domain = crate::config::load_config(Some(&config_p))
+                    .ok()
+                    .and_then(|c| c.server.custom_domain.clone());
+                let domain_label = match &existing_domain {
+                    Some(d) => format!("{}  {}",
+                        bold("Custom domain (permanent)"),
+                        dim(&format!("— {} · your domain", d))),
+                    None => format!("{}  {}",
+                        bold("Custom domain (permanent)"),
+                        dim("— your own domain, always-on")),
+                };
+                let online_items = vec![
+                    term::SelectItem {
+                        label: format!("{}  {}",
+                            bold("Temporary (Cloudflare tunnel)"),
+                            dim("— free, random URL, session only")),
+                        value: "tunnel".into(),
+                    },
+                    term::SelectItem {
+                        label: domain_label,
+                        value: "custom".into(),
+                    },
+                ];
+                match term::select("Online sharing type:", &online_items, 0).as_deref() {
+                    Some("tunnel") => ShareMode::Tunnel,
+                    Some("custom") => ShareMode::CustomDomain,
+                    _ => return Ok(()),
+                }
+            }
+            _ => return Ok(()),
         }
-    } else {
-        (tunnel, stop)
     };
 
-    if stop {
+    if matches!(mode, ShareMode::Stop) {
         // Reconfirm before disabling
         if !term::confirm("Stop sharing and revert to localhost-only?") {
             println!("  {} Cancelled.", dim("·"));
@@ -1946,7 +1982,7 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
         return Ok(());
     }
 
-    // Generate or reuse existing key
+    // Generate or reuse existing remote key
     let key = match extract_remote_key(&text) {
         Some(k) => k,
         None => {
@@ -1963,111 +1999,129 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
 
     std::fs::write(&config_p, &text)?;
 
-    let (port, relay_url) = match crate::config::load_config(Some(&config_p)) {
+    let (port, relay_url, saved_domain) = match crate::config::load_config(Some(&config_p)) {
         Ok(cfg) => {
             let relay = std::env::var("SHUNT_RELAY_URL")
                 .unwrap_or_else(|_| cfg.server.relay_url.clone());
-            (cfg.server.port, relay)
+            (cfg.server.port, relay, cfg.server.custom_domain)
         }
-        Err(_) => (8082u16, std::env::var("SHUNT_RELAY_URL")
-            .unwrap_or_else(|_| "https://relay.ramcharan.shop".to_string())),
+        Err(_) => (8082u16,
+            std::env::var("SHUNT_RELAY_URL")
+                .unwrap_or_else(|_| "https://relay.ramcharan.shop".to_string()),
+            None),
     };
 
-    if tunnel {
-        // Cloudflare quick tunnel — works over any network, no account needed
-        print_splash(&[
-            format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-            dim("Starting Cloudflare tunnel…").to_string(),
-            String::new(),
-        ]);
+    match mode {
+        ShareMode::Tunnel => {
+            print_splash(&[
+                format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+                dim("Starting Cloudflare tunnel…").to_string(),
+                String::new(),
+            ]);
+            println!("  {} Make sure the proxy is running: {}", dim("·"), cyan("shunt start"));
+            println!();
 
-        println!("  {} Make sure the proxy is running: {}", dim("·"), cyan("shunt start"));
-        println!();
+            let url = start_cloudflare_tunnel(port)?;
+            share_and_print(&url, &key, &relay_url, "Tunnel active", &[
+                format!("  {} Code expires in 10 minutes — one-time use", dim("·")),
+                format!("  {} Tunnel is active — keep this terminal open.", dim("·")),
+                format!("  {} Press Ctrl+C to stop.", dim("·")),
+            ]).await;
 
-        let url = start_cloudflare_tunnel(port)?;
-
-        // Push share code to relay
-        let share_code = crate::sync::generate_share_code();
-        match crate::sync::push_share(&share_code, &url, &key, &relay_url).await {
-            Ok(()) => {
-                print_splash(&[
-                    format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-                    dim("Tunnel active — share code ready").to_string(),
-                    String::new(),
-                ]);
-                println!("  {}  Share code:\n", green(CHECK));
-                println!("      {}\n", cyan(&share_code));
-                println!("  {} On the other device, run:", dim("·"));
-                println!("       {}", cyan(&format!("shunt connect {share_code}")));
-                println!();
-                println!("  {} Code expires in 10 minutes — one-time use", dim("·"));
-                println!("  {} Tunnel is active — keep this terminal open.", dim("·"));
-                println!("  {} Press Ctrl+C to stop.", dim("·"));
-                println!();
-            }
-            Err(e) => {
-                // Fall back to manual instructions if relay is unavailable
-                println!("  {}  Set on the remote device:\n", green(CHECK));
-                println!("    {}{}", dim("export ANTHROPIC_BASE_URL="), cyan(&url));
-                println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(&key));
-                println!();
-                println!("  {} (share code unavailable: {e})", dim("·"));
-                println!("  {} Tunnel is active — keep this terminal open.", dim("·"));
-                println!("  {} Press Ctrl+C to stop.", dim("·"));
-                println!();
-            }
+            tokio::signal::ctrl_c().await.ok();
+            println!("\n  {} Tunnel closed.", dim("·"));
         }
 
-        // Block until the user kills it
-        tokio::signal::ctrl_c().await.ok();
-        println!("\n  {} Tunnel closed.", dim("·"));
-    } else {
-        let ip = local_ip().unwrap_or_else(|| "<your-ip>".to_string());
-        let base_url = format!("http://{ip}:{port}");
+        ShareMode::CustomDomain => {
+            // Resolve domain: use saved, or prompt + save
+            let domain = if let Some(d) = saved_domain {
+                d
+            } else {
+                use std::io::Write;
+                println!();
+                println!("  {} Enter your domain URL (e.g. {}): ",
+                    dim("·"), dim("https://shunt.mysite.com"));
+                print!("    ");
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let domain = input.trim().trim_end_matches('/').to_string();
+                if domain.is_empty() {
+                    bail!("No domain entered.");
+                }
+                if !domain.starts_with("http") {
+                    bail!("Domain must start with http:// or https://");
+                }
+                // Save to config
+                let mut cfg_text = std::fs::read_to_string(&config_p)?;
+                cfg_text = insert_into_server_section(&cfg_text,
+                    &format!("custom_domain = \"{domain}\""));
+                std::fs::write(&config_p, &cfg_text)?;
+                println!("  {} Saved {} to config.", green(CHECK), cyan(&domain));
+                domain
+            };
 
-        // Push share code to relay
-        let share_code = crate::sync::generate_share_code();
-        match crate::sync::push_share(&share_code, &base_url, &key, &relay_url).await {
-            Ok(()) => {
-                print_splash(&[
-                    format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-                    dim("Remote sharing enabled (LAN)").to_string(),
-                    String::new(),
-                ]);
-                println!("  {}  Share code:\n", green(CHECK));
-                println!("      {}\n", cyan(&share_code));
-                println!("  {} On the other device, run:", dim("·"));
-                println!("       {}", cyan(&format!("shunt connect {share_code}")));
-                println!();
-                println!("  {} Code expires in 10 minutes — one-time use", dim("·"));
-                println!("  {} Both devices must be on the same network.", dim("·"));
-                println!("  {} For any network: {}", dim("·"), cyan("shunt share --tunnel"));
-                println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
-                println!("  {} To stop sharing:  {}", dim("·"), cyan("shunt share --stop"));
-                println!();
-            }
-            Err(e) => {
-                // Fall back to manual instructions
-                print_splash(&[
-                    format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-                    dim("Remote sharing enabled (LAN)").to_string(),
-                    String::new(),
-                ]);
-                println!("  Set on the remote device:\n");
-                println!("    {}{}", dim("export ANTHROPIC_BASE_URL="), cyan(&base_url));
-                println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(&key));
-                println!();
-                println!("  {} (share code unavailable: {e})", dim("·"));
-                println!("  {} Both devices must be on the same network.", dim("·"));
-                println!("  {} For any network: {}", dim("·"), cyan("shunt share --tunnel"));
-                println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
-                println!("  {} To stop sharing:  {}", dim("·"), cyan("shunt share --stop"));
-                println!();
-            }
+            share_and_print(&domain, &key, &relay_url, "Online sharing (custom domain)", &[
+                format!("  {} Code expires in 10 minutes — one-time use", dim("·")),
+                format!("  {} Make sure {} is pointing to port {} on this machine.",
+                    dim("·"), cyan(&domain), port),
+                format!("  {} Restart to apply: {}", dim("·"), cyan("shunt start")),
+                format!("  {} To stop sharing:  {}", dim("·"), cyan("shunt share --stop")),
+            ]).await;
         }
+
+        ShareMode::Lan => {
+            let ip = local_ip().unwrap_or_else(|| "<your-ip>".to_string());
+            let base_url = format!("http://{ip}:{port}");
+
+            share_and_print(&base_url, &key, &relay_url, "Remote sharing enabled (LAN)", &[
+                format!("  {} Code expires in 10 minutes — one-time use", dim("·")),
+                format!("  {} Both devices must be on the same network.", dim("·")),
+                format!("  {} Restart to apply: {}", dim("·"), cyan("shunt start")),
+                format!("  {} To stop sharing:  {}", dim("·"), cyan("shunt share --stop")),
+            ]).await;
+        }
+
+        ShareMode::Stop => unreachable!(),
     }
 
     Ok(())
+}
+
+/// Push share code to relay and print the result (code or fallback manual instructions).
+async fn share_and_print(base_url: &str, key: &str, relay_url: &str, subtitle: &str, hints: &[String]) {
+    let share_code = crate::sync::generate_share_code();
+    match crate::sync::push_share(&share_code, base_url, key, relay_url).await {
+        Ok(()) => {
+            print_splash(&[
+                format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+                dim(subtitle).to_string(),
+                String::new(),
+            ]);
+            println!("  {}  Share code:\n", green(CHECK));
+            println!("      {}\n", cyan(&share_code));
+            println!("  {} On the other device, run:", dim("·"));
+            println!("       {}", cyan(&format!("shunt connect {share_code}")));
+            println!();
+            for hint in hints { println!("{hint}"); }
+            println!();
+        }
+        Err(e) => {
+            // Relay unavailable — fall back to manual env var instructions
+            print_splash(&[
+                format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+                dim(subtitle).to_string(),
+                String::new(),
+            ]);
+            println!("  Set on the remote device:\n");
+            println!("    {}{}", dim("export ANTHROPIC_BASE_URL="), cyan(base_url));
+            println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(key));
+            println!();
+            println!("  {} (share code unavailable: {e})", dim("·"));
+            for hint in hints { println!("{hint}"); }
+            println!();
+        }
+    }
 }
 
 /// Spawn `cloudflared tunnel --url http://localhost:{port}`, wait for the public URL,
