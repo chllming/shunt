@@ -26,6 +26,14 @@ struct AppState {
     state: StateStore,
     /// Live credentials — can be refreshed at runtime without restarting.
     credentials: Arc<RwLock<HashMap<String, OAuthCredential>>>,
+    /// Per-account mutex that serialises concurrent token-refresh attempts.
+    ///
+    /// When multiple in-flight requests hit a 401 for the same account at the
+    /// same time, only one should call the upstream OAuth endpoint; the others
+    /// should wait and then re-use the fresh token instead of each making their
+    /// own refresh call (which would rotate the refresh_token out from under the
+    /// others and cause cascading auth failures).
+    refresh_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Epoch-ms when this proxy instance started.
     started_ms: u64,
     /// If set, /v1/chat/completions requests are translated and forwarded here
@@ -65,6 +73,7 @@ pub fn create_app_with_state(
         forwarder: Arc::new(forwarder),
         state,
         credentials: Arc::clone(&credentials),
+        refresh_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         started_ms: now_ms(),
         anthropic_base_url,
     };
@@ -350,44 +359,76 @@ async fn proxy_handler(
             401 => {
                 if !refreshed.contains(&account_name) {
                     // Access token invalidated (e.g. user logged out) — try refresh.
-                    let cred = {
+                    //
+                    // Acquire the per-account refresh lock so concurrent requests
+                    // for the same account serialise here. The first waiter to get
+                    // the lock does the actual OAuth refresh; subsequent waiters
+                    // re-check credentials and skip the refresh if the token was
+                    // already rotated while they were queued.
+                    let account_lock = {
+                        let mut locks = s.refresh_locks.lock().unwrap();
+                        locks.entry(account_name.clone())
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                            .clone()
+                    };
+                    let _guard = account_lock.lock().await;
+
+                    // Re-read credentials after acquiring the lock — another task
+                    // may have already refreshed while we were waiting.
+                    let cred_before = {
                         let creds = s.credentials.read().await;
                         creds.get(&account_name).cloned()
                             .or_else(|| account.credential.clone())
                     };
-                    let Some(cred) = cred else {
+                    let Some(cred) = cred_before else {
                         tried.insert(account_name);
                         continue;
                     };
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        account.provider.refresh_token(&cred),
-                    ).await {
-                        Ok(Ok(fresh)) => {
-                            warn!(account = %account_name, "401 — token refreshed, retrying");
-                            {
-                                let mut creds = s.credentials.write().await;
-                                creds.insert(account_name.clone(), fresh.clone());
-                            }
-                            // Persist to disk so the refreshed token survives a restart.
-                            let name = account_name.clone();
-                            let fresh = fresh.clone();
-                            tokio::task::spawn_blocking(move || {
-                                let mut store = CredentialsStore::load();
-                                store.accounts.insert(name, fresh.clone());
-                                store.save().ok();
-                                if fresh.id_token.is_some() {
-                                    crate::oauth::write_codex_auth_file(&fresh);
+
+                    // Check if the token already changed while we were waiting.
+                    let token_before = cred.access_token.clone();
+                    let already_refreshed = {
+                        let creds = s.credentials.read().await;
+                        creds.get(&account_name)
+                            .map(|c| c.access_token != token_before)
+                            .unwrap_or(false)
+                    };
+
+                    if already_refreshed {
+                        // Another concurrent request already refreshed — just retry.
+                        warn!(account = %account_name, "401 — token was refreshed by concurrent request, retrying");
+                        refreshed.insert(account_name);
+                    } else {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            account.provider.refresh_token(&cred),
+                        ).await {
+                            Ok(Ok(fresh)) => {
+                                warn!(account = %account_name, "401 — token refreshed, retrying");
+                                {
+                                    let mut creds = s.credentials.write().await;
+                                    creds.insert(account_name.clone(), fresh.clone());
                                 }
-                            });
-                            // Mark as refreshed but don't add to tried — retry this account.
-                            refreshed.insert(account_name);
-                        }
-                        _ => {
-                            // Refresh failed/timed out — cool down, don't permanently disable.
-                            error!(account = %account_name, "401 — token refresh failed, cooling 5min");
-                            s.state.set_cooldown(&account_name, 5 * 60_000);
-                            tried.insert(account_name);
+                                // Persist to disk so the refreshed token survives a restart.
+                                let name = account_name.clone();
+                                let fresh = fresh.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let mut store = CredentialsStore::load();
+                                    store.accounts.insert(name, fresh.clone());
+                                    store.save().ok();
+                                    if fresh.id_token.is_some() {
+                                        crate::oauth::write_codex_auth_file(&fresh);
+                                    }
+                                });
+                                // Mark as refreshed but don't add to tried — retry this account.
+                                refreshed.insert(account_name);
+                            }
+                            _ => {
+                                // Refresh failed/timed out — cool down, don't permanently disable.
+                                error!(account = %account_name, "401 — token refresh failed, cooling 5min");
+                                s.state.set_cooldown(&account_name, 5 * 60_000);
+                                tried.insert(account_name);
+                            }
                         }
                     }
                 } else {
@@ -944,11 +985,18 @@ async fn post_cooldown_prefetch(
 /// Analogous to `recovery_watcher` (which handles `auth_failed` accounts), but
 /// for timed cooldowns (429 / 529 / 401 / 403 backoffs). Sleeps precisely until
 /// the next cooldown deadline rather than polling at a fixed interval.
+///
+/// Also handles stale rate-limit data: if an account's rate-limit snapshot is
+/// older than STALE_RL_MS and the account is available, a lightweight prefetch
+/// is triggered so the router always has fresh utilization metrics.
 pub async fn cooldown_watcher(
     config: Arc<Config>,
     state: StateStore,
     credentials: LiveCredentials,
 ) {
+    /// Re-fetch rate-limit headers if data is older than 1 hour.
+    const STALE_RL_MS: u64 = 60 * 60_000;
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -959,9 +1007,12 @@ pub async fn cooldown_watcher(
     let mut last_resumed: HashMap<String, u64> = HashMap::new();
     // Accounts whose cooldown was long enough (≥5 min) to deserve a "back online" notification.
     let mut notify_on_resume: HashSet<String> = HashSet::new();
+    // Epoch-ms of the last successful stale-prefetch per account.
+    let mut last_stale_prefetch: HashMap<String, u64> = HashMap::new();
 
     loop {
         let states = state.account_states();
+        let rl_snapshot = state.rate_limit_snapshot();
         let now = now_ms();
         let mut next_wake_ms: Option<u64> = None;
 
@@ -969,9 +1020,8 @@ pub async fn cooldown_watcher(
             let Some(st) = states.get(&account.name) else { continue };
             if st.disabled { continue; } // auth_failed or permanently disabled
             let cdl = st.cooldown_until_ms;
-            if cdl == 0 { continue; } // never entered cooldown
 
-            if cdl <= now {
+            if cdl > 0 && cdl <= now {
                 // Cooldown expired — skip if we already handled this exact deadline
                 let handled = last_resumed.get(&account.name).map(|&t| t >= cdl).unwrap_or(false);
                 if !handled {
@@ -994,14 +1044,42 @@ pub async fn cooldown_watcher(
                         );
                     }
                     last_resumed.insert(account.name.clone(), cdl);
+                    last_stale_prefetch.insert(account.name.clone(), now);
                 }
-            } else {
+            } else if cdl > now {
                 // Still cooling — schedule wake at expiry; flag for notification if long
                 let remaining = cdl - now;
                 if remaining >= 5 * 60_000 {
                     notify_on_resume.insert(account.name.clone());
                 }
                 next_wake_ms = Some(next_wake_ms.map(|m| m.min(cdl)).unwrap_or(cdl));
+            } else {
+                // Not in cooldown — check for stale rate-limit data
+                let rl_age = rl_snapshot
+                    .get(&account.name)
+                    .map(|r| now.saturating_sub(r.updated_ms))
+                    .unwrap_or(u64::MAX); // no data → treat as infinitely stale
+                let last_fetched = last_stale_prefetch.get(&account.name).copied().unwrap_or(0);
+                let fetched_ago = now.saturating_sub(last_fetched);
+
+                if rl_age >= STALE_RL_MS && fetched_ago >= STALE_RL_MS {
+                    tracing::debug!(
+                        account = %account.name,
+                        age_min = rl_age / 60_000,
+                        "rate-limit data stale — refreshing"
+                    );
+                    let token = {
+                        let creds = credentials.read().await;
+                        creds.get(&account.name).map(|c| c.access_token.clone())
+                    };
+                    if let Some(token) = token {
+                        post_cooldown_prefetch(
+                            &client, account, &token, &state,
+                            &config.server.upstream_url,
+                        ).await;
+                    }
+                    last_stale_prefetch.insert(account.name.clone(), now);
+                }
             }
         }
 
@@ -1026,15 +1104,12 @@ use crate::notify::notify;
 // The response is translated back to OpenAI Chat Completions format.
 
 /// Map OpenAI model names → Claude model names.
-fn map_model(openai_model: &str) -> &'static str {
+/// Claude model names are passed through unchanged; only OpenAI aliases are remapped.
+fn map_model(openai_model: &str) -> String {
+    if openai_model.starts_with("claude-") {
+        return openai_model.to_owned();
+    }
     match openai_model {
-        m if m.starts_with("claude-") => {
-            // Already a Claude model name — but we need a &'static str, so match known ones
-            // or fall through to default
-            if m.contains("opus")   { "claude-opus-4-6" }
-            else if m.contains("haiku") { "claude-haiku-4-5-20251001" }
-            else                    { "claude-sonnet-4-6" }
-        }
         "gpt-4o" | "gpt-4.5" | "o1" | "o1-pro" | "o3" | "o3-pro" | "gpt-5" | "gpt-5.5" => {
             "claude-opus-4-6"
         }
@@ -1042,13 +1117,13 @@ fn map_model(openai_model: &str) -> &'static str {
             "claude-haiku-4-5-20251001"
         }
         _ => "claude-sonnet-4-6",
-    }
+    }.to_owned()
 }
 
 /// Translate an OpenAI Chat Completions request body to an Anthropic Messages body.
 fn translate_to_anthropic(body: serde_json::Value) -> serde_json::Value {
     let model = body["model"].as_str().unwrap_or("gpt-4o");
-    let claude_model = map_model(model).to_owned();
+    let claude_model = map_model(model);
 
     // Extract system message from messages array.
     let mut system: Option<String> = None;
@@ -1056,11 +1131,42 @@ fn translate_to_anthropic(body: serde_json::Value) -> serde_json::Value {
     if let Some(arr) = body["messages"].as_array() {
         for msg in arr {
             let role = msg["role"].as_str().unwrap_or("");
-            let content = msg["content"].as_str().unwrap_or("").to_owned();
             if role == "system" {
+                // system can be a string or array of content parts
+                let content = msg["content"].as_str()
+                    .map(|s| s.to_owned())
+                    .unwrap_or_else(|| serde_json::to_string(&msg["content"]).unwrap_or_default());
                 system = Some(content);
+            } else if role == "tool" {
+                // OpenAI tool result → Anthropic tool_result content block
+                let tool_use_id = msg["tool_call_id"].as_str().unwrap_or("").to_owned();
+                let content = msg["content"].as_str().unwrap_or("").to_owned();
+                messages.push(json!({
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": content}]
+                }));
             } else {
-                messages.push(json!({ "role": role, "content": content }));
+                // Check for tool_calls in assistant messages
+                if let Some(tool_calls) = msg["tool_calls"].as_array() {
+                    let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+                    if let Some(text) = msg["content"].as_str().filter(|s| !s.is_empty()) {
+                        content_blocks.push(json!({"type": "text", "text": text}));
+                    }
+                    for tc in tool_calls {
+                        content_blocks.push(json!({
+                            "type": "tool_use",
+                            "id": tc["id"].as_str().unwrap_or(""),
+                            "name": tc["function"]["name"].as_str().unwrap_or(""),
+                            "input": serde_json::from_str::<serde_json::Value>(
+                                tc["function"]["arguments"].as_str().unwrap_or("{}")
+                            ).unwrap_or(json!({})),
+                        }));
+                    }
+                    messages.push(json!({"role": "assistant", "content": content_blocks}));
+                } else {
+                    let content = msg["content"].as_str().unwrap_or("").to_owned();
+                    messages.push(json!({ "role": role, "content": content }));
+                }
             }
         }
     }
@@ -1085,6 +1191,21 @@ fn translate_to_anthropic(body: serde_json::Value) -> serde_json::Value {
         req["stop_sequences"] = sp.clone();
     }
 
+    // Translate OpenAI tools → Anthropic tools format
+    if let Some(tools) = body["tools"].as_array() {
+        let claude_tools: Vec<serde_json::Value> = tools.iter().filter_map(|t| {
+            let func = &t["function"];
+            Some(json!({
+                "name": func["name"].as_str()?,
+                "description": func["description"].as_str().unwrap_or(""),
+                "input_schema": func.get("parameters").cloned().unwrap_or(json!({"type": "object", "properties": {}})),
+            }))
+        }).collect();
+        if !claude_tools.is_empty() {
+            req["tools"] = json!(claude_tools);
+        }
+    }
+
     req
 }
 
@@ -1092,15 +1213,51 @@ fn translate_to_anthropic(body: serde_json::Value) -> serde_json::Value {
 fn translate_from_anthropic(body: serde_json::Value) -> serde_json::Value {
     let id = format!("chatcmpl-{}", &uuid_v4()[..8]);
     let model = body["model"].as_str().unwrap_or("claude-sonnet-4-6").to_owned();
-    let content = body["content"]
-        .as_array()
-        .and_then(|arr| arr.iter().find_map(|b| b["text"].as_str()))
-        .unwrap_or("")
-        .to_owned();
+
+    // Extract text content and tool_use blocks.
+    let mut text_content = String::new();
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    if let Some(blocks) = body["content"].as_array() {
+        for (idx, block) in blocks.iter().enumerate() {
+            match block["type"].as_str() {
+                Some("text") => {
+                    text_content.push_str(block["text"].as_str().unwrap_or(""));
+                }
+                Some("tool_use") => {
+                    let args = match &block["input"] {
+                        serde_json::Value::String(s) => s.clone(),
+                        v => serde_json::to_string(v).unwrap_or_default(),
+                    };
+                    tool_calls.push(json!({
+                        "id": block["id"].as_str().unwrap_or(""),
+                        "type": "function",
+                        "index": idx,
+                        "function": {
+                            "name": block["name"].as_str().unwrap_or(""),
+                            "arguments": args,
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
     let stop_reason = body["stop_reason"].as_str().unwrap_or("end_turn");
-    let finish_reason = if stop_reason == "end_turn" { "stop" } else { stop_reason };
+    let finish_reason = match stop_reason {
+        "end_turn"   => "stop",
+        "tool_use"   => "tool_calls",
+        "max_tokens" => "length",
+        other        => other,
+    };
+
     let input_tokens = body["usage"]["input_tokens"].as_u64().unwrap_or(0);
     let output_tokens = body["usage"]["output_tokens"].as_u64().unwrap_or(0);
+
+    let mut message = json!({"role": "assistant", "content": text_content});
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
 
     json!({
         "id": id,
@@ -1108,7 +1265,7 @@ fn translate_from_anthropic(body: serde_json::Value) -> serde_json::Value {
         "model": model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": content },
+            "message": message,
             "finish_reason": finish_reason,
         }],
         "usage": {
@@ -1212,6 +1369,7 @@ async fn openai_compat_handler(
 }
 
 /// Translate Anthropic SSE events to OpenAI SSE format, yielding raw bytes.
+/// Handles text content, tool_use blocks, and finish reasons.
 fn translate_anthropic_stream(
     resp: reqwest::Response,
     chat_id: String,
@@ -1223,6 +1381,9 @@ fn translate_anthropic_stream(
 
     async_stream::stream! {
         let mut buf = String::new();
+        // Per-block state: block_index -> (tool_call_oai_index, tool_id, tool_name)
+        let mut tool_blocks: std::collections::HashMap<u64, (usize, String, String)> = std::collections::HashMap::new();
+        let mut tool_call_count: usize = 0;
         futures_util::pin_mut!(byte_stream);
 
         // Send initial role chunk
@@ -1256,18 +1417,69 @@ fn translate_anthropic_stream(
                 let event_type = event["type"].as_str().unwrap_or("");
 
                 let maybe_chunk = match event_type {
+                    "content_block_start" => {
+                        let block_idx = event["index"].as_u64().unwrap_or(0);
+                        let cb = &event["content_block"];
+                        if cb["type"].as_str() == Some("tool_use") {
+                            let tool_id = cb["id"].as_str().unwrap_or("").to_owned();
+                            let tool_name = cb["name"].as_str().unwrap_or("").to_owned();
+                            let oai_idx = tool_call_count;
+                            tool_call_count += 1;
+                            tool_blocks.insert(block_idx, (oai_idx, tool_id.clone(), tool_name.clone()));
+                            Some(json!({
+                                "id": id,
+                                "object": "chat.completion.chunk",
+                                "choices": [{"index": 0, "delta": {
+                                    "tool_calls": [{
+                                        "index": oai_idx,
+                                        "id": tool_id,
+                                        "type": "function",
+                                        "function": {"name": tool_name, "arguments": ""}
+                                    }]
+                                }, "finish_reason": null}]
+                            }))
+                        } else {
+                            None
+                        }
+                    }
                     "content_block_delta" => {
-                        let text = event["delta"]["text"].as_str().unwrap_or("");
-                        if text.is_empty() { continue; }
-                        Some(json!({
-                            "id": id,
-                            "object": "chat.completion.chunk",
-                            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
-                        }))
+                        let block_idx = event["index"].as_u64().unwrap_or(0);
+                        let delta = &event["delta"];
+                        match delta["type"].as_str() {
+                            Some("text_delta") => {
+                                let text = delta["text"].as_str().unwrap_or("");
+                                if text.is_empty() { continue; }
+                                Some(json!({
+                                    "id": id,
+                                    "object": "chat.completion.chunk",
+                                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+                                }))
+                            }
+                            Some("input_json_delta") => {
+                                let args = delta["partial_json"].as_str().unwrap_or("");
+                                if let Some((oai_idx, _, _)) = tool_blocks.get(&block_idx) {
+                                    Some(json!({
+                                        "id": id,
+                                        "object": "chat.completion.chunk",
+                                        "choices": [{"index": 0, "delta": {
+                                            "tool_calls": [{"index": oai_idx, "function": {"arguments": args}}]
+                                        }, "finish_reason": null}]
+                                    }))
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
                     }
                     "message_delta" => {
                         let stop_reason = event["delta"]["stop_reason"].as_str().unwrap_or("stop");
-                        let finish = if stop_reason == "end_turn" { "stop" } else { stop_reason };
+                        let finish = match stop_reason {
+                            "end_turn"  => "stop",
+                            "tool_use"  => "tool_calls",
+                            "max_tokens" => "length",
+                            other       => other,
+                        };
                         Some(json!({
                             "id": id,
                             "object": "chat.completion.chunk",

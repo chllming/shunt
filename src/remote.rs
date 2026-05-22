@@ -53,7 +53,6 @@ struct RemoteSnapshot {
 
 #[derive(Debug, Clone)]
 struct Snap {
-    available: bool,
     auth_failed: bool,
     /// true if `cooldown_until_ms > now_ms` at snapshot time
     cooling: bool,
@@ -63,7 +62,6 @@ struct Snap {
 impl Snap {
     fn from_status(acc: &AccountStatus, now_ms: u64) -> Self {
         Self {
-            available: acc.available,
             auth_failed: acc.auth_failed,
             cooling: acc.cooldown_until_ms > now_ms,
             disabled: acc.disabled,

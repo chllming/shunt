@@ -364,13 +364,18 @@ pub async fn fetch_account_email(access_token: &str) -> Option<String> {
     }
 
     let body: serde_json::Value = resp.json().await.ok()?;
-    // organization_name is "email's Organization" — extract email prefix
-    let org = body["organization_name"].as_str()?;
-    if let Some(email) = org.strip_suffix("'s Organization") {
-        Some(email.to_owned())
-    } else {
-        Some(org.to_owned())
+
+    // Try dedicated email fields first.
+    for field in &["email", "emailAddress", "email_address"] {
+        if let Some(e) = body[field].as_str().filter(|s| s.contains('@')) {
+            return Some(e.to_owned());
+        }
     }
+
+    // Fall back to extracting from organization_name ("addr@example.com's Organization").
+    let org = body["organization_name"].as_str()?;
+    let email = org.strip_suffix("'s Organization").unwrap_or(org).trim();
+    if !email.is_empty() { Some(email.to_owned()) } else { None }
 }
 
 // ---------------------------------------------------------------------------

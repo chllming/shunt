@@ -182,7 +182,7 @@ impl StateStore {
     }
 
     pub fn load(path: &Path) -> Self {
-        let data: StateData = if path.exists() {
+        let mut data: StateData = if path.exists() {
             match std::fs::read_to_string(path) {
                 Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
                     warn!("State file unreadable ({e}), starting fresh");
@@ -196,6 +196,9 @@ impl StateStore {
         } else {
             StateData::default()
         };
+        // Prune expired sticky entries so the file doesn't grow unbounded.
+        let now = now_ms();
+        data.sticky.retain(|_, v| v.expires_at_ms > now);
 
         let store = Self {
             path: path.to_owned(),
@@ -309,11 +312,14 @@ impl StateStore {
     }
 
     pub fn set_sticky(&self, fingerprint: &str, account_name: &str, ttl_ms: u64) {
-        let mut data = self.inner.lock().unwrap();
-        data.sticky.insert(
-            fingerprint.to_owned(),
-            StickyEntry { account_name: account_name.to_owned(), expires_at_ms: now_ms() + ttl_ms },
-        );
+        {
+            let mut data = self.inner.lock().unwrap();
+            data.sticky.insert(
+                fingerprint.to_owned(),
+                StickyEntry { account_name: account_name.to_owned(), expires_at_ms: now_ms() + ttl_ms },
+            );
+        }
+        self.persist();
     }
 
     // -----------------------------------------------------------------------
@@ -413,6 +419,24 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn update_rate_limits(&self, name: &str, info: RateLimitInfo) {
+        let prev = self.inner.lock().unwrap().rate_limits.get(name).cloned();
+
+        // Warn the first time utilization crosses 90% for each window.
+        let prev_5h = prev.as_ref().and_then(|p| p.utilization_5h).unwrap_or(0.0);
+        let prev_7d = prev.as_ref().and_then(|p| p.utilization_7d).unwrap_or(0.0);
+        if let Some(u) = info.utilization_5h {
+            if u >= 0.9 && prev_5h < 0.9 {
+                warn!(account = %name, utilization = %format!("{:.0}%", u * 100.0),
+                    "5h rate limit above 90% — approaching quota");
+            }
+        }
+        if let Some(u) = info.utilization_7d {
+            if u >= 0.9 && prev_7d < 0.9 {
+                warn!(account = %name, utilization = %format!("{:.0}%", u * 100.0),
+                    "7d rate limit above 90% — approaching quota");
+            }
+        }
+
         {
             let mut data = self.inner.lock().unwrap();
             data.rate_limits.insert(name.to_owned(), info);

@@ -69,20 +69,25 @@ fn canonical_tools(v: &serde_json::Value) -> String {
 // Account selection helpers
 // ---------------------------------------------------------------------------
 
-/// Return the (utilization, reset_secs) pair for whichever window expires sooner.
-/// If only one window has data, return that. If neither, return (0.0, None).
+/// Return (effective_utilization, soonest_reset) for an account's rate-limit windows.
+///
+/// `effective_utilization` = max(util_5h, util_7d) — the binding constraint is whichever
+/// window is more exhausted, not just whichever expires sooner.
+///
+/// `soonest_reset` = the earliest reset timestamp across both windows, used for the
+/// "use-it-or-lose-it" expiry check (if any window is expiring soon, prefer this account).
 fn most_urgent_window(
     util_5h: f64, reset_5h: Option<u64>,
     util_7d: f64, reset_7d: Option<u64>,
 ) -> (f64, Option<u64>) {
-    match (reset_5h, reset_7d) {
-        (Some(r5), Some(r7)) => {
-            if r5 <= r7 { (util_5h, Some(r5)) } else { (util_7d, Some(r7)) }
-        }
-        (Some(r5), None) => (util_5h, Some(r5)),
-        (None, Some(r7)) => (util_7d, Some(r7)),
-        (None, None)     => (util_5h.max(util_7d), None),
-    }
+    let effective = util_5h.max(util_7d);
+    let soonest = match (reset_5h, reset_7d) {
+        (Some(r5), Some(r7)) => Some(r5.min(r7)),
+        (Some(r5), None)     => Some(r5),
+        (None, Some(r7))     => Some(r7),
+        (None, None)         => None,
+    };
+    (effective, soonest)
 }
 
 // ---------------------------------------------------------------------------
