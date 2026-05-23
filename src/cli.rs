@@ -1729,11 +1729,16 @@ fn render_splash_frame(
         .map(|s| Line::styled(s.clone(), Style::default().fg(dim_col)))
         .collect();
     let desc_h = desc.len() as u16;
+    // 1-col left spacer so text doesn't touch the separator.
+    let right_inner = Layout::new(Direction::Horizontal, [
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ]).split(right_area)[1];
     let right_v = Layout::new(Direction::Vertical, [
         Constraint::Fill(1),
         Constraint::Length(desc_h),
         Constraint::Fill(1),
-    ]).split(right_area);
+    ]).split(right_inner);
     f.render_widget(
         Paragraph::new(desc).alignment(alignment),
         right_v[1],
