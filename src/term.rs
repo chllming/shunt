@@ -62,7 +62,7 @@ pub fn green_bold(s: &str) -> String {
 
 /// Bold medium green — the primary brand colour for the "shunt" wordmark.
 pub fn brand_green(s: &str) -> String {
-    if is_tty() { format!("\x1b[1;38;5;34m{s}\x1b[0m") } else { s.to_owned() }
+    if is_tty() { format!("\x1b[1;38;2;188;255;96m{s}\x1b[0m") } else { s.to_owned() }
 }
 
 // ---------------------------------------------------------------------------

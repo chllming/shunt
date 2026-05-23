@@ -1,10 +1,10 @@
 # shunt
 
-A local proxy that pools multiple Claude accounts behind a single endpoint, routing requests across accounts to maximize your available rate limits.
+A local proxy that pools multiple Claude (and Codex) accounts behind a single endpoint, routing requests across accounts to maximize your available rate limits.
 
 ```
-  ─┐    shunt  v0.1.0
-  ─┼─▶  2 accounts  ·  http://127.0.0.1:8082
+  ─┐    shunt  v0.1.50
+  ─┼─▶  3 accounts  ·  http://127.0.0.1:8082
   ─┘    Proxying Claude API across multiple accounts
 ```
 
@@ -12,11 +12,12 @@ A local proxy that pools multiple Claude accounts behind a single endpoint, rout
 
 Claude's rate limits are per-account. If you hit your 5-hour or weekly limit on one account, you're stuck waiting. Shunt sits in front of the Anthropic API and automatically routes each request to whichever account has the most remaining capacity — so you get the combined limits of all your accounts.
 
-- **Least-utilization routing** — tracks live `anthropic-ratelimit-unified-*` headers and always picks the account with the most headroom
-- **Auto-failover** — if one account is rate-limited, the next request goes to another
-- **Auto-resume** — if all accounts are exhausted, requests are held and automatically retried the moment the first account's limit resets (up to 5 hours), so your tools never see a hard failure mid-session
+- **Least-utilization routing** — tracks live `anthropic-ratelimit-unified-*` headers across both 5h and 7d windows, always picking the account with the most headroom
+- **Auto-failover** — if one account returns 429/529, the next request goes to another automatically
+- **Auto-resume** — if all accounts are exhausted, requests are held open and retried the moment the first account's limit resets (up to 5 hours), so your tools never see a hard failure mid-session
+- **Strong resume** — after a cooldown expires, shunt pre-fetches quota so the next request routes instantly instead of discovering limits cold
 - **Transparent** — drop-in replacement for `api.anthropic.com`; works with Claude Code, the SDK, or any tool that speaks the Anthropic API
-- **Account management** — add or remove accounts without restarting manually
+- **Savings tracker** — shows how much you'd have paid for the same usage at API prices
 
 ## Install
 
@@ -52,13 +53,7 @@ Log out of Claude Code, log in with your second Claude account, then:
 shunt add-account secondary
 ```
 
-Or give it any name you want (`work`, `personal`, etc.):
-
-```bash
-shunt add-account work
-```
-
-This opens a browser for OAuth authorization.
+Or give it any name you want (`work`, `personal`, etc.). This opens a browser for OAuth authorization.
 
 **Step 3: Start the proxy**
 
@@ -74,14 +69,29 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8082
 
 Add that to your `.zshrc` / `.bashrc` (shunt setup offers to do this automatically).
 
-## Usage
+## Commands
 
 ```bash
 shunt start              # Start (or restart) the proxy in the background
 shunt start --foreground # Keep it in the terminal (for debugging)
-shunt status             # Show accounts, rate limit bars, reset times
-shunt add-account <name> # Add another Claude account
+shunt start --verbose    # Debug logging: routing decisions, token refresh details
+shunt stop               # Stop the running proxy
+shunt restart            # Restart the proxy
+shunt status             # Show accounts, rate limit bars, reset times, savings
+shunt monitor            # Live fullscreen TUI dashboard
+shunt logs               # Last 50 lines of the proxy log
+shunt logs -f            # Follow log output in real time
+shunt logs -n 100        # Last N lines
+shunt add-account <name> # Add another Claude or Codex account
 shunt remove-account <name> # Remove an account
+shunt logout [name]      # Log out of one account (or --all)
+shunt use [account]      # Pin routing to a specific account (or "auto" to restore)
+shunt share              # Expose the proxy to your LAN
+shunt share --tunnel     # Expose via Cloudflare tunnel (any network)
+shunt connect <code>     # Connect another device to a shared proxy
+shunt remote             # Generate a watch code (host mode)
+shunt remote <code>      # Watch a remote instance; receive local notifications (client mode)
+shunt update             # Update shunt to the latest release
 shunt setup              # First-time setup
 ```
 
@@ -97,51 +107,82 @@ shunt setup              # First-time setup
 
   ✓  personal    Claude Pro  alt@example.com          available     fresh
           5h window  ░░░░░░░░░░░░░░░░░░  100% remaining  ok
+
+── SAVINGS ─────────────────────────────────────────────────
+
+  Today: 2.3M tok  ·  $6.12  ·  All-time: $48.30
 ```
+
+### Monitor TUI
+
+`shunt monitor` opens a fullscreen live dashboard showing account utilization bars, cooldown countdowns, request history, and cost — updates in real time as requests flow through.
 
 ## How routing works
 
-Every response from the Anthropic API includes `anthropic-ratelimit-unified-5h-utilization` headers (a float from 0–1). Shunt captures these and always routes the next request to the account with the **lowest 5-hour utilization**. Fresh accounts (no data yet) are treated as 0% utilized and get highest priority.
+Every response from the Anthropic API includes `anthropic-ratelimit-unified-5h-utilization` and `anthropic-ratelimit-unified-7d-utilization` headers (floats from 0–1). Shunt captures these and always routes the next request to the account with the **lowest utilization across the most-urgent window**. Fresh accounts (no data yet) are treated as 0% utilized and get highest priority.
 
-If a request returns 429 or 529, shunt reads the `reset_5h` timestamp from the response headers and sets that account's cooldown to exactly when the window resets — no polling. It then retries with the next-best account automatically.
+If a request returns 429 or 529, shunt reads the `reset_5h` (or `reset_7d`) timestamp from the response headers and sets that account's cooldown to exactly when the window resets — no polling. It then retries with the next-best account automatically.
 
 If every account is exhausted at once, shunt holds the request open and waits until the soonest account recovers (sleeping directly until the reset time), then retries transparently. Requests will wait up to 5 hours before giving up with a 503.
 
-## Configuration
+After a cooldown expires, shunt pre-fetches the account's quota state so the routing decision for the next real request is accurate immediately.
 
-Config lives at `~/Library/Application Support/shunt/config.toml` (macOS) or `~/.config/shunt/config.toml` (Linux):
+## Sharing & remote access
 
-```toml
-[server]
-host = "127.0.0.1"
-port = 8082
-log_level = "info"
+### Share with your LAN
 
-[[accounts]]
-name = "work"
-plan_type = "pro"
-
-[[accounts]]
-name = "personal"
-plan_type = "pro"
+```bash
+shunt share
 ```
 
-Credentials are stored separately in `credentials.json` (never in the config file).
+Binds the proxy to your LAN IP and prints a share code. Anyone on your network can run `shunt connect <code>` to automatically configure their Claude Code to route through your proxy.
 
-## Files
+### Share over any network (Cloudflare tunnel)
 
-| File | Location |
-|------|----------|
-| Config | `~/Library/Application Support/shunt/config.toml` |
-| Credentials | `~/Library/Application Support/shunt/credentials.json` |
-| Logs | `~/Library/Application Support/shunt/proxy.log` |
-| Status API | `http://127.0.0.1:8082/status` |
+```bash
+shunt share --tunnel
+```
 
-## Requirements
+Creates a public Cloudflare tunnel — works across different networks, VPNs, etc. Same share code flow.
 
-- Rust 1.75+
-- One or more Claude Pro / Max accounts
-- Claude Code installed (shunt borrows its OAuth credentials)
+### Connect another device
+
+```bash
+shunt connect SC-a3f2b1c4d5e6f7a8b9
+```
+
+Fetches the proxy URL and API key for the given share code and writes them to your shell profile — Claude Code on that device starts routing through the shared proxy immediately.
+
+### Remote notifications
+
+Watch a remote shunt instance from another machine and receive local system notifications (rate limit hits, account resume, reauth needed):
+
+```bash
+# On the host machine:
+shunt remote
+# prints: RM-a3f2b1c4...
+
+# On the watching device:
+shunt remote RM-a3f2b1c4...
+```
+
+## System notifications
+
+Shunt fires native system notifications when:
+
+- An account hits a rate limit (429/529)
+- An exhausted account resumes (limit reset)
+- An account needs re-authentication
+
+## Pin routing
+
+Force all requests through a specific account:
+
+```bash
+shunt use work      # Pin to 'work'
+shunt use auto      # Restore automatic least-utilization routing
+shunt use           # Interactive picker
+```
 
 ## Codex / OpenAI routing
 
@@ -182,6 +223,10 @@ codex
 
 Add these to your shell profile to make them permanent. Requests are translated from OpenAI format to Anthropic format and routed through your Claude pool.
 
+### Cross-protocol interop
+
+Shunt routes transparently across provider types. If you have both Claude and Codex accounts configured, any request can be satisfied by any compatible account — Claude Code requests can overflow to a Codex pool and vice versa.
+
 ### Model mapping (Claude routing)
 
 When routing through Claude, OpenAI model names are mapped automatically:
@@ -196,12 +241,47 @@ Claude model names (e.g. `claude-sonnet-4-6`) pass through as-is.
 
 ### What's supported
 
-- `POST /v1/chat/completions` — streaming and non-streaming, system messages, temperature, stop sequences
+- `POST /v1/chat/completions` — streaming and non-streaming, system messages, tool calls, temperature, stop sequences
 - `GET /v1/models` — returns available Claude models in OpenAI format
 - Everything else is forwarded to the ChatGPT upstream as-is
 
+## Configuration
+
+Config lives at `~/Library/Application Support/shunt/config.toml` (macOS) or `~/.config/shunt/config.toml` (Linux):
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 8082
+log_level = "info"
+
+[[accounts]]
+name = "work"
+plan_type = "pro"
+
+[[accounts]]
+name = "personal"
+plan_type = "pro"
+```
+
+Credentials are stored separately in `credentials.json` (never in the config file).
+
+## Files
+
+| File | Location |
+|------|----------|
+| Config | `~/Library/Application Support/shunt/config.toml` |
+| Credentials | `~/Library/Application Support/shunt/credentials.json` |
+| Logs | `~/Library/Application Support/shunt/proxy.log` |
+| Status API | `http://127.0.0.1:8082/status` |
+
+## Requirements
+
+- One or more Claude Pro / Max accounts
+- Claude Code installed (shunt borrows its OAuth credentials)
+
 ## Notes
 
-- Both accounts need to be **different Claude logins** — two sessions from the same account won't double your limits
+- Accounts need to be **different Claude logins** — two sessions from the same account won't double your limits
 - Shunt only proxies `/v1/messages` and `/v1/messages/count_tokens` for the Anthropic endpoint — everything else passes through untouched
 - `shunt start` automatically kills and replaces any running instance
