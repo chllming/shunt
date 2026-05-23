@@ -2180,8 +2180,10 @@ async fn cmd_update() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let p = exe_path.display().to_string();
-        std::process::Command::new("xattr").args(["-d", "com.apple.quarantine", &p]).status().ok();
-        std::process::Command::new("codesign").args(["--force", "--deep", "--sign", "-", &p]).status().ok();
+        std::process::Command::new("xattr").args(["-d", "com.apple.quarantine", &p])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().ok();
+        std::process::Command::new("codesign").args(["--force", "--deep", "--sign", "-", &p])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().ok();
     }
 
     status!("  {} Updated to {}", green(CHECK), bold_white(&format!("v{latest}")));
