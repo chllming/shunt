@@ -2879,15 +2879,22 @@ fn register_service() -> Result<bool> {
         );
         std::fs::write(&plist_path, &plist)?;
 
-        // Unload first (silent — ignore errors if not loaded)
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", &plist_path.display().to_string()])
-            .output();
-
         // launchctl hangs in SSH sessions without a GUI bootstrap context.
-        // Run it in a thread with a 4-second timeout; if it times out or fails,
-        // the plist is still written and will auto-load on next GUI login.
+        // Wrap both unload and load in threads with timeouts.
         let plist_str = plist_path.display().to_string();
+
+        // Unload first (best-effort, ignore result)
+        let p = plist_str.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &p])
+                .output();
+            let _ = tx.send(());
+        });
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(4));
+
+        // Load
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let ok = std::process::Command::new("launchctl")
