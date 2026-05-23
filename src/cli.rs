@@ -68,7 +68,13 @@ enum Command {
         #[arg(short = 'n', long, default_value = "50")]
         lines: usize,
     },
+    /// Manage accounts — add, remove, or log out (interactive menu)
+    Config {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Import the current Claude Code session as an additional account
+    #[command(hide = true)]
     AddAccount {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -79,6 +85,7 @@ enum Command {
         provider: Option<String>,
     },
     /// Remove an account from the pool
+    #[command(hide = true)]
     RemoveAccount {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -97,11 +104,7 @@ enum Command {
         stop: bool,
     },
     /// Log out of an account — clears stored credentials (keeps account in config)
-    ///
-    /// Examples:
-    ///   shunt logout           — interactive picker
-    ///   shunt logout work      — log out 'work'
-    ///   shunt logout --all     — log out every account
+    #[command(hide = true)]
     Logout {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -187,6 +190,7 @@ pub async fn run() -> Result<()> {
         Command::Restart { config } => cmd_restart(config).await,
         Command::Status { config } => cmd_status(config).await,
         Command::Logs { config, follow, lines } => cmd_logs(config, follow, lines).await,
+        Command::Config { config } => cmd_config(config).await,
         Command::AddAccount { config, name, provider } => cmd_add_account(config, name, provider.as_deref()).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
         Command::Logout { config, name, all } => cmd_logout(config, name, all).await,
@@ -288,6 +292,31 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
     println!("  {} Run {} to start.", green(CHECK), cyan("shunt start"));
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// config  (unified account management)
+// ---------------------------------------------------------------------------
+
+async fn cmd_config(config_override: Option<PathBuf>) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+    if !config_p.exists() {
+        bail!("No config found. Run `shunt setup` first.");
+    }
+
+    let items = vec![
+        term::SelectItem { label: format!("{}  {}", bold("Add account"),    dim("connect a new account to the pool")), value: "add".into() },
+        term::SelectItem { label: format!("{}  {}", bold("Remove account"), dim("delete an account from the pool")),   value: "remove".into() },
+        term::SelectItem { label: format!("{}  {}", bold("Log out"),        dim("clear credentials for an account")), value: "logout".into() },
+    ];
+
+    println!();
+    match term::select("Account management", &items, 0) {
+        Some(v) if v == "add"    => cmd_add_account(config_override, None, None).await,
+        Some(v) if v == "remove" => cmd_remove_account(config_override, None).await,
+        Some(v) if v == "logout" => cmd_logout(config_override, None, false).await,
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
