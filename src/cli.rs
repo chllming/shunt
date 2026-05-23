@@ -141,6 +141,18 @@ enum Command {
     },
     /// Update shunt to the latest release
     Update,
+    /// Completely remove shunt — stops service, deletes config, removes binary
+    Uninstall,
+    /// Manage shunt as a system service (auto-start on login)
+    ///
+    /// Examples:
+    ///   shunt service install    — register + start (called by install.sh)
+    ///   shunt service uninstall  — stop + remove
+    ///   shunt service status     — is service registered/running?
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Pin routing to a specific account, or restore automatic routing
     ///
     /// Examples:
@@ -153,6 +165,16 @@ enum Command {
         /// Account name to pin to, or "auto". Omit to pick interactively.
         account: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Register shunt as a login service and start it immediately
+    Install,
+    /// Stop and unregister the shunt login service
+    Uninstall,
+    /// Show whether the service is registered and running
+    Status,
 }
 
 pub async fn run() -> Result<()> {
@@ -172,7 +194,13 @@ pub async fn run() -> Result<()> {
         Command::Connect { code } => cmd_connect(code).await,
         Command::Update => cmd_update().await,
         Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
+        Command::Uninstall => cmd_uninstall().await,
         Command::Use { config, account } => cmd_use(config, account).await,
+        Command::Service { action } => match action {
+            ServiceAction::Install   => cmd_service_install().await,
+            ServiceAction::Uninstall => cmd_service_uninstall().await,
+            ServiceAction::Status    => cmd_service_status().await,
+        },
     }
 }
 
@@ -1428,21 +1456,201 @@ fn futures_executor_hack(resp: reqwest::Response) -> Option<serde_json::Value> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Clean header: ◆ followed by title and optional subtitle, then a rule.
-fn print_splash(info: &[String]) {
-    println!();
-    let title    = info.get(0).map(|s| s.as_str()).unwrap_or("");
-    let subtitle = info.get(1).map(|s| s.as_str()).unwrap_or("");
+/// Circuit shunt symbol: rectangle with wires extending left/right from the mid row,
+/// and two legs going down from the bottom.
+///
+///   ·  ██████  ·
+///   ███      ███   ← wire row (middle of box)
+///   ·  ██████  ·
+///   ·    █ █   ·   ← legs
+fn build_logo_lines(h: usize, w: usize) -> Vec<String> {
+    if h == 0 || w < 5 { return vec![]; }
 
-    println!("  {}  {}", brand_green(DIAMOND), title);
-    if !subtitle.is_empty() {
-        println!("       {}", subtitle);
+    let box_l = w / 4;
+    let box_r = w - w / 4;  // exclusive
+    let leg_h = (h / 4).max(1);
+    let box_h = h.saturating_sub(leg_h).max(2); // at least top + bottom row
+    let wire_row = box_h / 2; // wire connects at vertical mid of box
+
+    // Mirror from each side so legs are symmetric around centre.
+    let leg1 = w / 3;
+    let leg2 = w - w / 3 - 1;
+
+    let mut out = Vec::new();
+    for row in 0..h {
+        let mut r = vec![' '; w];
+        if row < box_h {
+            let is_top = row == 0;
+            let is_bot = row == box_h - 1;
+            if is_top || is_bot {
+                for j in box_l..box_r { r[j] = '█'; }
+            } else {
+                r[box_l]     = '█';
+                r[box_r - 1] = '█';
+            }
+            if row == wire_row {
+                for j in 0..box_l  { r[j] = '█'; }
+                for j in box_r..w  { r[j] = '█'; }
+            }
+        } else {
+            if leg1 < w { r[leg1] = '█'; }
+            if leg2 < w { r[leg2] = '█'; }
+        }
+        out.push(r.into_iter().collect());
     }
-    let w = strip_ansi(title).chars().count()
-        .max(strip_ansi(subtitle).chars().count())
-        .max(18) + 3;
-    println!("  {}", dim(&"─".repeat(w)));
-    println!();
+    out
+}
+
+fn render_splash_frame(
+    f: &mut ratatui::Frame,
+    title_raw: &str,
+    subtitle_raw: &str,
+) {
+    use ratatui::{
+        layout::{Constraint, Direction, Layout},
+        style::{Color, Style},
+        text::Line,
+        widgets::{Block, Borders, Paragraph},
+    };
+
+    let brand   = Color::Rgb(188, 255, 96);  // #bcff60
+    let dim_col = Color::Rgb(100, 160, 40);  // #bcff60 dimmed
+
+    // Fixed-width box — does not stretch to fill the terminal.
+    const BOX_W: u16 = 70;
+    let full = f.area();
+    let area = Layout::new(Direction::Horizontal, [
+        Constraint::Length(BOX_W.min(full.width)),
+        Constraint::Fill(1),
+    ]).split(full)[0];
+
+    // Outer bordered box.
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(brand))
+        .title(Line::styled(format!(" {title_raw} "), Style::default().fg(brand)));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    const CONTENT_H: u16 = 4;
+    const LOGO_W:    u16 = 10;
+
+    // Main horizontal split: left half | separator | right half
+    let cols = Layout::new(Direction::Horizontal, [
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ]).split(inner);
+    let (left_area, sep_area, right_area) = (cols[0], cols[1], cols[2]);
+
+    // Left: vertical centering around the content row.
+    let has_sub = !subtitle_raw.is_empty();
+    let left_v_constraints: Vec<Constraint> = if has_sub {
+        vec![Constraint::Fill(1), Constraint::Length(CONTENT_H), Constraint::Fill(1), Constraint::Length(1)]
+    } else {
+        vec![Constraint::Fill(1), Constraint::Length(CONTENT_H), Constraint::Fill(1)]
+    };
+    let left_v = Layout::new(Direction::Vertical, left_v_constraints).split(left_area);
+    let content_row = left_v[1];
+
+    // Left content: logo centered horizontally within the left half
+    let h = Layout::new(Direction::Horizontal, [
+        Constraint::Fill(1),
+        Constraint::Length(LOGO_W),
+        Constraint::Fill(1),
+    ]).split(content_row);
+
+    let logo = build_logo_lines(CONTENT_H as usize, LOGO_W as usize);
+    f.render_widget(
+        Paragraph::new(logo.into_iter()
+            .map(|l| Line::styled(l, Style::default().fg(brand)))
+            .collect::<Vec<_>>()),
+        h[1],
+    );
+
+    if has_sub {
+        f.render_widget(
+            Paragraph::new(subtitle_raw).style(Style::default().fg(dim_col)),
+            left_v[3],
+        );
+    }
+
+    // Vertical separator spanning full inner height.
+    let sep_lines: Vec<Line> = (0..sep_area.height)
+        .map(|_| Line::styled("│", Style::default().fg(dim_col)))
+        .collect();
+    f.render_widget(Paragraph::new(sep_lines), sep_area);
+
+    // Right: brief description, vertically centered, with left padding.
+    let desc: Vec<Line> = vec![
+        Line::styled("Pool multiple Claude accounts", Style::default().fg(dim_col)),
+        Line::styled("behind a single endpoint.", Style::default().fg(dim_col)),
+        Line::styled("Maximise rate limits across", Style::default().fg(dim_col)),
+        Line::styled("all accounts automatically.", Style::default().fg(dim_col)),
+    ];
+    let desc_h = desc.len() as u16;
+    let right_v = Layout::new(Direction::Vertical, [
+        Constraint::Fill(1),
+        Constraint::Length(desc_h),
+        Constraint::Fill(1),
+    ]).split(right_area);
+    let right_h = Layout::new(Direction::Horizontal, [
+        Constraint::Fill(1),
+        Constraint::Length(2),
+    ]).split(right_v[1]);
+    f.render_widget(
+        Paragraph::new(desc).alignment(ratatui::layout::Alignment::Right),
+        right_h[0],
+    );
+}
+
+
+/// Print the splash using ratatui inline viewport — redraws live on resize.
+fn print_splash(info: &[String]) {
+    use ratatui::{backend::CrosstermBackend, Terminal, TerminalOptions, Viewport};
+    use crossterm::{event::{self, Event}, terminal as cterm};
+    use std::io::stdout;
+
+    let title_raw    = info.get(0).map(|s| strip_ansi(s)).unwrap_or_default();
+    let subtitle_raw = info.get(1).map(|s| strip_ansi(s)).unwrap_or_default();
+
+    // Logo = 4 rows content + 2 border + 2 vertical padding + optional subtitle
+    let splash_h: u16 = 4 + 2 + 2 + if subtitle_raw.is_empty() { 0 } else { 1 };
+
+    let mut terminal = match Terminal::with_options(
+        CrosstermBackend::new(stdout()),
+        TerminalOptions { viewport: Viewport::Inline(splash_h) },
+    ) {
+        Ok(t) => t,
+        Err(_) => {
+            // Fallback: plain text header if ratatui fails (e.g. non-TTY).
+            println!("\n  ◆  {}  {}\n", title_raw.trim(), subtitle_raw);
+            return;
+        }
+    };
+
+    let draw = |t: &mut Terminal<CrosstermBackend<std::io::Stdout>>| {
+        t.draw(|f| render_splash_frame(f, &title_raw, &subtitle_raw)).ok();
+    };
+
+    draw(&mut terminal);
+
+    // Redraw on resize for up to 500 ms.
+    let _ = cterm::enable_raw_mode();
+    let dl = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let rem = dl.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() { break; }
+        if event::poll(rem).unwrap_or(false) {
+            match event::read() {
+                Ok(Event::Resize(_, _)) => draw(&mut terminal),
+                _ => break,
+            }
+        } else { break; }
+    }
+    let _ = cterm::disable_raw_mode();
+    let _ = terminal.show_cursor();
+    println!(); // move cursor to next line after the inline viewport
 }
 
 // ---------------------------------------------------------------------------
@@ -1757,9 +1965,8 @@ async fn cmd_update() -> Result<()> {
 
     print_splash(&[
         format!("{}  {}", brand_green("shunt"), dim(&format!("v{current}"))),
-        dim("Checking for updates…").to_string(),
-        String::new(),
     ]);
+    println!("  {} Checking for updates…", dim("·"));
 
     // Fetch latest release from GitHub API
     let client = reqwest::Client::builder()
@@ -2431,6 +2638,431 @@ fn offer_shell_export() -> Result<()> {
         dim(&path.display().to_string()),
         cyan(&format!("source {}", path.display())));
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// uninstall
+// ---------------------------------------------------------------------------
+
+async fn cmd_uninstall() -> Result<()> {
+    use std::io::Write as _;
+
+    // ── Collect what exists ───────────────────────────────────────────────────
+    let config_dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("shunt");
+
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("shunt");
+
+    let exe = std::env::current_exe().ok();
+
+    // Shell profile line to remove
+    let shell_profile = detect_shell_profile();
+    let profile_has_export = shell_profile.as_ref().and_then(|p| {
+        std::fs::read_to_string(p).ok()
+    }).map(|s| s.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:")).unwrap_or(false);
+
+    #[cfg(target_os = "macos")]
+    let service_plist = {
+        let p = service_plist_path();
+        if p.exists() { Some(p) } else { None }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let service_plist: Option<PathBuf> = None;
+
+    #[cfg(target_os = "linux")]
+    let service_unit = {
+        let p = service_unit_path();
+        if p.exists() { Some(p) } else { None }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let service_unit: Option<PathBuf> = None;
+
+    // ── Show plan ─────────────────────────────────────────────────────────────
+    print_splash(&[
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        red("Uninstall").to_string(),
+        String::new(),
+    ]);
+
+    println!("  This will permanently remove:");
+    println!();
+
+    if service_plist.is_some() || service_unit.is_some() {
+        println!("  {}  Stop and unregister login service", red("✕"));
+    }
+
+    if config_dir.exists() {
+        println!("  {}  {} {}", red("✕"), dim("delete"), cyan(&config_dir.display().to_string()));
+    }
+    if data_dir.exists() && data_dir != config_dir {
+        println!("  {}  {} {}", red("✕"), dim("delete"), cyan(&data_dir.display().to_string()));
+    }
+    if let Some(ref p) = shell_profile {
+        if profile_has_export {
+            println!("  {}  {} ANTHROPIC_BASE_URL from {}", red("✕"), dim("remove"), cyan(&p.display().to_string()));
+        }
+    }
+    if let Some(ref exe_path) = exe {
+        println!("  {}  {} {}", red("✕"), dim("delete"), cyan(&exe_path.display().to_string()));
+    }
+
+    println!();
+
+    // ── Reconfirm ─────────────────────────────────────────────────────────────
+    if !term::confirm("Are you sure you want to completely uninstall shunt?") {
+        println!("  {} Cancelled.", dim("·"));
+        println!();
+        return Ok(());
+    }
+
+    // Second confirmation — type "uninstall"
+    println!();
+    print!("  {} Type {} to confirm: ", dim("·"), bold("uninstall"));
+    std::io::stdout().flush()?;
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    if buf.trim() != "uninstall" {
+        println!("  {} Cancelled.", dim("·"));
+        println!();
+        return Ok(());
+    }
+
+    println!();
+
+    // ── Execute ───────────────────────────────────────────────────────────────
+
+    // 1. Stop + unregister service
+    #[cfg(target_os = "macos")]
+    if let Some(ref p) = service_plist {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &p.display().to_string()])
+            .output();
+        let _ = std::fs::remove_file(p);
+        println!("  {} Login service removed", green(CHECK));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ref p) = service_unit {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", "shunt"])
+            .output();
+        let _ = std::fs::remove_file(p);
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output();
+        println!("  {} Login service removed", green(CHECK));
+    }
+
+    // 2. Config + credentials dir
+    if config_dir.exists() {
+        std::fs::remove_dir_all(&config_dir)
+            .with_context(|| format!("failed to remove {}", config_dir.display()))?;
+        println!("  {} Config removed  {}", green(CHECK), dim(&config_dir.display().to_string()));
+    }
+
+    // 3. Data dir (logs, state, pid) — skip if same as config_dir (macOS)
+    if data_dir.exists() && data_dir != config_dir {
+        std::fs::remove_dir_all(&data_dir)
+            .with_context(|| format!("failed to remove {}", data_dir.display()))?;
+        println!("  {} Data removed    {}", green(CHECK), dim(&data_dir.display().to_string()));
+    }
+
+    // 4. Shell profile — strip ANTHROPIC_BASE_URL lines
+    if let Some(ref profile_path) = shell_profile {
+        if profile_has_export {
+            if let Ok(contents) = std::fs::read_to_string(profile_path) {
+                let cleaned: String = contents
+                    .lines()
+                    .filter(|l| {
+                        !l.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:")
+                            && *l != "# Added by shunt"
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // Preserve trailing newline if original had one
+                let cleaned = if contents.ends_with('\n') {
+                    format!("{cleaned}\n")
+                } else {
+                    cleaned
+                };
+                std::fs::write(profile_path, cleaned)?;
+                println!("  {} Shell export removed  {}", green(CHECK),
+                    dim(&profile_path.display().to_string()));
+            }
+        }
+    }
+
+    // 5. Binary — do this last so error messages can still print
+    if let Some(exe_path) = exe {
+        // Spawn a tiny shell to delete the binary after this process exits
+        let path_str = exe_path.display().to_string();
+        std::process::Command::new("sh")
+            .args(["-c", &format!("sleep 0.3 && rm -f '{path_str}'")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+        println!("  {} Binary removed   {}", green(CHECK), dim(&exe_path.display().to_string()));
+    }
+
+    println!();
+    println!("  {} shunt fully removed.", green(CHECK));
+    println!("  {} Run {} to clear the proxy from this shell session.", dim("·"), cyan("unset ANTHROPIC_BASE_URL"));
+    println!();
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// service
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn service_plist_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("Library/LaunchAgents/sh.shunt.proxy.plist")
+}
+
+#[cfg(target_os = "linux")]
+fn service_unit_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".config/systemd/user/shunt.service")
+}
+
+/// Write the platform service file and enable it to run at login.
+fn register_service() -> Result<()> {
+    let exe = std::env::current_exe().context("cannot locate current executable")?;
+    let exe_str = exe.display().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = service_plist_path();
+        if let Some(parent) = plist_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let plist = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>sh.shunt.proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe_str}</string>
+    <string>start</string>
+    <string>--foreground</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{home}/Library/Logs/shunt.log</string>
+  <key>StandardErrorPath</key>
+  <string>{home}/Library/Logs/shunt.log</string>
+</dict>
+</plist>
+"#,
+            exe_str = exe_str,
+            home = dirs::home_dir().unwrap_or_default().display(),
+        );
+        std::fs::write(&plist_path, &plist)?;
+
+        // Unload first in case it was already loaded (avoids duplicate errors)
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &plist_path.display().to_string()])
+            .output();
+
+        let out = std::process::Command::new("launchctl")
+            .args(["load", "-w", &plist_path.display().to_string()])
+            .output()
+            .context("failed to run launchctl")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!("launchctl load failed: {}", stderr.trim());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit_path = service_unit_path();
+        if let Some(parent) = unit_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let unit = format!(
+            "[Unit]\nDescription=shunt Claude Code proxy\nAfter=network.target\n\n\
+             [Service]\nExecStart={exe_str} start --foreground\nRestart=always\nRestartSec=5\n\n\
+             [Install]\nWantedBy=default.target\n"
+        );
+        std::fs::write(&unit_path, &unit)?;
+
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output();
+
+        let out = std::process::Command::new("systemctl")
+            .args(["--user", "enable", "--now", "shunt"])
+            .output()
+            .context("failed to run systemctl")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!("systemctl enable failed: {}", stderr.trim());
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    bail!("Service management is only supported on macOS and Linux.");
+
+    Ok(())
+}
+
+async fn cmd_service_install() -> Result<()> {
+    print_splash(&[
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        dim("Service install"),
+        String::new(),
+    ]);
+
+    // 1. Ensure config + credentials exist (OAuth flow if needed)
+    let config_p = config_path();
+    if !config_p.exists() {
+        cmd_setup_auto(None).await?;
+    }
+
+    // 2. Read port from config for shell export
+    let port = crate::config::load_config(None)
+        .map(|c| c.server.port)
+        .unwrap_or(8082);
+
+    // 3. Register the platform service
+    register_service()?;
+
+    // 4. Write shell export silently
+    auto_write_shell_export(port);
+
+    // 5. Wait a moment then check health
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let config = crate::config::load_config(None).ok();
+    let host = config.as_ref().map(|c| c.server.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
+    let running = wait_for_health(&host, port, 6).await;
+
+    println!();
+    if running {
+        println!("  {}  {}  {}", green(DOT), green_bold("proxy running"),
+            cyan(&format!("http://{host}:{port}")));
+    } else {
+        println!("  {}  {} — service registered, proxy starting in background",
+            yellow(DOT), yellow("starting"));
+    }
+
+    #[cfg(target_os = "macos")]
+    println!("  {}  service registered (LaunchAgent — starts at login)",
+        green(CHECK));
+    #[cfg(target_os = "linux")]
+    println!("  {}  service registered (systemd user unit — starts at login)",
+        green(CHECK));
+
+    println!();
+    println!("  {} To unregister: {}", dim("·"), cyan("shunt service uninstall"));
+    println!();
+
+    Ok(())
+}
+
+async fn cmd_service_uninstall() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = service_plist_path();
+        if plist_path.exists() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist_path.display().to_string()])
+                .output();
+            std::fs::remove_file(&plist_path)
+                .context("failed to remove plist")?;
+            println!("  {} Service unregistered.", green(CHECK));
+        } else {
+            println!("  {} Service not registered.", dim("·"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit_path = service_unit_path();
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", "shunt"])
+            .output();
+        if unit_path.exists() {
+            std::fs::remove_file(&unit_path)
+                .context("failed to remove unit file")?;
+        }
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output();
+        println!("  {} Service unregistered.", green(CHECK));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    bail!("Service management is only supported on macOS and Linux.");
+
+    println!();
+    Ok(())
+}
+
+async fn cmd_service_status() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = service_plist_path();
+        let registered = plist_path.exists();
+        if registered {
+            println!("  {} Registered  {}", green(CHECK), dim(&plist_path.display().to_string()));
+        } else {
+            println!("  {} Not registered (run {})", dim("·"), cyan("shunt service install"));
+        }
+
+        // Check if launchd considers it running
+        let out = std::process::Command::new("launchctl")
+            .args(["list", "sh.shunt.proxy"])
+            .output();
+        let running = out.map(|o| o.status.success()).unwrap_or(false);
+        if running {
+            println!("  {} Running (launchd)", green(DOT));
+        } else {
+            println!("  {} Not running", dim(DOT));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit_path = service_unit_path();
+        let registered = unit_path.exists();
+        if registered {
+            println!("  {} Registered  {}", green(CHECK), dim(&unit_path.display().to_string()));
+        } else {
+            println!("  {} Not registered (run {})", dim("·"), cyan("shunt service install"));
+        }
+
+        let out = std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "shunt"])
+            .output();
+        let active = out.map(|o| o.status.success()).unwrap_or(false);
+        if active {
+            println!("  {} Running (systemd)", green(DOT));
+        } else {
+            println!("  {} Not running", dim(DOT));
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    println!("  {} Service management is only supported on macOS and Linux.", dim("·"));
+
+    println!();
     Ok(())
 }
 

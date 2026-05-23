@@ -1,6 +1,6 @@
 [package]
 name = "shunt-proxy"
-version = "0.1.53"
+version = "0.1.54"
 edition = "2021"
 authors = ["Ramcharan <sairamcharansudagoni@gmail.com>"]
 description = "A local proxy that pools multiple Claude accounts behind a single endpoint, routing requests to maximise rate limits"
@@ -46,13 +46,14 @@ hex = "0.4.3"
 url = "2.5.8"
 libc = "0.2.185"
 crossterm = "0.27"
-ratatui = "0.29"
+ratatui = "0.30"
 flate2 = "1"
 tar = "0.4"
 aes-gcm = "0.10"
 getrandom = "0.2"
 toml_edit = "0.22"
 unicode-width = "0.1"
+tui-big-text = "0.8"
 async-stream = "0.3"
 
 [dev-dependencies]

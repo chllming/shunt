@@ -63,14 +63,12 @@ fi
 echo ""
 echo "Installed $BIN $VERSION to $INSTALL_DIR/$BIN"
 
-# Check if INSTALL_DIR is on PATH
+# Ensure INSTALL_DIR is on PATH for this session so the binary runs immediately
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
-  *)
-    echo ""
-    echo "Add to your PATH:"
-    echo "  export PATH=\"\$PATH:$INSTALL_DIR\""
-    echo ""
-    echo "Or add that line to your ~/.zshrc / ~/.bashrc"
-    ;;
+  *) export PATH="$INSTALL_DIR:$PATH" ;;
 esac
+
+# Configure shunt: import credentials, register login service, start proxy
+echo "Configuring shunt..."
+"$INSTALL_DIR/$BIN" service install
