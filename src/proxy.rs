@@ -59,7 +59,9 @@ fn build_app_state(
 ) -> anyhow::Result<(AppState, LiveCredentials)> {
     let forwarder = Forwarder::new(&config.server.upstream_url, config.server.request_timeout_secs)?;
 
-    for a in config.accounts.iter().filter(|a| a.credential.is_none()) {
+    for a in config.accounts.iter().filter(|a| {
+        a.credential.is_none() && a.provider.auth_kind() != crate::provider::AuthKind::None
+    }) {
         state.set_auth_failed(&a.name);
     }
 

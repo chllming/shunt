@@ -1377,7 +1377,7 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             if util_7d.is_some() || reset_7d.is_some() {
                 window_row("7d", util_7d, reset_7d, status_7d);
             }
-        } else if acc.credential.is_none() {
+        } else if acc.credential.is_none() && acc.provider.auth_kind() != crate::provider::AuthKind::None {
             println!("{}", card_row(&format!("{}  run {}",
                 dim("·"), cyan(&format!("shunt add-account {}", acc.name)))));
         } else if status == "reauth_required" {
