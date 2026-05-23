@@ -1716,12 +1716,12 @@ fn render_splash_frame(
     // Right: custom lines (center-aligned) or static description (right-aligned).
     let static_desc: Vec<String> = vec![
         "Pool multiple Claude accounts".into(),
-        "    behind a single endpoint.".into(),
-        "  Maximise rate limits across".into(),
-        "  all accounts automatically.".into(),
+        "behind a single endpoint.".into(),
+        "Maximise rate limits across".into(),
+        "all accounts automatically.".into(),
     ];
     let (desc_lines, alignment) = if right_lines.is_empty() {
-        (static_desc.as_slice(), ratatui::layout::Alignment::Right)
+        (static_desc.as_slice(), ratatui::layout::Alignment::Center)
     } else {
         (right_lines, ratatui::layout::Alignment::Center)
     };
