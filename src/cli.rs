@@ -1269,26 +1269,33 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             "cooling"         => (yellow("↻"),  yellow("cooling")),
             "disabled"        => (red(CROSS),   red("disabled")),
             "reauth_required" => (red(CROSS),   red("session expired")),
-            _ => match &acc.credential {
-                None                          => (red(CROSS),   red("no credential")),
-                Some(c) if c.needs_refresh()  => (yellow(CROSS), yellow("token expired")),
-                _                             => (dim(EMPTY),   dim("offline")),
-            },
+            _ => {
+                use crate::provider::AuthKind;
+                match &acc.credential {
+                    // Local/None-auth providers don't need a credential — show offline, not error.
+                    None if acc.provider.auth_kind() == AuthKind::None
+                                                  => (dim(EMPTY),   dim("offline")),
+                    None                          => (red(CROSS),   red("no credential")),
+                    Some(c) if c.needs_refresh()  => (yellow(CROSS), yellow("token expired")),
+                    _                             => (dim(EMPTY),   dim("offline")),
+                }
+            }
         };
 
-        let plan_label = if acc.provider == crate::provider::Provider::OpenAI {
-            match acc.plan_type.to_lowercase().as_str() {
+        let plan_label: &str = match &acc.provider {
+            crate::provider::Provider::OpenAI => match acc.plan_type.to_lowercase().as_str() {
                 "plus"  => "ChatGPT Plus [beta]",
                 "pro"   => "ChatGPT Pro [beta]",
                 "team"  => "ChatGPT Team [beta]",
                 _       => "ChatGPT [beta]",
-            }
-        } else {
-            match acc.plan_type.to_lowercase().as_str() {
+            },
+            crate::provider::Provider::Anthropic => match acc.plan_type.to_lowercase().as_str() {
                 "max" | "claude_max" => "Claude Max",
                 "team"               => "Claude Team",
                 _                    => "Claude Pro",
-            }
+            },
+            // API-key and Local providers don't have Claude plan tiers.
+            _ => "",
         };
         let email_str = acc.credential.as_ref().and_then(|c| c.email()).unwrap_or("");
 
