@@ -69,25 +69,22 @@ fn canonical_tools(v: &serde_json::Value) -> String {
 // Account selection helpers
 // ---------------------------------------------------------------------------
 
-/// Return (effective_utilization, soonest_reset) for an account's rate-limit windows.
+/// Return (effective_utilization, binding_reset) for an account's rate-limit windows.
 ///
 /// `effective_utilization` = max(util_5h, util_7d) — the binding constraint is whichever
-/// window is more exhausted, not just whichever expires sooner.
+/// window is more exhausted.
 ///
-/// `soonest_reset` = the earliest reset timestamp across both windows, used for the
-/// "use-it-or-lose-it" expiry check (if any window is expiring soon, prefer this account).
+/// `binding_reset` = the reset timestamp of the most-utilized (binding) window.
+/// This is used for the primary sort key: prefer the account whose binding window
+/// expires soonest — those unused tokens are at greatest risk of being wasted.
 fn most_urgent_window(
     util_5h: f64, reset_5h: Option<u64>,
     util_7d: f64, reset_7d: Option<u64>,
 ) -> (f64, Option<u64>) {
     let effective = util_5h.max(util_7d);
-    let soonest = match (reset_5h, reset_7d) {
-        (Some(r5), Some(r7)) => Some(r5.min(r7)),
-        (Some(r5), None)     => Some(r5),
-        (None, Some(r7))     => Some(r7),
-        (None, None)         => None,
-    };
-    (effective, soonest)
+    // Use the reset time of whichever window is the binding constraint (most utilized).
+    let binding_reset = if util_5h >= util_7d { reset_5h } else { reset_7d };
+    (effective, binding_reset)
 }
 
 // ---------------------------------------------------------------------------
@@ -136,10 +133,10 @@ pub fn pick_account<'a>(
     }
 
     // Pick the best account:
-    // - "Expiring soon" (reset within 30 min, not exhausted) → use it or lose it;
+    // - "Expiring soon" (binding window resets within 30 min, not exhausted) → use it or lose it;
     //   among those, prefer the most urgent (soonest reset).
-    // - Otherwise → drain most-utilized-first within the same reset window so tokens
-    //   aren't wasted; across different windows, prefer the soonest-expiring window.
+    // - Otherwise → prefer the account whose binding window expires soonest (to avoid wasting
+    //   tokens); break ties by draining the most-utilized account first.
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -168,11 +165,12 @@ pub fn pick_account<'a>(
                 (false, true) => std::cmp::Ordering::Greater,
                 (true, true) => ra.cmp(&rb), // most urgent first
                 (false, false) => {
-                    // Drain most-utilized first (reversed: higher utilization = preferred).
-                    ub.partial_cmp(&ua).unwrap_or(std::cmp::Ordering::Equal)
+                    // Primary: prefer the account whose binding window expires soonest
+                    // (those tokens are at greatest risk of being wasted).
+                    ra.unwrap_or(u64::MAX).cmp(&rb.unwrap_or(u64::MAX))
                         .then_with(|| {
-                            // Break ties by Anthropic's actual reset time: soonest expiry first.
-                            ra.unwrap_or(u64::MAX).cmp(&rb.unwrap_or(u64::MAX))
+                            // Tiebreak: drain most-utilized first (higher utilization = preferred).
+                            ub.partial_cmp(&ua).unwrap_or(std::cmp::Ordering::Equal)
                         })
                 }
             }
