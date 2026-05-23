@@ -1859,8 +1859,9 @@ fn render_splash_frame(
         widgets::{Block, Borders, Paragraph},
     };
 
-    let brand   = Color::Indexed(154);  // lime-green, consistent across all terminals
-    let dim_col = Color::Indexed(64);   // darker green for dimmed elements
+    let brand    = Color::Rgb(34, 197, 94);   // matches monitor BRAND / GREEN
+    let dim_col  = Color::Rgb(120, 120, 120); // matches monitor DIM
+    let dk_green = Color::Rgb(22, 101, 52);   // matches monitor DK_GREEN (borders/sep)
 
     // Fixed-width box — does not stretch to fill the terminal.
     const BOX_W: u16 = 70;
@@ -1873,7 +1874,7 @@ fn render_splash_frame(
     // Outer bordered box.
     let outer = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(brand))
+        .border_style(Style::default().fg(dk_green))
         .title(Line::styled(format!(" {title_raw} "), Style::default().fg(brand)));
     let inner = outer.inner(area);
     f.render_widget(outer, area);
@@ -1923,7 +1924,7 @@ fn render_splash_frame(
 
     // Vertical separator spanning full inner height.
     let sep_lines: Vec<Line> = (0..sep_area.height)
-        .map(|_| Line::styled("│", Style::default().fg(dim_col)))
+        .map(|_| Line::styled("│", Style::default().fg(dk_green)))
         .collect();
     f.render_widget(Paragraph::new(sep_lines), sep_area);
 
