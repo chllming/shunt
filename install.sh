@@ -71,4 +71,4 @@ esac
 
 # Configure shunt: import credentials, register login service, start proxy
 echo "Configuring shunt..."
-"$INSTALL_DIR/$BIN" service install
+"$INSTALL_DIR/$BIN" service install < /dev/null

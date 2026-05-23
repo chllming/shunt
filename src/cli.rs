@@ -2961,10 +2961,19 @@ async fn cmd_service_install() -> Result<()> {
         String::new(),
     ]);
 
-    // 1. Ensure config + credentials exist (OAuth flow if needed)
+    // 1. Ensure config + credentials exist.
+    //    If stdin is not a TTY (e.g. curl | sh), skip interactive setup to
+    //    avoid blocking on keychain/OAuth. The service is still registered and
+    //    the proxy started; user runs `shunt setup` in a terminal to finish.
     let config_p = config_path();
+    let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
     if !config_p.exists() {
-        cmd_setup_auto(None).await?;
+        if stdin_is_tty {
+            cmd_setup_auto(None).await?;
+        } else {
+            println!("  {} No config — run {} in a terminal to import credentials",
+                yellow("·"), cyan("shunt setup"));
+        }
     }
 
     // 2. Read port from config for shell export

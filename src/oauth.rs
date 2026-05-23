@@ -237,13 +237,23 @@ pub fn read_claude_session_info() -> Option<SessionInfo> {
 fn read_raw_credentials_json() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        let out = std::process::Command::new("security")
-            .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
-            .output()
-            .ok()?;
-        if out.status.success() {
-            let s = String::from_utf8(out.stdout).ok()?;
-            return Some(s.trim().to_owned());
+        // `security` can hang indefinitely in SSH sessions (no GUI keychain
+        // context). Run it in a thread with a 5-second timeout and fall
+        // through to the file-based fallback if it doesn't respond.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = std::process::Command::new("security")
+                .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+                .output()
+                .ok();
+            let _ = tx.send(out);
+        });
+        if let Ok(Some(out)) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    return Some(s.trim().to_owned());
+                }
+            }
         }
     }
     std::fs::read_to_string(claude_credentials_path()).ok()
