@@ -31,7 +31,7 @@ esac
 # Fetch latest release version
 echo "Fetching latest release..."
 VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-  | grep '"tag_name"' | sed 's/.*"tag_name": *"\(.*\)".*/\1/')"
+  | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
 
 if [ -z "$VERSION" ]; then
   echo "Could not determine latest version." >&2
