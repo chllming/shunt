@@ -561,10 +561,11 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse) {
             ]));
         }
 
-        // 5h bar
-        lines.push(util_bar_line("5h", acc.utilization_5h, acc.reset_5h));
-        // 7d bar
-        lines.push(util_bar_line("7d", acc.utilization_7d, acc.reset_7d));
+        // Rate-limit bars — only Anthropic reports utilization windows.
+        if acc.provider == "anthropic" || acc.provider.is_empty() {
+            lines.push(util_bar_line("5h", acc.utilization_5h, acc.reset_5h));
+            lines.push(util_bar_line("7d", acc.utilization_7d, acc.reset_7d));
+        }
 
         lines.push(Line::raw(""));
     }

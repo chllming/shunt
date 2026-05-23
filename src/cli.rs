@@ -1387,7 +1387,13 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             match &acc.provider {
                 crate::provider::Provider::Anthropic =>
                     println!("{}", card_row(&dim("· quota data will appear after first request"))),
-                crate::provider::Provider::Local => {}  // local has no quota
+                crate::provider::Provider::Local => {
+                    if acc.model.is_none() {
+                        println!("{}", card_row(&dim(&format!(
+                            "· tip: set model = \"your-model\" in config for this account"
+                        ))));
+                    }
+                }
                 _ =>
                     println!("{}", card_row(&dim("· quota tracking unavailable (provider doesn't report utilization)"))),
             }
