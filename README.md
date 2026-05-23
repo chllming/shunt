@@ -20,17 +20,17 @@
 Shunt is a local proxy that sits between your AI coding agents and every major AI provider. It pools multiple accounts, rotates across them intelligently, and presents a single unified endpoint — so your tools never see a rate limit, a 429, or a cold start.
 
 ```
-  Claude Code ─┐                    ┌─ Anthropic  (port 8082)
-  Cursor      ─┤                    ├─ OpenAI API (port 8083)
-  Codex CLI   ─┤──▶  [ shunt ]  ──▶ ├─ Gemini     (port 8092)
-  Windsurf    ─┤                    ├─ Groq        (port 8086)
-  any SDK     ─┘                    ├─ Mistral     (port 8087)
-                                    ├─ DeepSeek    (port 8090)
-                                    ├─ OpenRouter  (port 8089)
-                                    ├─ Together    (port 8088)
-                                    ├─ Fireworks   (port 8091)
-                                    ├─ Ollama      (port 8085/8093)
-                                    └─ local LLMs  (port 8093)
+  ✓ Claude Code ─┐                    ┌─ Anthropic
+    Cursor      ─┤                    ├─ OpenAI API
+    Codex CLI   ─┤──▶  [ shunt ]  ──▶ ├─ Gemini
+    Windsurf    ─┤                    ├─ Groq
+    any SDK     ─┘                    ├─ Mistral
+                                      ├─ DeepSeek
+                                      ├─ OpenRouter
+                                      ├─ Together
+                                      ├─ Fireworks
+                                      ├─ Ollama
+                                      └─ local LLMs
 ```
 
 One binary. Twelve providers. Every coding agent. Zero rate limits.
