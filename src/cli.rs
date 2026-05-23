@@ -1797,7 +1797,9 @@ fn print_status_splash(title: &str, right_lines: Vec<String>) {
     use crossterm::{event::{self, Event}, terminal as cterm};
     use std::io::stdout;
 
-    let splash_h: u16 = 4 + 2 + 2; // content + border + padding (no subtitle)
+    // Ensure top and bottom Fill(1) each get ≥1 row:
+    // inner_h = splash_h - 2; need inner_h >= content + 2 fills → splash_h >= len + 4
+    let splash_h: u16 = (right_lines.len() as u16 + 4).max(8);
     let right = right_lines.clone();
 
     let mut terminal = match Terminal::with_options(
