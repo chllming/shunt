@@ -1,81 +1,77 @@
 <div align="center">
 
-<img src="logo.svg" alt="shunt logo" width="140">
+<img src="logo.svg" alt="shunt" width="120"><br>
 
 # shunt
 
-**Pool every AI provider. Route every coding agent. Never hit a rate limit again.**
+**A proxy for AI coding agents — pool accounts, beat rate limits.**
 
 [![crates.io](https://img.shields.io/crates/v/shunt-proxy.svg)](https://crates.io/crates/shunt-proxy)
 [![downloads](https://img.shields.io/github/downloads/ramc10/shunt/total)](https://github.com/ramc10/shunt/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![platform](https://img.shields.io/badge/macOS%20%7C%20Linux-lightgrey)
+
+</div>
+
+---
+
+Shunt sits between your coding agents and your AI providers. It pools multiple accounts behind a single local endpoint, always routing to whoever has the most capacity left — so you never hit a rate limit mid-session.
+
+<div align="center">
+<img src="diagram.svg" width="600">
+</div>
+
+**Works with:** Claude Code · Cursor · Codex CLI · Windsurf · any OpenAI or Anthropic SDK
+
+**Providers:** Anthropic · OpenAI · Gemini · Groq · Mistral · DeepSeek · OpenRouter · Together · Fireworks · Ollama · local models
+
+---
+
+## Install
+
+**macOS / Linux**
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/ramc10/shunt/main/install.sh | sh
 ```
 
-</div>
-
----
-
-Shunt is a local proxy that sits between your AI coding agents and every major AI provider. It pools multiple accounts, rotates across them intelligently, and presents a single unified endpoint — so your tools never see a rate limit again.
-
-<div align="center">
-<img src="diagram.svg" alt="shunt routing diagram" width="620">
-</div>
-
----
-
-## Supported providers
-
-Anthropic · OpenAI · Gemini · Groq · Mistral · DeepSeek · OpenRouter · Together · Fireworks · Ollama · local LLMs
-
----
-
-## Why shunt?
-
-- **Pool multiple accounts** — two Claude Pro accounts ≈ 2× the throughput. Three ≈ 3×
-- **Always picks the best account** — tracks live utilization after every response, routes to whoever has the most headroom
-- **Never drops a request** — if an account hits a limit, shunt retries on the next best one instantly. If all accounts are drained, it holds your request and retries the moment the first one resets
-- **Share with your team** — expose your pool over LAN or a Cloudflare tunnel with one command
-- **Drop-in** — one env var and every tool you already use routes through shunt
-
----
-
-## Setup
-
-**1. Run setup**
+**via Cargo**
 
 ```bash
-shunt setup
+cargo install shunt-proxy
 ```
 
-Imports your existing Claude Code session and configures your shell automatically.
+---
 
-**2. Add more accounts**
-
-```bash
-shunt add-account personal   # another Claude account
-shunt add-account groq       # Groq API key
-shunt add-account codex      # ChatGPT Pro
-```
-
-**3. Start**
+## Quick start
 
 ```bash
-shunt start
+shunt setup      # import your Claude Code session + configure your shell
+shunt start      # start the proxy
 ```
 
-Done. Claude Code, Cursor, Codex CLI — everything routes through shunt automatically.
+That's it. Your tools will route through shunt automatically.
+
+To add more accounts:
+
+```bash
+shunt add-account personal   # another Claude account (OAuth)
+shunt add-account groq       # Groq (prompts for API key)
+shunt add-account codex      # ChatGPT Pro (device-code flow)
+```
 
 ---
 
-## Status
+## What you get
+
+**No more waiting on rate limits**
+
+If an account hits a limit, shunt switches to the next one instantly. If every account is drained, it holds your request open and retries the moment the first one resets — your agent session never fails.
+
+**Live dashboard**
 
 ```bash
-shunt status    # snapshot
-shunt monitor   # live fullscreen dashboard
+shunt monitor
 ```
 
 ```
@@ -91,26 +87,28 @@ shunt monitor   # live fullscreen dashboard
 
     ✓  available
     5h  ────────────────────  fresh
-    7d  ────────────────────  fresh
 ```
 
----
-
-## Sharing
+**Share with your team**
 
 ```bash
-shunt share              # share on your LAN — prints a connect code
-shunt share --tunnel     # share over any network via Cloudflare tunnel
-shunt connect <code>     # on another device — auto-configures everything
+shunt share              # LAN sharing — prints a connect code
+shunt share --tunnel     # any network via Cloudflare tunnel
+shunt connect <code>     # on another machine — configures everything
 ```
+
+**Savings tracker**
+
+Every request is tracked against API pricing. Shunt shows you how much you've saved by using subscriptions instead.
 
 ---
 
 ## Commands
 
 ```bash
-shunt start              # start in the background
-shunt stop               # stop
+shunt setup              # first-time setup
+shunt start              # start the proxy
+shunt stop               # stop the proxy
 shunt restart
 shunt status             # account utilization and savings
 shunt monitor            # live fullscreen dashboard
@@ -127,9 +125,8 @@ shunt connect <code>     # connect to a shared proxy
 shunt remote             # watch a remote instance (host)
 shunt remote <code>      # watch a remote instance (client)
 shunt update             # update to latest
-shunt setup              # first-time setup
 ```
 
 ---
 
-MIT
+MIT License
