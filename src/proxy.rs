@@ -59,10 +59,13 @@ fn build_app_state(
 ) -> anyhow::Result<(AppState, LiveCredentials)> {
     let forwarder = Forwarder::new(&config.server.upstream_url, config.server.request_timeout_secs)?;
 
-    for a in config.accounts.iter().filter(|a| {
-        a.credential.is_none() && a.provider.auth_kind() != crate::provider::AuthKind::None
-    }) {
-        state.set_auth_failed(&a.name);
+    for a in &config.accounts {
+        if a.provider.auth_kind() == crate::provider::AuthKind::None {
+            // Local providers never need credentials — clear any stale auth_failed from disk.
+            state.clear_auth_failed(&a.name);
+        } else if a.credential.is_none() {
+            state.set_auth_failed(&a.name);
+        }
     }
 
     let credentials: LiveCredentials = Arc::new(RwLock::new(
