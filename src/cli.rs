@@ -2910,23 +2910,8 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
         }
 
         ShareMode::CustomDomain => {
-            // Step 1: verify cloudflared is installed
-            match std::process::Command::new("cloudflared")
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-            {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    bail!(
-                        "cloudflared is not installed.\n\n  \
-                         Install it:\n    brew install cloudflared\n  \
-                         or: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
-                    );
-                }
-                Err(e) => bail!("Failed to check cloudflared: {e}"),
-                Ok(_) => {}
-            }
+            // Step 1: ensure cloudflared is available (downloads if needed)
+            ensure_cloudflared()?;
 
             // Step 2: resolve domain (use saved, or prompt + save)
             let domain = if let Some(d) = saved_domain {
@@ -3020,26 +3005,66 @@ async fn share_and_print(base_url: &str, key: &str, relay_url: &str, subtitle: &
     }
 }
 
+/// Ensure `cloudflared` is available in PATH or a local bin dir.
+/// Downloads the binary automatically if not found.
+fn ensure_cloudflared() -> Result<String> {
+    use std::process::Command;
+
+    // Check if it's already in PATH
+    if Command::new("cloudflared")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status().is_ok()
+    {
+        return Ok("cloudflared".to_string());
+    }
+
+    // Not found — download to ~/.local/bin/cloudflared
+    let local_bin = dirs::home_dir()
+        .context("Cannot find home directory")?
+        .join(".local").join("bin");
+    std::fs::create_dir_all(&local_bin)?;
+    let dest = local_bin.join("cloudflared");
+
+    let url = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos",  "aarch64") => "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64",
+        ("macos",  "x86_64")  => "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64",
+        ("linux",  "x86_64")  => "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+        ("linux",  "aarch64") => "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64",
+        (os, arch) => bail!("No cloudflared binary for {os}/{arch}. Install manually: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"),
+    };
+
+    println!("  {} cloudflared not found — downloading…", dim("·"));
+    let bytes = reqwest::blocking::get(url)
+        .and_then(|r| r.bytes())
+        .context("Failed to download cloudflared")?;
+
+    std::fs::write(&dest, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+    println!("  {} Downloaded to {}", green(CHECK), dim(&dest.display().to_string()));
+
+    Ok(dest.to_string_lossy().to_string())
+}
+
 /// Spawn `cloudflared tunnel --url http://localhost:{port}`, wait for the public URL,
 /// and return it. The cloudflared process is left running in the background.
 fn start_cloudflare_tunnel(port: u16) -> Result<String> {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new("cloudflared")
+    let bin = ensure_cloudflared()?;
+
+    let mut child = Command::new(&bin)
         .args(["tunnel", "--url", &format!("http://localhost:{port}")])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!(
-                    "cloudflared not found.\n\n  Install it:\n    brew install cloudflared\n  or: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
-                )
-            } else {
-                anyhow::anyhow!("Failed to start cloudflared: {e}")
-            }
-        })?;
+        .with_context(|| format!("Failed to start cloudflared ({bin})"))?;
 
     let stderr = child.stderr.take().expect("stderr was piped");
     let reader = BufReader::new(stderr);
@@ -3068,6 +3093,7 @@ fn start_named_cloudflare_tunnel(domain: &str, port: u16) -> Result<()> {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
+    let bin = ensure_cloudflared()?;
     let home = dirs::home_dir().context("Cannot find home directory")?;
     let cf_dir = home.join(".cloudflared");
 
@@ -3076,7 +3102,7 @@ fn start_named_cloudflare_tunnel(domain: &str, port: u16) -> Result<()> {
         println!();
         println!("  {} No Cloudflare credentials found. Opening browser for login…", dim("·"));
         println!();
-        let status = Command::new("cloudflared")
+        let status = Command::new(&bin)
             .args(["tunnel", "login"])
             .status()
             .context("Failed to run `cloudflared tunnel login`")?;
@@ -3086,7 +3112,7 @@ fn start_named_cloudflare_tunnel(domain: &str, port: u16) -> Result<()> {
     }
 
     // ── Step 2: find or create "shunt" tunnel ───────────────────────────────
-    let tunnel_id = cloudflared_find_or_create_tunnel()?;
+    let tunnel_id = cloudflared_find_or_create_tunnel(&bin)?;
     println!("  {} Tunnel ID: {}", dim("·"), dim(&tunnel_id));
 
     // ── Step 3: route DNS (idempotent) ──────────────────────────────────────
@@ -3096,7 +3122,7 @@ fn start_named_cloudflare_tunnel(domain: &str, port: u16) -> Result<()> {
         .trim_end_matches('/');
 
     println!("  {} Routing DNS for {}…", dim("·"), cyan(hostname));
-    let dns_out = Command::new("cloudflared")
+    let dns_out = Command::new(&bin)
         .args(["tunnel", "route", "dns", "shunt", hostname])
         .output()
         .context("Failed to run `cloudflared tunnel route dns`")?;
@@ -3124,7 +3150,7 @@ fn start_named_cloudflare_tunnel(domain: &str, port: u16) -> Result<()> {
 
     // ── Step 5: launch and wait for "registered" ────────────────────────────
     println!("  {} Starting named tunnel…", dim("·"));
-    let mut child = Command::new("cloudflared")
+    let mut child = Command::new(&bin)
         .args(["tunnel", "run", "--config",
                &config_yml.to_string_lossy(), "shunt"])
         .stderr(Stdio::piped())
@@ -3151,11 +3177,11 @@ fn start_named_cloudflare_tunnel(domain: &str, port: u16) -> Result<()> {
 }
 
 /// Find an existing "shunt" tunnel or create one, returning its UUID.
-fn cloudflared_find_or_create_tunnel() -> Result<String> {
+fn cloudflared_find_or_create_tunnel(bin: &str) -> Result<String> {
     use std::process::{Command, Stdio};
 
     // List existing tunnels
-    let list_out = Command::new("cloudflared")
+    let list_out = Command::new(bin)
         .args(["tunnel", "list", "--output", "json"])
         .stdout(Stdio::piped()).stderr(Stdio::null())
         .output().context("Failed to run `cloudflared tunnel list`")?;
@@ -3177,7 +3203,7 @@ fn cloudflared_find_or_create_tunnel() -> Result<String> {
 
     // Create it
     println!("  {} Creating 'shunt' tunnel…", dim("·"));
-    let create_out = Command::new("cloudflared")
+    let create_out = Command::new(bin)
         .args(["tunnel", "create", "shunt"])
         .stdout(Stdio::piped()).stderr(Stdio::piped())
         .output().context("Failed to run `cloudflared tunnel create shunt`")?;
