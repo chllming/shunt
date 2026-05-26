@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::ZeroizeOnDrop;
 
 // ---------------------------------------------------------------------------
 // Anthropic OAuth constants
@@ -30,18 +31,35 @@ pub const OPENAI_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/
 // Credential type
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Serialize, Deserialize)]
+/// #20: ZeroizeOnDrop wipes access_token, refresh_token, and id_token from
+/// memory when the credential is dropped (e.g. after a token rotation).
+/// Clone is implemented manually so the derive doesn't conflict with ZeroizeOnDrop.
+#[derive(Serialize, Deserialize, ZeroizeOnDrop)]
 pub struct OAuthCredential {
     pub access_token: String,
     pub refresh_token: String,
     /// Milliseconds since Unix epoch
+    #[zeroize(skip)]
     pub expires_at: u64,
     /// Account email, fetched from roles endpoint after auth
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
     pub email: Option<String>,
     /// OpenAI id_token — required by the Codex CLI's ~/.codex/auth.json
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
+}
+
+impl Clone for OAuthCredential {
+    fn clone(&self) -> Self {
+        Self {
+            access_token: self.access_token.clone(),
+            refresh_token: self.refresh_token.clone(),
+            expires_at: self.expires_at,
+            email: self.email.clone(),
+            id_token: self.id_token.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for OAuthCredential {
@@ -145,13 +163,26 @@ pub fn read_codex_credentials() -> Option<OAuthCredential> {
 
 /// Decode the `exp` claim from a JWT payload (no signature verification).
 /// Returns expiry as Unix milliseconds.
+///
+/// Applies a sanity cap (#8): rejects tokens already expired or claiming to
+/// expire more than 25 hours in the future (which would suggest a forged `exp`).
+/// Callers fall back to `now + 1h` when this returns None.
 pub(crate) fn jwt_exp_ms(token: &str) -> Option<u64> {
     let payload_b64 = token.splitn(3, '.').nth(1)?;
-    // base64url decode (no padding)
     let decoded = base64_url_decode(payload_b64)?;
     let v: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
     let exp_secs = v.get("exp")?.as_u64()?;
-    Some(exp_secs * 1000)
+    let exp_ms = exp_secs.saturating_mul(1_000);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    // Reject already-expired tokens or tokens expiring more than 25 hours out.
+    let max_exp_ms = now_ms.saturating_add(25 * 60 * 60 * 1_000);
+    if exp_ms > max_exp_ms || exp_ms < now_ms {
+        return None;
+    }
+    Some(exp_ms)
 }
 
 /// Minimal base64url decoder (no padding, URL-safe alphabet).
@@ -833,6 +864,30 @@ mod tests {
         let a: [u8; 32] = rand_bytes();
         let b: [u8; 32] = rand_bytes();
         assert_ne!(a, b, "rand_bytes must return unique values each call");
+    }
+
+    #[test]
+    fn test_jwt_exp_ms_sanity_cap() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+        fn make_token(exp_offset_secs: i64) -> String {
+            let exp = SystemTime::now()
+                .duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + exp_offset_secs;
+            let payload = serde_json::json!({"sub":"test","exp": exp as u64});
+            let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"HS256\"}");
+            let body   = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+            format!("{header}.{body}.fakesig")
+        }
+
+        // Already expired: should return None
+        assert!(jwt_exp_ms(&make_token(-3600)).is_none(), "expired token must return None");
+        // Valid 1h: should return Some
+        assert!(jwt_exp_ms(&make_token(3600)).is_some(), "1h-future token must return Some");
+        // Valid 24h: should return Some
+        assert!(jwt_exp_ms(&make_token(86400)).is_some(), "24h-future token must return Some");
+        // 26h in the future: exceeds 25h cap → None
+        assert!(jwt_exp_ms(&make_token(26 * 3600)).is_none(), "26h-future token must return None (forged exp)");
     }
 
     #[test]

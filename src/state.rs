@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
@@ -219,7 +220,7 @@ impl StateStore {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if pending.compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                    let data = inner.lock().unwrap().clone();
+                    let data = inner.lock().clone();
                     if let Err(e) = write_to_disk(&data, &path) {
                         warn!("Failed to persist state: {e}");
                     }
@@ -233,7 +234,7 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn is_available(&self, name: &str) -> bool {
-        let data = self.inner.lock().unwrap();
+        let data = self.inner.lock();
         match data.accounts.get(name) {
             None => true,
             Some(s) => !s.disabled && now_ms() >= s.cooldown_until_ms,
@@ -242,7 +243,7 @@ impl StateStore {
 
     /// Returns a snapshot of all account states for the status endpoint.
     pub fn account_states(&self) -> HashMap<String, AccountState> {
-        self.inner.lock().unwrap().accounts.clone()
+        self.inner.lock().accounts.clone()
     }
 
     // -----------------------------------------------------------------------
@@ -251,7 +252,7 @@ impl StateStore {
 
     pub fn set_cooldown(&self, name: &str, duration_ms: u64) {
         {
-            let mut data = self.inner.lock().unwrap();
+            let mut data = self.inner.lock();
             let acc = data.accounts.entry(name.to_owned()).or_default();
             acc.cooldown_until_ms = now_ms() + duration_ms;
         }
@@ -260,7 +261,7 @@ impl StateStore {
 
     pub fn disable_account(&self, name: &str) {
         {
-            let mut data = self.inner.lock().unwrap();
+            let mut data = self.inner.lock();
             data.accounts.entry(name.to_owned()).or_default().disabled = true;
         }
         self.persist();
@@ -268,7 +269,7 @@ impl StateStore {
 
     pub fn set_auth_failed(&self, name: &str) {
         {
-            let mut data = self.inner.lock().unwrap();
+            let mut data = self.inner.lock();
             let acc = data.accounts.entry(name.to_owned()).or_default();
             acc.auth_failed = true;
             acc.disabled = true; // also disable so it's skipped in routing
@@ -279,7 +280,7 @@ impl StateStore {
     /// Clear auth_failed + disabled for an account after a successful token refresh.
     pub fn clear_auth_failed(&self, name: &str) {
         {
-            let mut data = self.inner.lock().unwrap();
+            let mut data = self.inner.lock();
             if let Some(acc) = data.accounts.get_mut(name) {
                 acc.auth_failed = false;
                 acc.disabled = false;
@@ -290,7 +291,7 @@ impl StateStore {
 
     /// Returns names of accounts (from the given list) that have auth_failed set.
     pub fn auth_failed_accounts<'a>(&self, names: &[&'a str]) -> Vec<&'a str> {
-        let data = self.inner.lock().unwrap();
+        let data = self.inner.lock();
         names.iter()
             .filter(|&&n| data.accounts.get(n).map(|s| s.auth_failed).unwrap_or(false))
             .copied()
@@ -302,7 +303,7 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn get_sticky(&self, fingerprint: &str) -> Option<String> {
-        let data = self.inner.lock().unwrap();
+        let data = self.inner.lock();
         let entry = data.sticky.get(fingerprint)?;
         if now_ms() < entry.expires_at_ms {
             Some(entry.account_name.clone())
@@ -314,7 +315,7 @@ impl StateStore {
     pub fn set_sticky(&self, fingerprint: &str, account_name: &str, ttl_ms: u64) {
         const MAX_STICKY_ENTRIES: usize = 10_000;
         {
-            let mut data = self.inner.lock().unwrap();
+            let mut data = self.inner.lock();
             // Prune expired entries if approaching limit
             if data.sticky.len() >= MAX_STICKY_ENTRIES {
                 let now = now_ms();
@@ -339,7 +340,7 @@ impl StateStore {
     /// Epoch-ms when the account's current window started.
     /// Returns u64::MAX for accounts with no window (sorts last in earliest-expiry).
     pub fn window_start_ms(&self, name: &str) -> u64 {
-        let data = self.inner.lock().unwrap();
+        let data = self.inner.lock();
         data.quota.get(name).map(|q| q.window_start_ms).unwrap_or(u64::MAX)
     }
 
@@ -350,7 +351,7 @@ impl StateStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let data = self.inner.lock().unwrap();
+        let data = self.inner.lock();
         let reset = data.rate_limits.get(name)?.reset_5h?;
         if reset > now_secs { Some(reset) } else { None }
     }
@@ -362,7 +363,7 @@ impl StateStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let data = self.inner.lock().unwrap();
+        let data = self.inner.lock();
         let Some(rl) = data.rate_limits.get(name) else { return 0.0 };
         // If the reset time is in the past, the window has rolled over — treat as fresh
         if rl.reset_5h.map(|t| t <= now_secs).unwrap_or(false) {
@@ -378,7 +379,7 @@ impl StateStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let data = self.inner.lock().unwrap();
+        let data = self.inner.lock();
         let Some(rl) = data.rate_limits.get(name) else { return 0.0 };
         if rl.reset_7d.map(|t| t <= now_secs).unwrap_or(false) {
             return 0.0;
@@ -393,7 +394,7 @@ impl StateStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let data = self.inner.lock().unwrap();
+        let data = self.inner.lock();
         let reset = data.rate_limits.get(name)?.reset_7d?;
         if reset > now_secs { Some(reset) } else { None }
     }
@@ -405,7 +406,7 @@ impl StateStore {
             return;
         }
         {
-            let mut data = self.inner.lock().unwrap();
+            let mut data = self.inner.lock();
             let quota = data.quota.entry(name.to_owned()).or_default();
             let now = now_ms();
             if quota.window_start_ms == 0 || now >= quota.window_start_ms + WINDOW_MS {
@@ -421,7 +422,7 @@ impl StateStore {
 
     /// Snapshot of all quota windows for the status endpoint.
     pub fn quota_snapshot(&self) -> HashMap<String, QuotaWindow> {
-        self.inner.lock().unwrap().quota.clone()
+        self.inner.lock().quota.clone()
     }
 
     // -----------------------------------------------------------------------
@@ -429,7 +430,7 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn update_rate_limits(&self, name: &str, info: RateLimitInfo) {
-        let prev = self.inner.lock().unwrap().rate_limits.get(name).cloned();
+        let prev = self.inner.lock().rate_limits.get(name).cloned();
 
         // Warn the first time utilization crosses 90% for each window.
         let prev_5h = prev.as_ref().and_then(|p| p.utilization_5h).unwrap_or(0.0);
@@ -448,14 +449,14 @@ impl StateStore {
         }
 
         {
-            let mut data = self.inner.lock().unwrap();
+            let mut data = self.inner.lock();
             data.rate_limits.insert(name.to_owned(), info);
         }
         self.persist();
     }
 
     pub fn rate_limit_snapshot(&self) -> HashMap<String, RateLimitInfo> {
-        self.inner.lock().unwrap().rate_limits.clone()
+        self.inner.lock().rate_limits.clone()
     }
 
     // -----------------------------------------------------------------------
@@ -463,12 +464,12 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn get_pinned(&self) -> Option<String> {
-        self.inner.lock().unwrap().pinned_account.clone()
+        self.inner.lock().pinned_account.clone()
     }
 
     pub fn set_pinned(&self, name: Option<String>) {
         {
-            let mut data = self.inner.lock().unwrap();
+            let mut data = self.inner.lock();
             data.pinned_account = name;
         }
         self.persist();
@@ -479,12 +480,12 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn get_last_used(&self) -> Option<String> {
-        self.inner.lock().unwrap().last_used_account.clone()
+        self.inner.lock().last_used_account.clone()
     }
 
     pub fn set_last_used(&self, name: &str) {
         {
-            let mut data = self.inner.lock().unwrap();
+            let mut data = self.inner.lock();
             data.last_used_account = Some(name.to_owned());
         }
         self.persist();
@@ -495,7 +496,7 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn record_request(&self, log: RequestLog) {
-        let mut data = self.inner.lock().unwrap();
+        let mut data = self.inner.lock();
         if data.recent_requests.len() >= MAX_RECENT {
             data.recent_requests.pop_front();
         }
@@ -504,7 +505,7 @@ impl StateStore {
 
     /// Most-recent first snapshot for the monitor / status endpoint.
     pub fn recent_requests_snapshot(&self) -> Vec<RequestLog> {
-        let data = self.inner.lock().unwrap();
+        let data = self.inner.lock();
         data.recent_requests.iter().rev().cloned().collect()
     }
 
@@ -520,7 +521,7 @@ impl StateStore {
         let cost = crate::pricing::api_cost_usd(model, input_tokens, output_tokens);
         let key = today_key();
         {
-            let mut data = self.inner.lock().unwrap();
+            let mut data = self.inner.lock();
             let bucket = data.global_daily.entry(key).or_default();
             bucket.input_tokens  = bucket.input_tokens.saturating_add(input_tokens);
             bucket.output_tokens = bucket.output_tokens.saturating_add(output_tokens);
@@ -550,7 +551,7 @@ impl StateStore {
         let today   = today_key();
         let week_ago = epoch_to_ymd(now_secs.saturating_sub(7 * 86400));
 
-        let data = self.inner.lock().unwrap();
+        let data = self.inner.lock();
 
         let today_bucket = data.global_daily.get(&today).cloned().unwrap_or_default();
 

@@ -1,4 +1,27 @@
 use anyhow::{bail, Context, Result};
+
+/// Validate that an upstream URL uses http/https and does not point to
+/// loopback or link-local addresses (SSRF guard).
+/// Pass `allow_loopback = true` for Local-provider accounts (e.g. Ollama).
+fn validate_upstream_url(url: &str, allow_loopback: bool) -> Result<()> {
+    let parsed = url::Url::parse(url)
+        .with_context(|| format!("Invalid upstream URL: {url}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        s => bail!("Upstream URL must use http or https, got scheme '{s}': {url}"),
+    }
+    if !allow_loopback {
+        if let Some(host) = parsed.host_str() {
+            let blocked = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+                || host.starts_with("169.254.")
+                || host.starts_with("fd");
+            if blocked {
+                bail!("Upstream URL must not point to loopback or link-local addresses: {url}");
+            }
+        }
+    }
+    Ok(())
+}
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -133,6 +156,8 @@ struct RawServer {
     expiry_soon_minutes: Option<u64>,
     /// Upstream request timeout in seconds (default: 600)
     request_timeout_secs: Option<u64>,
+    /// Per-IP rate limit in requests per minute (0 = disabled, default disabled).
+    rate_limit_rpm: Option<u32>,
     /// URL of a shunt relay-server instance for multi-machine history aggregation.
     /// e.g. "http://relay.internal:3001"
     telemetry_url: Option<String>,
@@ -157,6 +182,7 @@ impl Default for RawServer {
             sticky_ttl_minutes: None,
             expiry_soon_minutes: None,
             request_timeout_secs: None,
+            rate_limit_rpm: None,
             telemetry_url: None,
             telemetry_token: None,
             instance_name: None,
@@ -224,6 +250,8 @@ pub struct ServerConfig {
     pub expiry_soon_secs: u64,
     /// Upstream request timeout in seconds.
     pub request_timeout_secs: u64,
+    /// Per-IP rate limit in requests per minute (0 = disabled, default disabled).
+    pub rate_limit_rpm: u32,
     /// Optional relay-server URL for cross-instance history aggregation.
     pub telemetry_url: Option<String>,
     /// Bearer token for the relay-server.
@@ -246,6 +274,7 @@ impl Default for ServerConfig {
             sticky_ttl_ms: 10 * 60 * 1000,
             expiry_soon_secs: 30 * 60,
             request_timeout_secs: 600,
+            rate_limit_rpm: 0,
             telemetry_url: None,
             telemetry_token: None,
             instance_name: default_instance_name(),
@@ -305,11 +334,10 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     // Derive the default upstream URL from the first account's provider so that
     // an all-OpenAI config automatically points at api.openai.com without any
     // explicit `upstream_url` in the config file.
-    let default_upstream = raw.accounts.first()
+    let primary_provider_derived = raw.accounts.first()
         .map(|a| a.provider.as_deref().map(Provider::from_str).unwrap_or_default())
-        .unwrap_or_default()
-        .default_upstream_url()
-        .to_owned();
+        .unwrap_or_default();
+    let default_upstream = primary_provider_derived.default_upstream_url().to_owned();
 
     let upstream_url = raw
         .server
@@ -333,6 +361,16 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         .or_else(|| std::env::var("SHUNT_INSTANCE_NAME").ok())
         .unwrap_or_else(default_instance_name);
 
+    // #6 SSRF: validate the server-level upstream URL.
+    // Allow loopback only when the URL was derived from a Local provider's default
+    // (e.g. an all-Ollama config); explicit upstream_url entries are never allowed to
+    // use loopback unless explicitly set via SHUNT_UPSTREAM_URL (trust the operator).
+    let server_url_is_local_derived = raw.server.upstream_url.is_none()
+        && std::env::var("SHUNT_UPSTREAM_URL").is_err()
+        && matches!(primary_provider_derived, Provider::Local);
+    validate_upstream_url(&upstream_url, server_url_is_local_derived)
+        .with_context(|| "server.upstream_url failed validation")?;
+
     let server = ServerConfig {
         host: raw.server.host,
         port: raw.server.port,
@@ -345,6 +383,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         sticky_ttl_ms: raw.server.sticky_ttl_minutes.unwrap_or(10) * 60 * 1000,
         expiry_soon_secs: raw.server.expiry_soon_minutes.unwrap_or(30) * 60,
         request_timeout_secs: raw.server.request_timeout_secs.unwrap_or(600),
+        rate_limit_rpm: raw.server.rate_limit_rpm.unwrap_or(0),
         telemetry_url,
         telemetry_token,
         instance_name,
@@ -356,11 +395,8 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 
     let store = CredentialsStore::load();
 
-    // Determine the primary provider (first account) so we know which accounts
-    // use config.server.upstream_url and which need the provider's default URL.
-    let primary_provider = raw.accounts.first()
-        .map(|a| a.provider.as_deref().map(Provider::from_str).unwrap_or_default())
-        .unwrap_or_default();
+    // primary_provider_derived was already computed above for the server URL derivation.
+    let primary_provider = primary_provider_derived;
 
     let mut accounts = Vec::new();
     for a in &raw.accounts {
@@ -396,6 +432,12 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         // Upstream URL: per-account override from TOML takes priority, then
         // non-primary-provider accounts get the provider's default URL so
         // the forwarder knows where to send requests.
+        let is_local = matches!(provider, Provider::Local);
+        if let Some(ref url) = a.upstream_url {
+            // #6 SSRF: allow loopback only for Local provider (e.g. Ollama at localhost).
+            validate_upstream_url(url, is_local)
+                .with_context(|| format!("account '{}' upstream_url failed validation", a.name))?;
+        }
         let acct_upstream = a.upstream_url.clone().or_else(|| {
             if provider != primary_provider {
                 Some(provider.default_upstream_url().to_owned())

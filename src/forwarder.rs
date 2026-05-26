@@ -24,16 +24,32 @@ const HOP_BY_HOP: &[&str] = &[
     "content-length",
 ];
 
-/// Auth headers that the proxy manages — always stripped from client requests
-/// and replaced with the selected account's credential.
-const CLIENT_AUTH_HEADERS: &[&str] = &["authorization", "x-api-key"];
+/// Headers the proxy explicitly passes through to upstream.
+/// All other client-supplied headers are dropped (allowlist approach, #15).
+const ALLOWED_REQUEST_HEADERS: &[&str] = &[
+    "content-type",
+    "accept",
+    "anthropic-version",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
+    "x-request-id",
+    "user-agent",
+    // chatgpt.com sentinel token — injected by proxy, pass through
+    "openai-sentinel-chat-requirements-token",
+];
+
+/// Sensitive response headers that upstream must never inject into client responses (#21).
+const BLOCKED_RESPONSE_HEADERS: &[&str] = &[
+    "set-cookie",
+    "set-cookie2",
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+];
 
 fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.contains(&name.to_ascii_lowercase().as_str())
-}
-
-fn is_client_auth(name: &str) -> bool {
-    CLIENT_AUTH_HEADERS.contains(&name.to_ascii_lowercase().as_str())
 }
 
 pub struct Forwarder {
@@ -72,16 +88,14 @@ impl Forwarder {
 
         let mut upstream_headers = reqwest::header::HeaderMap::new();
 
-        for (name, value) in client_headers.iter() {
-            let lower = name.as_str().to_ascii_lowercase();
-            if is_hop_by_hop(&lower) || is_client_auth(&lower) {
-                continue;
-            }
-            if let (Ok(n), Ok(v)) = (
-                reqwest::header::HeaderName::from_str(name.as_str()),
-                reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
-            ) {
-                upstream_headers.insert(n, v);
+        // #15: allowlist — only forward explicitly permitted client headers.
+        for &name in ALLOWED_REQUEST_HEADERS {
+            if let Some(value) = client_headers.get(name) {
+                if let Ok(n) = reqwest::header::HeaderName::from_str(name) {
+                    if let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+                        upstream_headers.insert(n, v);
+                    }
+                }
             }
         }
 
@@ -117,13 +131,16 @@ impl Forwarder {
         let mut builder = Response::builder().status(status.as_u16());
 
         for (name, value) in upstream_resp.headers().iter() {
-            if !is_hop_by_hop(name.as_str()) {
-                if let (Ok(n), Ok(v)) = (
-                    HeaderName::from_str(name.as_str()),
-                    HeaderValue::from_bytes(value.as_bytes()),
-                ) {
-                    builder = builder.header(n, v);
-                }
+            let lower = name.as_str().to_ascii_lowercase();
+            // #21: drop hop-by-hop and sensitive response headers.
+            if is_hop_by_hop(&lower) || BLOCKED_RESPONSE_HEADERS.contains(&lower.as_str()) {
+                continue;
+            }
+            if let (Ok(n), Ok(v)) = (
+                HeaderName::from_str(name.as_str()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                builder = builder.header(n, v);
             }
         }
 

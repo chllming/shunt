@@ -4,6 +4,7 @@
 //! codebase stays credential-type-agnostic.
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::oauth::OAuthCredential;
 
@@ -20,6 +21,16 @@ pub enum Credential {
     /// Static API key — no expiry, no refresh.
     /// Used by Groq, Mistral, OpenRouter, Gemini, Ollama Cloud, etc.
     Apikey { key: String },
+}
+
+impl Drop for Credential {
+    fn drop(&mut self) {
+        // #20: zero out the API key on drop so it doesn't linger in freed memory.
+        if let Credential::Apikey { key } = self {
+            key.zeroize();
+        }
+        // OAuthCredential already derives ZeroizeOnDrop for its token fields.
+    }
 }
 
 impl Credential {

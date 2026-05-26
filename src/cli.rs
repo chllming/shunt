@@ -1034,6 +1034,14 @@ async fn cmd_start(
         let host = host_override.unwrap_or_else(|| config.server.host.clone());
         let port = port_override.unwrap_or(config.server.port);
 
+        // #5: Warn once if sensitive values are found in config as plaintext.
+        if let Ok(raw) = std::fs::read_to_string(&config_p) {
+            if raw.lines().any(|l| l.trim_start().starts_with("cloudflare_api_token") || l.trim_start().starts_with("remote_key")) {
+                eprintln!("  [shunt] Warning: plaintext sensitive values detected in config.toml.");
+                eprintln!("  [shunt] Consider migrating to env vars: CLOUDFLARE_API_TOKEN, SHUNT_REMOTE_KEY");
+            }
+        }
+
         for account in &mut config.accounts {
             if let Some(cred) = &account.credential {
                 if cred.needs_refresh() {
@@ -2692,6 +2700,29 @@ async fn cmd_update() -> Result<()> {
     let bytes = resp.bytes().await
         .context("Failed to read download")?;
 
+    // #4: Verify checksum before trusting the download.
+    let base_url = format!("https://github.com/{REPO}/releases/download/v{latest}");
+    let checksum_url = format!("{base_url}/checksums.txt");
+    match client.get(&checksum_url).send().await {
+        Ok(cr) if cr.status().is_success() => {
+            use sha2::{Sha256, Digest};
+            let checksums_text = cr.text().await.context("Failed to read checksums")?;
+            let expected_hash = checksums_text.lines()
+                .find(|l| l.contains(&archive_name))
+                .and_then(|l| l.split_whitespace().next())
+                .context("Checksum not found for this artifact — cannot verify download")?;
+            let actual_hash = hex::encode(Sha256::digest(&bytes));
+            if actual_hash != expected_hash {
+                bail!("Checksum mismatch! Expected {expected_hash}, got {actual_hash}. Aborting update.");
+            }
+            status!("  {} Checksum verified", green(CHECK));
+        }
+        _ => {
+            // checksums.txt not yet published — warn but continue.
+            status!("  {} Warning: no checksums.txt found for this release — skipping integrity check", yellow("!"));
+        }
+    }
+
     // Sanity-check: gzip magic bytes are 0x1f 0x8b
     if bytes.len() < 2 || bytes[0] != 0x1f || bytes[1] != 0x8b {
         bail!(
@@ -2705,6 +2736,13 @@ async fn cmd_update() -> Result<()> {
     // Extract binary from tarball into a temp file next to the current exe
     let exe_path = std::env::current_exe().context("Cannot locate current executable")?;
     let tmp_path = exe_path.with_extension("tmp");
+
+    // #13 TOCTOU: remove any pre-existing file or symlink before writing,
+    // so we don't follow an attacker-placed symlink to an arbitrary path.
+    if tmp_path.symlink_metadata().is_ok() {
+        std::fs::remove_file(&tmp_path)
+            .context("Failed to remove stale temp file (possible symlink attack?)")?;
+    }
 
     extract_binary_from_tarball(&bytes, &tmp_path)
         .context("Failed to extract binary from archive")?;
@@ -2886,14 +2924,25 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
         return Ok(());
     }
 
-    // Generate or reuse existing remote key
-    let key = match extract_remote_key(&text) {
-        Some(k) => k,
-        None => {
-            let k = generate_remote_key();
-            text = insert_into_server_section(&text, &format!("remote_key = \"{k}\""));
-            k
-        }
+    // #5: remote_key — read from env var first, then legacy config entry.
+    // New keys are printed for the user to save; never written to config.
+    let key = if let Ok(k) = std::env::var("SHUNT_REMOTE_KEY") {
+        if !k.is_empty() { k } else { extract_remote_key(&text).unwrap_or_else(generate_remote_key) }
+    } else if let Some(k) = extract_remote_key(&text) {
+        // Existing config entry — keep using it, but nudge migration
+        println!("  {} remote_key found in config.toml (plaintext).", yellow("!"));
+        println!("  {} Migrate to an env var for better security:", dim("·"));
+        println!("       export SHUNT_REMOTE_KEY='{k}'");
+        println!();
+        k
+    } else {
+        let k = generate_remote_key();
+        println!();
+        println!("  {} Generated remote key (save this in your env):", dim("·"));
+        println!("       export SHUNT_REMOTE_KEY='{k}'");
+        println!("  {} Add that line to your shell profile.", dim("·"));
+        println!();
+        k
     };
 
     // Ensure host is 0.0.0.0
@@ -3067,6 +3116,25 @@ fn ensure_cloudflared() -> Result<String> {
         .and_then(|r| r.bytes())
         .context("Failed to download cloudflared")?;
 
+    // #4: Attempt checksum verification from Cloudflare's published checksums.
+    // cloudflared publishes a checksums file alongside each release binary.
+    let checksum_url = format!("{url}.sha256sum");
+    match reqwest::blocking::get(&checksum_url).and_then(|r| r.text()) {
+        Ok(text) => {
+            use sha2::{Sha256, Digest};
+            // Format: "<sha256>  cloudflared-darwin-arm64"
+            let expected = text.split_whitespace().next().unwrap_or("");
+            let actual = hex::encode(Sha256::digest(&bytes));
+            if actual != expected {
+                bail!("cloudflared checksum mismatch! Expected {expected}, got {actual}. Aborting.");
+            }
+            println!("  {} cloudflared checksum verified", green(CHECK));
+        }
+        Err(_) => {
+            println!("  {} Warning: no .sha256sum file found — skipping cloudflared integrity check", yellow("!"));
+        }
+    }
+
     std::fs::write(&dest, &bytes)?;
     #[cfg(unix)]
     {
@@ -3188,26 +3256,36 @@ fn start_named_cloudflare_tunnel(domain: &str, port: u16, config_p: &std::path::
     bail!("cloudflared exited before the tunnel became ready")
 }
 
-/// Prompt for a Cloudflare API token, or load from config / env var.
-/// Saves newly entered tokens to the shunt config for reuse.
+/// Prompt for a Cloudflare API token, or load from env var / legacy config entry.
+///
+/// #5: New tokens are never written to config — users are directed to store them
+/// in the environment instead. Existing entries in config.toml continue to work
+/// for backward compat (with a one-time migration notice).
 fn cf_api_get_token(config_p: &std::path::Path) -> Result<String> {
     // env var takes priority
     if let Ok(t) = std::env::var("CLOUDFLARE_API_TOKEN") {
         if !t.is_empty() { return Ok(t); }
     }
-    // saved in shunt config
+    // backward compat: read from config (legacy), but warn once
     if let Ok(text) = std::fs::read_to_string(config_p) {
         for line in text.lines() {
             let line = line.trim();
             if line.starts_with("cloudflare_api_token") {
                 if let Some(v) = line.splitn(2, '=').nth(1) {
                     let t = v.trim().trim_matches('"').to_string();
-                    if !t.is_empty() { return Ok(t); }
+                    if !t.is_empty() {
+                        println!("  {} Cloudflare API token found in config.toml (plaintext).", yellow("!"));
+                        println!("  {} Migrate to an env var to improve security:", dim("·"));
+                        println!("       export CLOUDFLARE_API_TOKEN='{t}'");
+                        println!("  {} Add that line to your shell profile and remove cloudflare_api_token from config.toml.", dim("·"));
+                        println!();
+                        return Ok(t);
+                    }
                 }
             }
         }
     }
-    // prompt
+    // prompt — do NOT write to config
     use std::io::Write;
     println!();
     println!("  {} A Cloudflare API token is needed to create the tunnel and DNS record.", dim("·"));
@@ -3219,11 +3297,11 @@ fn cf_api_get_token(config_p: &std::path::Path) -> Result<String> {
         .context("Failed to read token")?;
     if token.is_empty() { bail!("No API token entered."); }
 
-    // save to config
-    let mut text = std::fs::read_to_string(config_p).unwrap_or_default();
-    text = insert_into_server_section(&text, &format!("cloudflare_api_token = \"{token}\""));
-    std::fs::write(config_p, &text)?;
-    println!("  {} Token saved to config.", green(CHECK));
+    // Tell user how to persist — do not write to config
+    println!();
+    println!("  {} To avoid entering this each time, add to your shell profile:", dim("·"));
+    println!("       export CLOUDFLARE_API_TOKEN='<your-token>'");
+    println!();
     Ok(token)
 }
 
