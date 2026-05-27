@@ -35,23 +35,23 @@
   <line x1="128" y1="188" x2="145" y2="188"/>
 
   <!-- arrow → logo -->
-  <line class="arrow" x1="145" y1="116" x2="178" y2="116"/>
-  <polygon points="178,111 190,116 178,121" fill="#bcff5e" stroke="none"/>
+  <line class="arrow" x1="145" y1="116" x2="193" y2="116"/>
+  <polygon points="193,111 205,116 193,121" fill="#bcff5e" stroke="none"/>
 
-  <!-- ── CENTER: shunt logo (11px/unit, origin x=190, y=108) ── -->
-  <!-- row 0: units 2-7 → x=212, w=66 -->
-  <rect class="logo" x="212" y="108" width="66" height="11"/>
-  <!-- row 1: left units 0-2 → x=190,w=33; right units 7-9 → x=267,w=33 -->
-  <rect class="logo" x="190" y="119" width="33" height="11"/>
-  <rect class="logo" x="267" y="119" width="33" height="11"/>
+  <!-- ── CENTER: shunt logo (8px/unit, origin x=205, center x=245, y=112) ── -->
+  <!-- row 0: units 2-7 → x=221, w=48 -->
+  <rect class="logo" x="221" y="112" width="48" height="8"/>
+  <!-- row 1: left units 0-2 → x=205,w=24; right units 7-9 → x=261,w=24 -->
+  <rect class="logo" x="205" y="120" width="24" height="8"/>
+  <rect class="logo" x="261" y="120" width="24" height="8"/>
   <!-- row 2: same as row 0 -->
-  <rect class="logo" x="212" y="130" width="66" height="11"/>
-  <!-- row 3: unit 3 → x=223,w=11; unit 6 → x=256,w=11 -->
-  <rect class="logo" x="223" y="141" width="11" height="11"/>
-  <rect class="logo" x="256" y="141" width="11" height="11"/>
+  <rect class="logo" x="221" y="128" width="48" height="8"/>
+  <!-- row 3: unit 3 → x=229,w=8; unit 6 → x=253,w=8 -->
+  <rect class="logo" x="229" y="136" width="8" height="8"/>
+  <rect class="logo" x="253" y="136" width="8" height="8"/>
 
   <!-- arrow → providers -->
-  <line class="arrow" x1="300" y1="116" x2="318" y2="116"/>
+  <line class="arrow" x1="285" y1="116" x2="318" y2="116"/>
   <polygon points="318,111 330,116 318,121" fill="#bcff5e" stroke="none"/>
 
   <!-- ── RIGHT: providers ── -->
