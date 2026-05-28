@@ -12,7 +12,11 @@ pub fn api_cost_usd(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
 
 /// (input_price_per_mtok, output_price_per_mtok) in USD.
 fn model_prices(model: &str) -> (f64, f64) {
-    if model.contains("opus") {
+    if model.contains("opus-4-5") || model.contains("opus-4-6") {
+        // Opus 4.5 / 4.6 — new pricing tier (much cheaper than 4.0/4.1)
+        (5.0, 25.0)
+    } else if model.contains("opus") {
+        // Opus 4.0 / 4.1 and older
         (15.0, 75.0)
     } else if model.contains("haiku") {
         (0.80, 4.0)

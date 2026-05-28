@@ -234,6 +234,13 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
     if config_p.exists() {
         println!("  {} Already configured.", green(CHECK));
         println!("  {} Use {} to add more accounts.", dim("·"), cyan("shunt add-account"));
+        // Ensure settings.json is pointing at the local proxy even if setup ran
+        // before this feature was added (e.g. after an update).
+        let port = crate::config::load_config(config_override.as_deref())
+            .map(|c| c.server.port)
+            .unwrap_or(8082);
+        write_local_claude_settings(port);          // verbose: prints what it wrote
+        apply_local_routing_silent(port);           // also writes managed_settings (silent, skips if correct)
         println!();
         return Ok(());
     }
@@ -256,7 +263,19 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
         }
         None => {
             println!("  {} No Claude Code session at {}", red(CROSS), dim(&claude_credentials_path().display().to_string()));
-            println!("  {} Run {} first, then re-run setup.", dim("·"), cyan("claude"));
+            // Help the user understand what's missing: not installed vs. not logged in.
+            let claude_installed = std::process::Command::new("sh")
+                .args(["-c", "command -v claude"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !claude_installed {
+                println!("  {} Claude Code is not installed.", dim("·"));
+                println!("  {} Install it: {}", dim("·"), cyan("npm install -g @anthropic-ai/claude-code"));
+                println!("  {} Then log in with {} and re-run setup.", dim("·"), cyan("claude"));
+            } else {
+                println!("  {} Run {} to log in first, then re-run setup.", dim("·"), cyan("claude"));
+            }
             println!();
             bail!("No Claude Code credentials found.");
         }
@@ -291,14 +310,25 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
     store.accounts.insert("main".into(), Credential::Oauth(cred));
     store.save()?;
 
+    // Derive port from the config we just wrote (always 8082 from template, but be explicit).
+    let setup_port = crate::config::load_config(config_override.as_deref())
+        .map(|c| c.server.port)
+        .unwrap_or(8082);
+
     println!();
     println!("  {} Config      {}", green("→"), dim(&config_p.display().to_string()));
     println!("  {} Credentials {}", green("→"), dim(&credentials_path().display().to_string()));
 
-    offer_shell_export()?;
+    // Write ANTHROPIC_BASE_URL to ~/.claude/settings.json so Claude Code picks up
+    // the proxy immediately — no shell restart required.
+    write_local_claude_settings(setup_port);
+
+    // For non-Claude-Code tools (curl, Python SDK, etc.) that read the env var.
+    offer_shell_export(setup_port)?;
 
     println!();
     println!("  {} Run {} to start.", green(CHECK), cyan("shunt start"));
+    println!("  {} Then restart any open Claude Code windows.", dim("·"));
 
     Ok(())
 }
@@ -1066,6 +1096,9 @@ async fn cmd_start(
         let _log_guard = crate::logging::setup(&lp, log_level)?;
         let state = crate::state::StateStore::load(&crate::config::state_path());
         write_pid();
+        // Apply routing on every daemon start — silently re-injects ANTHROPIC_BASE_URL
+        // into both settings files so Claude Code routes through shunt immediately.
+        apply_local_routing_silent(port);
         serve_all_providers(config, state, &host, port).await?;
         return Ok(());
     }
@@ -1137,6 +1170,7 @@ async fn cmd_start(
         println!();
         let state = crate::state::StateStore::load(&crate::config::state_path());
         write_pid();
+        apply_local_routing_silent(port);
         serve_all_providers(config, state, &host, port).await?;
         return Ok(());
     }
@@ -1202,6 +1236,12 @@ async fn cmd_stop() -> Result<()> {
     if !is_shunt_pid(pid) {
         let _ = std::fs::remove_file(&pid_p);
         println!("  {} Proxy is not running.", dim("·"));
+        // Daemon died without cleanup — remove stale routing so Claude Code doesn't
+        // keep hitting a dead localhost port.
+        if let Some(home) = dirs::home_dir() {
+            remove_from_settings_file(&home.join(".claude").join("settings.json"));
+            remove_from_settings_file(&managed_claude_settings_path(&home));
+        }
         println!();
         return Ok(());
     }
@@ -1222,6 +1262,15 @@ async fn cmd_stop() -> Result<()> {
 
     let _ = std::fs::remove_file(&pid_p);
     println!("  {} Proxy stopped.", green(CHECK));
+
+    // Remove routing from both settings files so Claude Code hits the API directly
+    // while the daemon is down (avoids "connection refused" errors).
+    // Routing is re-applied automatically when the daemon starts again.
+    if let Some(home) = dirs::home_dir() {
+        remove_from_settings_file(&home.join(".claude").join("settings.json"));
+        remove_from_settings_file(&managed_claude_settings_path(&home));
+    }
+
     println!();
     Ok(())
 }
@@ -2483,6 +2532,10 @@ async fn serve_all_providers(
         axum::serve(control_listener, control_app).await
     }));
 
+    // Spawn settings guardian — re-injects ANTHROPIC_BASE_URL into ~/.claude/settings.json
+    // if a Claude Code re-login overwrites it while the daemon is running.
+    tokio::spawn(settings_guardian_loop(primary_port));
+
     // Spawn heartbeat loop if telemetry is configured.
     if let Some(telemetry_url) = config.server.telemetry_url.clone() {
         let telem = crate::telemetry::TelemetryClient::new(
@@ -3646,6 +3699,34 @@ async fn cmd_disconnect() -> Result<()> {
         }
     }
 
+    // 3. managed_settings.json — remove remote ANTHROPIC_BASE_URL if present
+    let managed_path = managed_claude_settings_path(&home);
+    if managed_path.exists() {
+        if let Ok(text) = std::fs::read_to_string(&managed_path) {
+            if let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) {
+                let mut changed = false;
+                if let Some(env_obj) = root.get_mut("env").and_then(|e| e.as_object_mut()) {
+                    if let Some(url) = env_obj.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()) {
+                        if !url.contains("127.0.0.1") && !url.contains("localhost") {
+                            env_obj.remove("ANTHROPIC_BASE_URL");
+                            changed = true;
+                        }
+                    }
+                    if env_obj.remove("ANTHROPIC_API_KEY").is_some() {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if let Ok(t) = serde_json::to_string_pretty(&root) {
+                        let _ = std::fs::write(&managed_path, t);
+                        println!("  {} Removed from {}", green(CHECK), dim(&managed_path.display().to_string()));
+                        any = true;
+                    }
+                }
+            }
+        }
+    }
+
     if !any {
         println!("  {} Nothing to remove — no remote connection found.", dim("·"));
     }
@@ -3714,37 +3795,196 @@ fn write_connect_vars_to_profile(profile: &std::path::Path, base_url: &str, api_
 }
 
 /// Write ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY into ~/.claude/settings.json
-/// under the `env` key, creating the file if absent.
+/// and the managed-settings policy file under the `env` key (creating if absent).
+/// Both files must be updated so the managed policy (highest priority) does not
+/// shadow the user settings when switching between local and remote shunt.
 fn write_claude_settings(base_url: &str, api_key: &str) -> Result<()> {
     let home = dirs::home_dir().context("Cannot find home directory")?;
+
+    for settings_path in [
+        home.join(".claude").join("settings.json"),
+        managed_claude_settings_path(&home),
+    ] {
+        let mut root: serde_json::Value = if settings_path.exists() {
+            let text = std::fs::read_to_string(&settings_path)?;
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Object(Default::default()))
+        } else {
+            serde_json::Value::Object(Default::default())
+        };
+
+        let obj = root.as_object_mut().context("settings root is not an object")?;
+        let env = obj.entry("env").or_insert(serde_json::Value::Object(Default::default()));
+        let env_obj = env.as_object_mut().context("settings 'env' is not an object")?;
+        env_obj.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::Value::String(base_url.to_string()));
+        env_obj.insert("ANTHROPIC_API_KEY".to_string(), serde_json::Value::String(api_key.to_string()));
+
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+    }
+    Ok(())
+}
+
+/// Write `ANTHROPIC_BASE_URL` pointing at the local shunt proxy into
+/// `~/.claude/settings.json` so Claude Code picks it up immediately without
+/// requiring a shell restart.  Only sets the URL — never touches API keys.
+/// Skips if settings.json already has a non-localhost ANTHROPIC_BASE_URL
+/// (i.e. user connected to a remote shunt; don't clobber that).
+fn write_local_claude_settings(port: u16) {
+    let url = format!("http://127.0.0.1:{port}");
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
     let settings_path = home.join(".claude").join("settings.json");
 
     let mut root: serde_json::Value = if settings_path.exists() {
-        let text = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&text).unwrap_or(serde_json::Value::Object(Default::default()))
+        std::fs::read_to_string(&settings_path).ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(serde_json::Value::Object(Default::default()))
     } else {
         serde_json::Value::Object(Default::default())
     };
 
-    let obj = root.as_object_mut().context("settings.json root is not an object")?;
+    // Don't override a remote URL that was set by `shunt connect`.
+    if let Some(existing) = root.get("env")
+        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+        .and_then(|v| v.as_str())
+    {
+        if !existing.contains("127.0.0.1") && !existing.contains("localhost") {
+            return;
+        }
+    }
+
+    let obj = match root.as_object_mut() { Some(o) => o, None => return };
     let env = obj.entry("env").or_insert(serde_json::Value::Object(Default::default()));
-    let env_obj = env.as_object_mut().context("settings.json 'env' is not an object")?;
-    env_obj.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::Value::String(base_url.to_string()));
-    env_obj.insert("ANTHROPIC_API_KEY".to_string(), serde_json::Value::String(api_key.to_string()));
+    if let Some(env_obj) = env.as_object_mut() {
+        env_obj.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::Value::String(url));
+    }
 
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
-    Ok(())
+    if let Ok(text) = serde_json::to_string_pretty(&root) {
+        if std::fs::write(&settings_path, text).is_ok() {
+            println!("  {} {} → {}", green(CHECK),
+                cyan("ANTHROPIC_BASE_URL"),
+                dim(&settings_path.display().to_string()));
+        }
+    }
 }
 
-fn offer_shell_export() -> Result<()> {
+// ---------------------------------------------------------------------------
+// managed_settings: highest-priority Claude Code policy file
+// On macOS this sits in ~/Library/Application Support/Claude/managed_settings.json
+// and takes precedence over user settings — Claude Code login cannot clear it.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn managed_claude_settings_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("Library").join("Application Support").join("Claude").join("managed_settings.json")
+}
+#[cfg(not(target_os = "macos"))]
+fn managed_claude_settings_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config").join("claude").join("managed_settings.json")
+}
+
+/// Remove ANTHROPIC_BASE_URL from a settings JSON file (user or managed).
+fn remove_from_settings_file(path: &std::path::Path) -> bool {
+    if !path.exists() { return false; }
+    let Ok(text) = std::fs::read_to_string(path) else { return false };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    let removed = if let Some(env) = root.get_mut("env").and_then(|e| e.as_object_mut()) {
+        env.remove("ANTHROPIC_BASE_URL").is_some()
+    } else {
+        false
+    };
+    if removed {
+        if let Ok(t) = serde_json::to_string_pretty(&root) {
+            let _ = std::fs::write(path, t);
+            println!("  {} Removed from {}", green(CHECK), dim(&path.display().to_string()));
+        }
+    }
+    removed
+}
+
+/// Write ANTHROPIC_BASE_URL into both settings files without any console output.
+/// Used by the daemon on startup and by the guardian loop.
+fn apply_local_routing_silent(port: u16) {
+    let url = format!("http://127.0.0.1:{port}");
+    let home = match dirs::home_dir() { Some(h) => h, None => return };
+    let managed = managed_claude_settings_path(&home);
+
+    for settings_path in [home.join(".claude").join("settings.json"), managed.clone()] {
+        // For user settings.json: only touch if it already exists.
+        // For managed_settings: always create — it survives re-login.
+        if !settings_path.exists() && settings_path != managed { continue; }
+
+        let mut root: serde_json::Value = if settings_path.exists() {
+            std::fs::read_to_string(&settings_path).ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or(serde_json::Value::Object(Default::default()))
+        } else {
+            serde_json::Value::Object(Default::default())
+        };
+
+        // Never clobber a remote URL written by `shunt connect` — only touch localhost URLs.
+        if let Some(existing) = root.get("env")
+            .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+            .and_then(|v| v.as_str())
+        {
+            if !existing.contains("127.0.0.1") && !existing.contains("localhost") {
+                continue;
+            }
+        }
+
+        // Skip if already correct to avoid unnecessary writes.
+        let current = root.get("env").and_then(|e| e.get("ANTHROPIC_BASE_URL")).and_then(|v| v.as_str());
+        if current == Some(url.as_str()) { continue; }
+
+        let obj = match root.as_object_mut() { Some(o) => o, None => continue };
+        let env = obj.entry("env").or_insert(serde_json::Value::Object(Default::default()));
+        if let Some(e) = env.as_object_mut() {
+            e.insert("ANTHROPIC_BASE_URL".to_string(), serde_json::Value::String(url.clone()));
+        }
+
+        if let Some(parent) = settings_path.parent() { let _ = std::fs::create_dir_all(parent); }
+        if let Ok(out) = serde_json::to_string_pretty(&root) {
+            let _ = std::fs::write(&settings_path, out);
+        }
+    }
+}
+
+/// Background task: re-inject ANTHROPIC_BASE_URL into ~/.claude/settings.json if a Claude Code
+/// re-login clears it while the shunt daemon is running.
+async fn settings_guardian_loop(port: u16) {
+    let url = format!("http://127.0.0.1:{port}");
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let home = match dirs::home_dir() { Some(h) => h, None => return };
+    let settings_path = home.join(".claude").join("settings.json");
+
+    loop {
+        interval.tick().await;
+        if !settings_path.exists() { continue; }
+
+        let current = std::fs::read_to_string(&settings_path).ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("env")?.get("ANTHROPIC_BASE_URL")?.as_str().map(String::from));
+
+        if current.as_deref() != Some(url.as_str()) {
+            apply_local_routing_silent(port);
+        }
+    }
+}
+
+fn offer_shell_export(port: u16) -> Result<()> {
     use std::io::{self, Write};
 
-    let line = "export ANTHROPIC_BASE_URL=http://127.0.0.1:8082";
+    let line = format!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}");
+    let line = line.as_str();
     println!();
-    println!("  To use with Claude Code, set:");
+    println!("  For other tools (curl, Python SDK, …), set:");
     println!("    {}", cyan(line));
 
     let profile = detect_shell_profile();
@@ -3814,6 +4054,22 @@ async fn cmd_uninstall() -> Result<()> {
         std::fs::read_to_string(p).ok()
     }).map(|s| s.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:")).unwrap_or(false);
 
+    let uninstall_home = dirs::home_dir();
+    let user_settings_has_shunt = uninstall_home.as_ref().map(|h| {
+        let p = h.join(".claude").join("settings.json");
+        std::fs::read_to_string(&p).ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("env")?.get("ANTHROPIC_BASE_URL")?.as_str().map(|u| u.contains("127.0.0.1") || u.contains("localhost")))
+            .unwrap_or(false)
+    }).unwrap_or(false);
+    let managed_settings_has_shunt = uninstall_home.as_ref().map(|h| {
+        let p = managed_claude_settings_path(h);
+        std::fs::read_to_string(&p).ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("env")?.get("ANTHROPIC_BASE_URL")?.as_str().map(|u| u.contains("127.0.0.1") || u.contains("localhost")))
+            .unwrap_or(false)
+    }).unwrap_or(false);
+
     #[cfg(target_os = "macos")]
     let service_plist = {
         let p = service_plist_path();
@@ -3853,6 +4109,18 @@ async fn cmd_uninstall() -> Result<()> {
     if let Some(ref p) = shell_profile {
         if profile_has_export {
             println!("  {}  {} ANTHROPIC_BASE_URL from {}", red("✕"), dim("remove"), cyan(&p.display().to_string()));
+        }
+    }
+    if user_settings_has_shunt {
+        if let Some(ref h) = uninstall_home {
+            println!("  {}  {} ANTHROPIC_BASE_URL from {}", red("✕"), dim("remove"),
+                cyan(&h.join(".claude").join("settings.json").display().to_string()));
+        }
+    }
+    if managed_settings_has_shunt {
+        if let Some(ref h) = uninstall_home {
+            println!("  {}  {} ANTHROPIC_BASE_URL from {}", red("✕"), dim("remove"),
+                cyan(&managed_claude_settings_path(h).display().to_string()));
         }
     }
     if let Some(ref exe_path) = exe {
@@ -3944,7 +4212,13 @@ async fn cmd_uninstall() -> Result<()> {
         }
     }
 
-    // 5. Binary — do this last so error messages can still print
+    // 5. Claude Code settings — remove ANTHROPIC_BASE_URL from user + managed settings
+    if let Some(ref h) = uninstall_home {
+        remove_from_settings_file(&h.join(".claude").join("settings.json"));
+        remove_from_settings_file(&managed_claude_settings_path(h));
+    }
+
+    // 6. Binary — do this last so error messages can still print
     if let Some(exe_path) = exe {
         // Spawn a tiny shell to delete the binary after this process exits
         let path_str = exe_path.display().to_string();
