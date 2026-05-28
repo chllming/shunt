@@ -4248,7 +4248,10 @@ async fn cmd_uninstall() -> Result<()> {
 
     println!();
     println!("  {} shunt fully removed.", green(CHECK));
-    println!("  {} Run {} to clear the proxy from this shell session.", dim("·"), cyan("unset ANTHROPIC_BASE_URL"));
+    // Only hint if the variable is actually set in this shell session.
+    if std::env::var("ANTHROPIC_BASE_URL").is_ok() {
+        println!("  {} Run {} to clear the proxy from this shell session.", dim("·"), cyan("unset ANTHROPIC_BASE_URL"));
+    }
     println!();
 
     Ok(())
