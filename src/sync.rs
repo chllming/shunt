@@ -76,13 +76,16 @@ pub fn validate_share_code(code: &str) -> Result<()> {
     Ok(())
 }
 
-/// Push {base_url, api_key} to the relay under `code`. TTL 10 minutes, one-time read.
+/// Push {base_url, api_key} to the relay under `code`.
+/// base_url is sent plaintext (not sensitive — it's just an IP/URL).
+/// api_key is encrypted with the share code before sending — the relay never sees it.
 pub async fn push_share(code: &str, base_url: &str, api_key: &str, relay_url: &str) -> Result<()> {
+    let encrypted_key = encrypt_bytes(api_key.as_bytes(), code)?;
     let client = reqwest::Client::new();
     let url = format!("{relay_url}/share/{code}");
     let res = client
         .put(&url)
-        .json(&serde_json::json!({ "base_url": base_url, "api_key": api_key }))
+        .json(&serde_json::json!({ "base_url": base_url, "api_key": encrypted_key }))
         .send()
         .await
         .context("Failed to reach relay")?;
@@ -93,7 +96,8 @@ pub async fn push_share(code: &str, base_url: &str, api_key: &str, relay_url: &s
     Ok(())
 }
 
-/// Pull {base_url, api_key} from the relay for `code`. Deletes the entry on success.
+/// Pull {base_url, api_key} from the relay for `code`. api_key is decrypted with the code.
+/// Deletes the entry on success.
 pub async fn pull_share(code: &str, relay_url: &str) -> Result<(String, String)> {
     let client = reqwest::Client::new();
     let url = format!("{relay_url}/share/{code}");
@@ -111,8 +115,50 @@ pub async fn pull_share(code: &str, relay_url: &str) -> Result<(String, String)>
     }
     let json: serde_json::Value = res.json().await.context("Invalid JSON from relay")?;
     let base_url = json["base_url"].as_str().context("Missing base_url")?.to_owned();
-    let api_key = json["api_key"].as_str().context("Missing api_key")?.to_owned();
+    let encrypted_key = json["api_key"].as_str().context("Missing api_key")?;
+    let key_bytes = decrypt_bytes(encrypted_key, code)?;
+    let api_key = String::from_utf8(key_bytes).context("api_key is not valid UTF-8")?;
     Ok((base_url, api_key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let code = "SC-aabbccddeeff001122";
+        let api_key = b"sk-ant-testkey-0000111122223333";
+        let encrypted = encrypt_bytes(api_key, code).unwrap();
+        let decrypted = decrypt_bytes(&encrypted, code).unwrap();
+        assert_eq!(api_key.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_wrong_code_fails() {
+        let code = "SC-aabbccddeeff001122";
+        let data = b"hello";
+        let encrypted = encrypt_bytes(data, code).unwrap();
+        assert!(decrypt_bytes(&encrypted, "SC-wrongcodewrongco").is_err());
+    }
+
+    /// Full relay roundtrip — requires network, skipped by default.
+    /// Run with: cargo test --lib sync::tests::test_relay_roundtrip -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn test_relay_roundtrip() {
+        let code = generate_share_code();
+        let relay = "https://relay.ramcharan.shop";
+        let base_url = "http://192.168.1.100:8082";
+        let api_key = "sk-ant-test-relay-roundtrip";
+
+        push_share(&code, base_url, api_key, relay).await.expect("push_share failed");
+        let (got_url, got_key) = pull_share(&code, relay).await.expect("pull_share failed");
+
+        assert_eq!(got_url, base_url);
+        assert_eq!(got_key, api_key);
+        println!("Relay roundtrip OK — code={code}");
+    }
 }
 
 /// Decrypt a base64 payload into bytes using the given code.

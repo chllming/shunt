@@ -590,7 +590,7 @@ fn draw(
 
     draw_footer(f, chunks[2], picker.is_some() || model_picker.is_some() || strategy_picker.is_some(), refresh_ms, focus);
 
-    if let Some(p) = picker { draw_picker(f, p, area); }
+    if let Some(p) = picker { draw_picker(f, p, current_strategy.as_deref(), area); }
     if let Some(mp) = model_picker { draw_model_picker(f, mp, model_override.as_deref(), area); }
     if let Some(sp) = strategy_picker { draw_strategy_picker(f, sp, current_strategy.as_deref(), area); }
     if show_help { draw_help_overlay(f, area); }
@@ -609,6 +609,7 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_
     let mut spans = vec![
         Span::styled(" ◆ ", style_brand()),
         Span::styled("shunt", style_brand()),
+        Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), style_dim()),
         Span::styled("  monitor", style_dim()),
         Span::styled("  ·  live", Style::default().fg(GREEN)),
     ];
@@ -1101,7 +1102,7 @@ fn fmt_secs_label(secs: f64) -> String {
 // Picker overlay
 // ---------------------------------------------------------------------------
 
-fn draw_picker(f: &mut Frame, picker: &Picker, area: Rect) {
+fn draw_picker(f: &mut Frame, picker: &Picker, strategy: Option<&str>, area: Rect) {
     let h = (picker.items.len() + 4) as u16;
     let w = 36u16;
     let x = area.x + area.width.saturating_sub(w) / 2;
@@ -1119,7 +1120,8 @@ fn draw_picker(f: &mut Frame, picker: &Picker, area: Rect) {
     let rows: Vec<Row> = picker.items.iter().enumerate().map(|(i, item)| {
         let is_sel = i == picker.cursor;
         let label = if item == "auto" {
-            format!("  {} auto routing", if is_sel { "◆" } else { " " })
+            let strat = strategy.unwrap_or("auto");
+            format!("  {} {} routing", if is_sel { "◆" } else { " " }, strat)
         } else {
             format!("  {} {}", if is_sel { "◆" } else { " " }, item)
         };

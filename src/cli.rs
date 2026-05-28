@@ -97,6 +97,13 @@ enum Command {
         name: Option<String>,
     },
     /// Enable remote access — expose the proxy to other devices
+    ///
+    /// With no arguments: interactive menu to choose sharing mode (LAN, tunnel, custom domain).
+    /// With a share code: connect this device to a remote shunt instance.
+    ///
+    /// Examples:
+    ///   shunt share                    — host: choose sharing mode
+    ///   shunt share SC-a3f2b1c4d5e6f7a8b9  — guest: connect with a share code
     Share {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -106,6 +113,8 @@ enum Command {
         /// Disable remote access and revert to localhost-only
         #[arg(long)]
         stop: bool,
+        /// Share code from `shunt share` on the host — connects this device to a remote shunt
+        code: Option<String>,
     },
     /// Log out of an account — clears stored credentials (keeps account in config)
     #[command(hide = true)]
@@ -135,14 +144,8 @@ enum Command {
         /// Watch code from `shunt remote` on the host. Omit to start hosting.
         code: Option<String>,
     },
-    /// Connect this device to a remote shunt instance
-    ///
-    /// Fetches the proxy URL and API key for the given share code (printed by
-    /// `shunt share` on the host) and writes them to your shell profile so
-    /// Claude Code routes through the shared proxy automatically.
-    ///
-    /// Examples:
-    ///   shunt connect SC-a3f2b1c4d5e6f7a8b9
+    /// Connect this device to a remote shunt instance (alias: shunt share <code>)
+    #[command(hide = true)]
     Connect {
         /// Share code printed by `shunt share` on the host
         code: String,
@@ -263,7 +266,13 @@ pub async fn run() -> Result<()> {
         Command::Connect { code } => cmd_connect(code).await,
         Command::Disconnect => cmd_disconnect().await,
         Command::Update => cmd_update().await,
-        Command::Share { config, tunnel, stop } => cmd_share(config, tunnel, stop).await,
+        Command::Share { config, tunnel, stop, code } => {
+            if let Some(code) = code {
+                cmd_connect(code).await
+            } else {
+                cmd_share(config, tunnel, stop).await
+            }
+        }
         Command::Uninstall => cmd_uninstall().await,
         Command::Use { config, account } => cmd_use(config, account).await,
         Command::Report { config } => cmd_report(config).await,
@@ -3164,7 +3173,7 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
         bail!("No config found. Run `shunt setup` first.");
     }
 
-    let mut text = std::fs::read_to_string(&config_p)?;
+    let text = std::fs::read_to_string(&config_p)?;
 
     // If no flags given, show interactive menu
     // use an enum to track the chosen mode cleanly
@@ -3244,13 +3253,13 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
             return Ok(());
         }
 
-        text = text.lines()
-            .filter(|l| !l.trim_start().starts_with("remote_key"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !text.ends_with('\n') { text.push('\n'); }
-        text = text.replace("host = \"0.0.0.0\"", "host = \"127.0.0.1\"");
-        std::fs::write(&config_p, &text)?;
+        let mut doc = text.parse::<toml_edit::DocumentMut>()
+            .context("Failed to parse config as TOML")?;
+        if let Some(server) = doc.get_mut("server").and_then(|t| t.as_table_mut()) {
+            server.remove("remote_key");
+            server.insert("host", toml_edit::value("127.0.0.1"));
+        }
+        write_config_atomic(&config_p, &doc.to_string())?;
 
         print_splash(&[
             format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
@@ -3284,11 +3293,14 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
     };
 
     // Ensure host is 0.0.0.0
-    if text.contains("host = \"127.0.0.1\"") {
-        text = text.replace("host = \"127.0.0.1\"", "host = \"0.0.0.0\"");
+    {
+        let mut doc = text.parse::<toml_edit::DocumentMut>()
+            .context("Failed to parse config as TOML")?;
+        if let Some(server) = doc.get_mut("server").and_then(|t| t.as_table_mut()) {
+            server.insert("host", toml_edit::value("0.0.0.0"));
+        }
+        write_config_atomic(&config_p, &doc.to_string())?;
     }
-
-    std::fs::write(&config_p, &text)?;
 
     let (port, relay_url, saved_domain) = match crate::config::load_config(Some(&config_p)) {
         Ok(cfg) => {
@@ -3301,6 +3313,10 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
                 .unwrap_or_else(|_| "https://relay.ramcharan.shop".to_string()),
             None),
     };
+
+    if !relay_url.starts_with("https://") {
+        bail!("Relay URL must use HTTPS (got: {relay_url})");
+    }
 
     match mode {
         ShareMode::Tunnel => {
@@ -3341,13 +3357,17 @@ async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -
                 std::io::stdin().read_line(&mut input)?;
                 let domain = input.trim().trim_end_matches('/').to_string();
                 if domain.is_empty() { bail!("No domain entered."); }
-                if !domain.starts_with("http") {
-                    bail!("Domain must start with http:// or https://");
+                let _ = url::Url::parse(&domain).context("Invalid domain URL")?;
+                if !domain.starts_with("https://") {
+                    bail!("Domain must use HTTPS (got: {domain})");
                 }
-                let mut cfg_text = std::fs::read_to_string(&config_p)?;
-                cfg_text = insert_into_server_section(&cfg_text,
-                    &format!("custom_domain = \"{domain}\""));
-                std::fs::write(&config_p, &cfg_text)?;
+                let mut doc = std::fs::read_to_string(&config_p)?
+                    .parse::<toml_edit::DocumentMut>()
+                    .context("Failed to parse config as TOML")?;
+                if let Some(server) = doc.get_mut("server").and_then(|t| t.as_table_mut()) {
+                    server.insert("custom_domain", toml_edit::value(&domain));
+                }
+                write_config_atomic(&config_p, &doc.to_string())?;
                 println!("  {} Saved {} to config.", green(CHECK), cyan(&domain));
                 domain
             };
@@ -3396,7 +3416,7 @@ async fn share_and_print(base_url: &str, key: &str, relay_url: &str, subtitle: &
             println!("  {}  Share code:\n", green(CHECK));
             println!("      {}\n", cyan(&share_code));
             println!("  {} On the other device, run:", dim("·"));
-            println!("       {}", cyan(&format!("shunt connect {share_code}")));
+            println!("       {}", cyan(&format!("shunt share {share_code}")));
             println!();
             for hint in hints { println!("{hint}"); }
             println!();
@@ -3408,11 +3428,10 @@ async fn share_and_print(base_url: &str, key: &str, relay_url: &str, subtitle: &
                 dim(subtitle).to_string(),
                 String::new(),
             ]);
-            println!("  Set on the remote device:\n");
-            println!("    {}{}", dim("export ANTHROPIC_BASE_URL="), cyan(base_url));
-            println!("    {}{}", dim("export ANTHROPIC_API_KEY="), cyan(key));
+            println!("  {} Relay unavailable ({e}).", dim("·"));
+            println!("  {} Set on the remote device:", dim("·"));
+            println!("      {}{}", dim("export ANTHROPIC_BASE_URL="), cyan(base_url));
             println!();
-            println!("  {} (share code unavailable: {e})", dim("·"));
             for hint in hints { println!("{hint}"); }
             println!();
         }
@@ -3705,6 +3724,11 @@ fn cf_api_find_or_create_tunnel(
                 "TunnelName": "shunt"
             });
             std::fs::write(creds_path, creds.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(creds_path, std::fs::Permissions::from_mode(0o600))?;
+            }
         }
         return Ok(id);
     }
@@ -3731,6 +3755,11 @@ fn cf_api_find_or_create_tunnel(
         "TunnelName":   "shunt"
     });
     std::fs::write(creds_path, creds.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(creds_path, std::fs::Permissions::from_mode(0o600))?;
+    }
 
     Ok(tunnel_id)
 }
@@ -3806,14 +3835,11 @@ fn extract_remote_key(config: &str) -> Option<String> {
     None
 }
 
-fn insert_into_server_section(config: &str, line: &str) -> String {
-    // Insert just before the first [[accounts]] block
-    if let Some(pos) = config.find("\n[[accounts]]") {
-        let (before, after) = config.split_at(pos);
-        format!("{before}\n{line}{after}")
-    } else {
-        format!("{config}\n{line}\n")
-    }
+fn write_config_atomic(path: &std::path::Path, content: &str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn local_ip() -> Option<String> {
