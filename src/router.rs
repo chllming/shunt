@@ -148,12 +148,25 @@ pub fn pick_account<'a>(
             candidates[idx]
         }
 
-        RoutingStrategy::LeastUtilized => {
+        RoutingStrategy::MostAvailable => {
             candidates.iter().copied().min_by(|a, b| {
-                // Prefer the account with the most remaining quota (lowest effective util).
-                let ua = state.utilization_5h(&a.name).max(state.utilization_7d(&a.name));
-                let ub = state.utilization_5h(&b.name).max(state.utilization_7d(&b.name));
-                ua.partial_cmp(&ub).unwrap_or(Ordering::Equal)
+                let a5 = state.utilization_5h(&a.name);
+                let a7 = state.utilization_7d(&a.name);
+                let b5 = state.utilization_5h(&b.name);
+                let b7 = state.utilization_7d(&b.name);
+
+                // Primary: the binding window (most-exhausted of 5h/7d).
+                // Prefer lower utilization = more tokens remaining.
+                let a_binding = a5.max(a7);
+                let b_binding = b5.max(b7);
+
+                // Secondary: the non-binding window — breaks ties when binding windows are equal.
+                let a_secondary = a5.min(a7);
+                let b_secondary = b5.min(b7);
+
+                a_binding.partial_cmp(&b_binding)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a_secondary.partial_cmp(&b_secondary).unwrap_or(Ordering::Equal))
             })?
         }
 
@@ -367,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_least_utilized_picks_freshest() {
+    fn test_most_available_picks_lowest_binding() {
         let accounts = vec![make_account("heavy"), make_account("light")];
         let state = StateStore::new_empty();
 
@@ -376,9 +389,52 @@ mod tests {
 
         assert_eq!(
             pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800,
-                RoutingStrategy::LeastUtilized)
+                RoutingStrategy::MostAvailable)
                 .map(|a| a.name.as_str()),
             Some("light"),
-            "least-utilized should pick the account with the most remaining quota");
+            "most-available should pick the account with the lowest binding-window utilization");
+    }
+
+    #[test]
+    fn test_most_available_tiebreaks_on_secondary_window() {
+        let accounts = vec![make_account("worse"), make_account("better")];
+        let state = StateStore::new_empty();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Both have 5h binding at 50%, but "better" has more room in the 7d window.
+        state.update_rate_limits("worse", RateLimitInfo {
+            utilization_5h: Some(0.5),
+            reset_5h: Some(now + 3600),
+            status_5h: Some("allowed".to_owned()),
+            utilization_7d: Some(0.6),
+            reset_7d: Some(now + 86400),
+            status_7d: Some("allowed".to_owned()),
+            overage_status: None,
+            overage_disabled_reason: None,
+            representative_claim: None,
+            updated_ms: now * 1000,
+        });
+        state.update_rate_limits("better", RateLimitInfo {
+            utilization_5h: Some(0.5),
+            reset_5h: Some(now + 3600),
+            status_5h: Some("allowed".to_owned()),
+            utilization_7d: Some(0.2),
+            reset_7d: Some(now + 86400),
+            status_7d: Some("allowed".to_owned()),
+            overage_status: None,
+            overage_disabled_reason: None,
+            representative_claim: None,
+            updated_ms: now * 1000,
+        });
+
+        assert_eq!(
+            pick_account(&accounts, &state, None, &HashSet::new(), 600_000, 1800,
+                RoutingStrategy::MostAvailable)
+                .map(|a| a.name.as_str()),
+            Some("better"),
+            "tied binding window: should prefer lower secondary-window utilization");
     }
 }

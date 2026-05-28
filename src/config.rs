@@ -248,9 +248,14 @@ pub enum RoutingStrategy {
     EarliestExpiry,
     /// Cycle through accounts in round-robin order regardless of quota.
     RoundRobin,
-    /// Route to the account with the most remaining quota (lowest utilization).
-    /// Good for latency-sensitive workloads where hitting a rate limit is costly.
-    LeastUtilized,
+    /// Route to the account with the most available capacity across both quota windows.
+    ///
+    /// Selects the account where the binding window (the more-exhausted of 5h and 7d)
+    /// has the most tokens remaining. When two accounts are tied on their binding window,
+    /// the secondary (less-exhausted) window breaks the tie.
+    ///
+    /// Best choice when you want to minimise the chance of hitting a rate limit mid-request.
+    MostAvailable,
 }
 
 #[derive(Debug, Clone)]
@@ -413,7 +418,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         expiry_soon_secs: raw.server.expiry_soon_minutes.unwrap_or(30) * 60,
         routing_strategy: match raw.server.routing_strategy.as_deref() {
             Some("round-robin") | Some("round_robin") => RoutingStrategy::RoundRobin,
-            Some("least-utilized") | Some("least_utilized") | Some("freshest") => RoutingStrategy::LeastUtilized,
+            Some("most-available") | Some("most_available") => RoutingStrategy::MostAvailable,
             _ => RoutingStrategy::EarliestExpiry,
         },
         request_timeout_secs: raw.server.request_timeout_secs.unwrap_or(600),
