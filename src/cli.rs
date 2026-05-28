@@ -2258,49 +2258,63 @@ fn print_splash(info: &[String]) {
 }
 
 /// Like print_splash but with custom right-side lines (used by cmd_status).
+///
+/// Plain println-based box drawing — no ratatui/crossterm terminal state so
+/// subsequent output is always left-aligned.
 fn print_status_splash(title: &str, right_lines: Vec<String>) {
-    use ratatui::{backend::CrosstermBackend, Terminal, TerminalOptions, Viewport};
-    use crossterm::{event::{self, Event}, terminal as cterm};
-    use std::io::stdout;
+    use crate::term::{brand_green, dark_green, dim};
 
-    // Ensure top and bottom Fill(1) each get ≥1 row:
-    // inner_h = splash_h - 2; need inner_h >= content + 2 fills → splash_h >= len + 4
-    let splash_h: u16 = (right_lines.len() as u16 + 4).max(8);
-    let right = right_lines.clone();
+    const BOX_W:     usize = 70; // visible width of the box (excluding indent)
+    const LOGO_W:    usize = 10;
+    const CONTENT_H: usize = 4;
 
-    let mut terminal = match Terminal::with_options(
-        CrosstermBackend::new(stdout()),
-        TerminalOptions { viewport: Viewport::Inline(splash_h) },
-    ) {
-        Ok(t) => t,
-        Err(_) => {
-            println!("\n  ◆  {title}\n");
-            for l in &right_lines { println!("     {l}"); }
-            return;
-        }
-    };
+    let splash_h = (right_lines.len() + 4).max(8);
+    let inner_h  = splash_h - 2;             // rows inside (between borders)
+    let left_w   = (BOX_W - 3) / 2;          // left panel visible width  (33)
+    let right_w  = BOX_W - 3 - left_w;       // right panel visible width (34)
 
-    let draw = |t: &mut Terminal<CrosstermBackend<std::io::Stdout>>, r: &[String]| {
-        t.draw(|f| render_splash_frame(f, title, "", r)).ok();
-    };
+    // ── top border ──────────────────────────────────────────────────────
+    let title_part = format!(" {title} ");
+    let fill = BOX_W.saturating_sub(4 + title_part.len());
+    print!("  {}", dark_green("┌─"));
+    print!("{}", brand_green(&title_part));
+    println!("{}", dark_green(&format!("{}─┐", "─".repeat(fill))));
 
-    draw(&mut terminal, &right);
+    // ── content rows ────────────────────────────────────────────────────
+    let logo      = build_logo_lines(CONTENT_H, LOGO_W);
+    let logo_top  = inner_h.saturating_sub(CONTENT_H) / 2;
+    let right_top = inner_h.saturating_sub(right_lines.len()) / 2;
+    let logo_lpad = left_w.saturating_sub(LOGO_W) / 2;
 
-    let _ = cterm::enable_raw_mode();
-    let dl = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    loop {
-        let rem = dl.saturating_duration_since(std::time::Instant::now());
-        if rem.is_zero() { break; }
-        if event::poll(rem).unwrap_or(false) {
-            match event::read() {
-                Ok(Event::Resize(_, _)) => draw(&mut terminal, &right),
-                _ => break,
-            }
-        } else { break; }
+    for row in 0..inner_h {
+        // Left panel: logo centered vertically and horizontally
+        let left_content: String = if row >= logo_top && row < logo_top + CONTENT_H {
+            let lrow = logo.get(row - logo_top).map(|s| s.as_str()).unwrap_or("");
+            let right_pad = left_w.saturating_sub(logo_lpad + LOGO_W);
+            format!("{}{}{}", " ".repeat(logo_lpad), brand_green(lrow), " ".repeat(right_pad))
+        } else {
+            " ".repeat(left_w)
+        };
+
+        // Right panel: lines centered vertically, left-aligned with padding
+        let right_content: String = if row >= right_top && row < right_top + right_lines.len() {
+            let rline = &right_lines[row - right_top];
+            let lpad = right_w.saturating_sub(rline.len()) / 2;
+            let rpad = right_w.saturating_sub(lpad.saturating_add(rline.len()));
+            format!("{}{}{}", " ".repeat(lpad), dim(rline), " ".repeat(rpad))
+        } else {
+            " ".repeat(right_w)
+        };
+
+        print!("  {}", dark_green("│"));
+        print!("{left_content}");
+        print!("{}", dark_green("│"));
+        print!("{right_content}");
+        println!("{}", dark_green("│"));
     }
-    let _ = cterm::disable_raw_mode();
-    let _ = terminal.show_cursor();
-    print!("\r\n");
+
+    // ── bottom border ───────────────────────────────────────────────────
+    println!("  {}", dark_green(&format!("└{}┘", "─".repeat(BOX_W - 2))));
 }
 
 // ---------------------------------------------------------------------------
