@@ -254,12 +254,12 @@ impl Picker {
     fn selected(&self) -> &str { &self.items[self.cursor] }
 }
 
-/// (display name, description, model id or "" for "client choice")
+/// (display name, description, model id or "" for auto/clear)
 const MODEL_PRESETS: &[(&str, &str, &str)] = &[
+    ("Auto",     "Let the client choose the model",         ""),
     ("Opus 4",   "Most capable · best for complex tasks",  "claude-opus-4-6"),
     ("Sonnet 4", "Balanced · fast and smart",               "claude-sonnet-4-6"),
     ("Haiku 4",  "Fastest · great for simple tasks",        "claude-haiku-4-5-20251001"),
-    ("Auto",     "Let the client choose the model",         ""),
 ];
 
 struct ModelPicker {
@@ -270,7 +270,7 @@ impl ModelPicker {
     fn new(current: Option<&str>) -> Self {
         let cursor = current
             .and_then(|m| MODEL_PRESETS.iter().position(|(_, _, id)| *id == m))
-            .unwrap_or(MODEL_PRESETS.len() - 1); // default to "Auto"
+            .unwrap_or(0); // default to "Auto"
         Self { cursor }
     }
     fn up(&mut self)   { self.cursor = if self.cursor == 0 { MODEL_PRESETS.len() - 1 } else { self.cursor - 1 }; }
