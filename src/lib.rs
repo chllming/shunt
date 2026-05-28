@@ -11,7 +11,6 @@ pub mod provider;
 pub mod proxy;
 pub mod quota;
 pub mod translate;
-pub mod remote;
 pub mod router;
 pub mod state;
 pub mod sync;

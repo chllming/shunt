@@ -13,23 +13,6 @@ use serde_json;
 // Code generation
 // ---------------------------------------------------------------------------
 
-/// Generate a random remote-watch code like `RM-a3f2b1c4d5e6f7a8b9`.
-pub fn generate_remote_code() -> String {
-    let bytes = crate::oauth::rand_bytes::<9>();
-    format!("RM-{}", hex::encode(bytes))
-}
-
-/// Validate that a remote-watch code looks like what we generated.
-pub fn validate_remote_code(code: &str) -> Result<()> {
-    if !code.starts_with("RM-") || code.len() != 21 {
-        anyhow::bail!("Invalid remote code format. Expected RM-<18 hex chars>.");
-    }
-    if !code[3..].chars().all(|c| c.is_ascii_hexdigit()) {
-        anyhow::bail!("Invalid remote code — must be hex characters after 'RM-'.");
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Encryption / decryption
 // ---------------------------------------------------------------------------
