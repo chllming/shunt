@@ -59,6 +59,13 @@ pub fn log_path() -> PathBuf {
         .join("proxy.log")
 }
 
+pub fn notify_log_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(APP_NAME)
+        .join("notify.log")
+}
+
 pub fn pid_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))

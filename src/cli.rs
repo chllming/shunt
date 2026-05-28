@@ -202,6 +202,30 @@ enum Command {
         #[command(subcommand)]
         action: Option<StrategyAction>,
     },
+    /// Open a persistent tunnel to the relay (your proxy becomes reachable at subdomain.domain)
+    ///
+    /// Examples:
+    ///   shunt live                       — tunnel using config defaults
+    ///   shunt live --subdomain shunt     — register as shunt.ramcharan.shop
+    Live {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Subdomain to register (e.g. "shunt" → shunt.ramcharan.shop)
+        #[arg(long)]
+        subdomain: Option<String>,
+        /// Override relay WebSocket URL
+        #[arg(long)]
+        relay: Option<String>,
+    },
+    /// Run the tunnel relay server (deploy on your VPS)
+    ///
+    /// Examples:
+    ///   shunt relay serve                — start on default port 8085
+    ///   shunt relay serve --port 9000    — custom port
+    Relay {
+        #[command(subcommand)]
+        action: RelayAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -236,6 +260,16 @@ enum StrategyAction {
     Clear,
 }
 
+#[derive(Subcommand)]
+enum RelayAction {
+    /// Start the relay server
+    Serve {
+        /// Port to listen on
+        #[arg(long, default_value = "8085")]
+        port: u16,
+    },
+}
+
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -265,6 +299,10 @@ pub async fn run() -> Result<()> {
         Command::Report { config } => cmd_report(config).await,
         Command::Model { config, action } => cmd_model(config, action).await,
         Command::Strategy { config, action } => cmd_strategy(config, action).await,
+        Command::Live { config, subdomain, relay } => cmd_live(config, subdomain, relay).await,
+        Command::Relay { action } => match action {
+            RelayAction::Serve { port } => cmd_relay_serve(port).await,
+        },
         Command::Service { action } => match action {
             ServiceAction::Install   => cmd_service_install().await,
             ServiceAction::Uninstall => cmd_service_uninstall().await,
@@ -3913,6 +3951,43 @@ async fn cmd_connect(code: String) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_live(config_override: Option<PathBuf>, subdomain: Option<String>, relay_override: Option<String>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())
+        .context("No config found. Run `shunt setup` first.")?;
+
+    let subdomain = subdomain
+        .or_else(|| std::env::var("SHUNT_TUNNEL_SUBDOMAIN").ok())
+        .unwrap_or_else(|| "shunt".to_string());
+
+    let relay_ws = relay_override
+        .or_else(|| std::env::var("SHUNT_RELAY_WS_URL").ok())
+        .unwrap_or_else(|| "wss://relay.ramcharan.shop/tunnel".to_string());
+
+    let token = std::env::var("SHUNT_TUNNEL_TOKEN")
+        .context("SHUNT_TUNNEL_TOKEN env var required")?;
+
+    let local_url = format!("http://{}:{}", config.server.host, config.server.port);
+
+    print_splash(&[
+        format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+        dim("Live tunnel").to_string(),
+        String::new(),
+    ]);
+    println!("  {} Subdomain:  {}", dim("·"), cyan(&format!("{subdomain}.ramcharan.shop")));
+    println!("  {} Local:      {}", dim("·"), dim(&local_url));
+    println!("  {} Relay:      {}", dim("·"), dim(&relay_ws));
+    println!("  {} Press Ctrl+C to disconnect.", dim("·"));
+    println!();
+
+    crate::tunnel::run_live(&relay_ws, &subdomain, &token, &local_url).await
+}
+
+async fn cmd_relay_serve(port: u16) -> Result<()> {
+    let token = std::env::var("SHUNT_RELAY_TOKEN")
+        .context("SHUNT_RELAY_TOKEN env var required")?;
+    crate::live_relay::run_relay_server(port, token).await
+}
+
 async fn cmd_disconnect() -> Result<()> {
     print_splash(&[
         format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
@@ -4658,6 +4733,24 @@ async fn cmd_report(config_override: Option<PathBuf>) -> Result<()> {
     match shell_val.as_deref() {
         Some(v) => println!("  {:<28} {} = {}", dim("shell $ANTHROPIC_BASE_URL"), green(CHECK), v),
         None    => println!("  {:<28} {} not set", dim("shell $ANTHROPIC_BASE_URL"), dim("·")),
+    }
+
+    // ── notification log ─────────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("last 50 notification triggers"));
+    sep();
+    let notify_log = crate::config::notify_log_path();
+    if notify_log.exists() {
+        let file = std::fs::File::open(&notify_log)?;
+        let reader = BufReader::new(file);
+        let mut ring: std::collections::VecDeque<String> = std::collections::VecDeque::with_capacity(51);
+        for line in reader.lines().flatten() {
+            if ring.len() >= 50 { ring.pop_front(); }
+            ring.push_back(line);
+        }
+        for l in &ring { println!("  {l}"); }
+    } else {
+        println!("  {} no notification log found ({})", dim("·"), notify_log.display());
     }
 
     // ── last 100 log lines ───────────────────────────────────────────────
