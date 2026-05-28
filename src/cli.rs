@@ -4350,14 +4350,19 @@ async fn cmd_report(config_override: Option<PathBuf>) -> Result<()> {
             match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(2)).send().await {
                 Ok(r) if r.status().is_success() => {
                     if let Ok(v) = r.json::<serde_json::Value>().await {
-                        if let Some(uptime) = v["uptime_secs"].as_u64() {
+                        if let Some(started_ms) = v["started_ms"].as_u64() {
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH).ok()
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let uptime = (now_ms.saturating_sub(started_ms)) / 1000;
                             let h = uptime / 3600;
                             let m = (uptime % 3600) / 60;
                             let s = uptime % 60;
                             println!("  {:<22} {}h {}m {}s", dim("uptime"), h, m, s);
                         }
-                        if let Some(total) = v["total_requests"].as_u64() {
-                            println!("  {:<22} {}", dim("total requests"), total);
+                        if let Some(reqs) = v["recent_requests"].as_array() {
+                            println!("  {:<22} {} (recent)", dim("requests"), reqs.len());
                         }
                     }
                 }
@@ -4425,13 +4430,14 @@ fn read_anthropic_base_url_from_file(path: &std::path::Path) -> Option<String> {
     v["env"]["ANTHROPIC_BASE_URL"].as_str().map(|s| s.to_owned())
 }
 
-/// Redact email addresses and long hex/base64 tokens from a log line.
+/// Redact email addresses and long tokens from a log line, and strip ANSI codes.
 fn redact_log_line(line: &str) -> String {
+    let clean = strip_ansi(line);
     // Redact email addresses: anything@anything.anything
     let re_email = regex::Regex::new(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}").unwrap();
-    let s = re_email.replace_all(line, "[email]");
-    // Redact long hex/base64 strings that look like tokens (≥32 chars of base64/hex)
-    let re_token = regex::Regex::new(r"[A-Za-z0-9+/\-_]{32,}={0,2}").unwrap();
+    let s = re_email.replace_all(&clean, "[email]");
+    // Redact long base64/hex strings that look like tokens (≥40 chars to avoid short IDs)
+    let re_token = regex::Regex::new(r"[A-Za-z0-9+/\-_]{40,}={0,2}").unwrap();
     let s = re_token.replace_all(&s, "[token]");
     s.into_owned()
 }
