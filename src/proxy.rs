@@ -97,7 +97,7 @@ fn build_app_state(
     state: StateStore,
     anthropic_base_url: Option<String>,
 ) -> anyhow::Result<(AppState, LiveCredentials)> {
-    let forwarder = Forwarder::new(&config.server.upstream_url, config.server.request_timeout_secs)?;
+    let forwarder = Forwarder::new(config.server.request_timeout_secs)?;
 
     for a in &config.accounts {
         if a.provider.auth_kind() == crate::provider::AuthKind::None {
@@ -208,7 +208,6 @@ pub fn create_app_with_state(
 /// Build a status JSON snapshot from config + state — used by the heartbeat loop.
 pub fn build_status_snapshot(config: &Config, state: &StateStore, started_ms: u64) -> serde_json::Value {
     let account_states = state.account_states();
-    let quotas         = state.quota_snapshot();
     let rate_limits    = state.rate_limit_snapshot();
 
     let accounts: Vec<_> = config.accounts.iter().map(|a| {
@@ -220,6 +219,7 @@ pub fn build_status_snapshot(config: &Config, state: &StateStore, started_ms: u6
         let reset_7d       = rl.and_then(|r| r.reset_7d);
         let disabled       = st.map(|s| s.disabled).unwrap_or(false);
         let auth_failed    = st.map(|s| s.auth_failed).unwrap_or(false);
+        let health_check_failed = st.map(|s| s.health_check_failed).unwrap_or(false);
         let cooldown_until_ms = st.map(|s| s.cooldown_until_ms).unwrap_or(0);
         let available      = state.is_available(&a.name);
         let email          = a.credential.as_ref().and_then(|c| c.email()).map(|e| e.to_owned());
@@ -231,6 +231,7 @@ pub fn build_status_snapshot(config: &Config, state: &StateStore, started_ms: u6
             "available": available,
             "disabled": disabled,
             "auth_failed": auth_failed,
+            "health_check_failed": health_check_failed,
             "cooldown_until_ms": cooldown_until_ms,
             "utilization_5h": utilization_5h,
             "reset_5h": reset_5h,
@@ -262,6 +263,8 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
             "reauth_required"
         } else if st.map(|s| s.disabled).unwrap_or(false) {
             "disabled"
+        } else if st.map(|s| s.health_check_failed).unwrap_or(false) {
+            "unhealthy"
         } else if s.state.is_available(&a.name) {
             "available"
         } else {
@@ -293,6 +296,7 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
         let email = a.credential.as_ref().and_then(|c| c.email()).map(|e| e.to_owned());
         let disabled = acc_state.map(|s| s.disabled).unwrap_or(false);
         let auth_failed = acc_state.map(|s| s.auth_failed).unwrap_or(false);
+        let health_check_failed = acc_state.map(|s| s.health_check_failed).unwrap_or(false);
         let cooldown_until_ms = acc_state.map(|s| s.cooldown_until_ms).unwrap_or(0);
         let utilization_5h = rl.and_then(|r| r.utilization_5h).unwrap_or(0.0);
         let reset_5h = rl.and_then(|r| r.reset_5h);
@@ -311,6 +315,7 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
             "available": available,
             "disabled": disabled,
             "auth_failed": auth_failed,
+            "health_check_failed": health_check_failed,
             "cooldown_until_ms": cooldown_until_ms,
             "utilization_5h": utilization_5h,
             "reset_5h": reset_5h,
@@ -1483,6 +1488,203 @@ async fn post_cooldown_prefetch(
             }
         }
         Err(e) => warn!(account = %account.name, "post-cooldown prefetch failed: {e}"),
+    }
+}
+
+/// Periodic health-check loop: probes every account at a configurable interval
+/// to detect dead/invalid accounts before real traffic hits them.
+///
+/// Uses exponential backoff (base_interval * 2^min(failures, 3)) per account,
+/// capped at ~40 min. Marks accounts as `health_check_failed` after 2 consecutive
+/// failures (tolerates one transient blip). On 401, delegates to `set_auth_failed`.
+pub async fn health_check_loop(
+    config: Arc<Config>,
+    state: StateStore,
+    live_creds: LiveCredentials,
+) {
+    if !config.server.health_check_enabled {
+        return;
+    }
+
+    // Let prefetch_rate_limits finish first.
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+    let base_interval_ms = config.server.health_check_interval_secs * 1000;
+    let timeout = std::time::Duration::from_secs(config.server.health_check_timeout_secs);
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .unwrap_or_default();
+
+    const FAILURE_THRESHOLD: u32 = 2;
+    const MAX_BACKOFF_EXP: u32 = 3; // 2^3 = 8x → 40 min at 5-min base
+
+    loop {
+        for account in &config.accounts {
+            // Skip accounts already handled by recovery_watcher.
+            {
+                let states = state.account_states();
+                if let Some(acc_state) = states.get(&account.name) {
+                    if acc_state.disabled || acc_state.auth_failed {
+                        continue;
+                    }
+                }
+            }
+
+            // Exponential backoff based on consecutive failure count.
+            let (last_check_ms, failures) = state.health_check_info(&account.name);
+            let backoff_factor = 1u64 << failures.min(MAX_BACKOFF_EXP);
+            let effective_interval_ms = base_interval_ms.saturating_mul(backoff_factor);
+            let now = crate::state::now_ms_pub();
+            if last_check_ms > 0 && now.saturating_sub(last_check_ms) < effective_interval_ms {
+                continue;
+            }
+
+            state.update_last_health_check(&account.name);
+
+            // Resolve current credential from live_creds (may have been refreshed).
+            let cred = {
+                let creds = live_creds.read().await;
+                creds.get(&account.name).cloned()
+            }.or_else(|| account.credential.clone());
+
+            let cred = match cred {
+                Some(c) => c,
+                None => {
+                    // Local providers have no cred — probe reachability via GET /v1/models.
+                    if let Some(probe_path) = account.provider.auth_probe_get_path() {
+                        let upstream = account.upstream_url.as_deref()
+                            .unwrap_or_else(|| account.provider.default_upstream_url());
+                        let url = format!("{upstream}{probe_path}");
+                        match client.get(&url).send().await {
+                            Ok(r) if r.status().is_success() => {
+                                if state.is_health_check_failed(&account.name) {
+                                    tracing::info!(account = %account.name, "health check recovered");
+                                }
+                                state.clear_health_check_failed(&account.name);
+                            }
+                            Ok(r) => {
+                                let count = state.record_health_check_failure(&account.name, FAILURE_THRESHOLD);
+                                tracing::warn!(account = %account.name, status = %r.status(),
+                                    failures = count, "health check failed");
+                            }
+                            Err(e) => {
+                                let count = state.record_health_check_failure(&account.name, FAILURE_THRESHOLD);
+                                tracing::warn!(account = %account.name, failures = count,
+                                    "health check unreachable: {e}");
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            let token = cred.bearer_token();
+            let upstream = account.upstream_url.as_deref()
+                .unwrap_or(&config.server.upstream_url);
+
+            // Try POST prefetch (Anthropic) or GET auth probe (other providers).
+            if let Some((path, body)) = account.provider.prefetch_request() {
+                let url = format!("{upstream}{path}");
+                match prefetch_send(&client, &url, &account.provider, token, &body).await {
+                    Ok(r) => {
+                        let status = r.status();
+                        if status == reqwest::StatusCode::UNAUTHORIZED {
+                            // Attempt refresh for OAuth accounts.
+                            if let Some(oauth_cred) = cred.as_oauth() {
+                                match account.provider.refresh_token(oauth_cred).await {
+                                    Ok(fresh) => {
+                                        let mut store = crate::config::CredentialsStore::load();
+                                        store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
+                                        store.save().ok();
+                                        live_creds.write().await.insert(account.name.clone(), Credential::Oauth(fresh));
+                                        state.clear_auth_failed(&account.name);
+                                        if state.is_health_check_failed(&account.name) {
+                                            state.clear_health_check_failed(&account.name);
+                                        }
+                                        tracing::info!(account = %account.name, "health check: token refreshed");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(account = %account.name, "health check: refresh failed: {e}");
+                                        state.set_auth_failed(&account.name);
+                                    }
+                                }
+                            } else {
+                                tracing::error!(account = %account.name, "health check: 401 — API key rejected");
+                                state.set_auth_failed(&account.name);
+                            }
+                        } else if status.is_server_error() {
+                            let count = state.record_health_check_failure(&account.name, FAILURE_THRESHOLD);
+                            tracing::warn!(account = %account.name, status = %status,
+                                failures = count, "health check: server error");
+                        } else {
+                            // Success — update rate limits if available.
+                            if let Some(info) = account.provider.parse_rate_limits(r.headers()) {
+                                state.update_rate_limits(&account.name, info);
+                            }
+                            if state.is_health_check_failed(&account.name) {
+                                tracing::info!(account = %account.name, "health check recovered");
+                            }
+                            state.clear_health_check_failed(&account.name);
+                        }
+                    }
+                    Err(e) => {
+                        let count = state.record_health_check_failure(&account.name, FAILURE_THRESHOLD);
+                        tracing::warn!(account = %account.name, failures = count,
+                            "health check probe failed: {e}");
+                    }
+                }
+            } else if let Some(probe_path) = account.provider.auth_probe_get_path() {
+                let probe_upstream = account.upstream_url.as_deref()
+                    .unwrap_or_else(|| account.provider.default_upstream_url());
+                let url = format!("{probe_upstream}{probe_path}");
+                let mut headers = reqwest::header::HeaderMap::new();
+                let _ = account.provider.inject_auth_headers(&mut headers, token);
+                match client.get(&url).headers(headers).send().await {
+                    Ok(r) => {
+                        let status = r.status();
+                        if status == reqwest::StatusCode::UNAUTHORIZED {
+                            if let Some(oauth_cred) = cred.as_oauth() {
+                                match account.provider.refresh_token(oauth_cred).await {
+                                    Ok(fresh) => {
+                                        let mut store = crate::config::CredentialsStore::load();
+                                        store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
+                                        store.save().ok();
+                                        live_creds.write().await.insert(account.name.clone(), Credential::Oauth(fresh));
+                                        state.clear_auth_failed(&account.name);
+                                        state.clear_health_check_failed(&account.name);
+                                        tracing::info!(account = %account.name, "health check: token refreshed (GET probe)");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(account = %account.name, "health check: refresh failed: {e}");
+                                        state.set_auth_failed(&account.name);
+                                    }
+                                }
+                            } else {
+                                tracing::error!(account = %account.name, "health check: 401 — API key rejected");
+                                state.set_auth_failed(&account.name);
+                            }
+                        } else if status.is_server_error() {
+                            let count = state.record_health_check_failure(&account.name, FAILURE_THRESHOLD);
+                            tracing::warn!(account = %account.name, status = %status,
+                                failures = count, "health check: server error (GET probe)");
+                        } else {
+                            if state.is_health_check_failed(&account.name) {
+                                tracing::info!(account = %account.name, "health check recovered");
+                            }
+                            state.clear_health_check_failed(&account.name);
+                        }
+                    }
+                    Err(e) => {
+                        let count = state.record_health_check_failure(&account.name, FAILURE_THRESHOLD);
+                        tracing::warn!(account = %account.name, failures = count,
+                            "health check probe failed: {e}");
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(config.server.health_check_interval_secs)).await;
     }
 }
 

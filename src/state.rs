@@ -20,6 +20,11 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Public version of `now_ms()` for use from other modules.
+pub fn now_ms_pub() -> u64 {
+    now_ms()
+}
+
 // ---------------------------------------------------------------------------
 // On-disk data
 // ---------------------------------------------------------------------------
@@ -35,6 +40,15 @@ pub struct AccountState {
     /// OAuth credentials are expired and need re-authorization via `shunt add-account`.
     #[serde(default)]
     pub auth_failed: bool,
+    /// Account failed health-check probes — skip in routing until it recovers.
+    #[serde(default)]
+    pub health_check_failed: bool,
+    /// Consecutive health-check failure count (for exponential backoff). Ephemeral.
+    #[serde(skip)]
+    pub health_check_failures: u32,
+    /// Epoch-ms of the last health-check probe attempt. Ephemeral.
+    #[serde(skip)]
+    pub last_health_check_ms: u64,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -333,6 +347,72 @@ impl StateStore {
     }
 
     // -----------------------------------------------------------------------
+    // Health check state
+    // -----------------------------------------------------------------------
+
+    pub fn is_health_check_failed(&self, name: &str) -> bool {
+        let data = self.inner.lock();
+        data.accounts.get(name).map(|s| s.health_check_failed).unwrap_or(false)
+    }
+
+    pub fn set_health_check_failed(&self, name: &str) {
+        {
+            let mut data = self.inner.lock();
+            let acc = data.accounts.entry(name.to_owned()).or_default();
+            acc.health_check_failed = true;
+        }
+        self.persist();
+    }
+
+    pub fn clear_health_check_failed(&self, name: &str) {
+        {
+            let mut data = self.inner.lock();
+            if let Some(acc) = data.accounts.get_mut(name) {
+                acc.health_check_failed = false;
+                acc.health_check_failures = 0;
+            }
+        }
+        self.persist();
+    }
+
+    /// Increment consecutive failure count and return the new value.
+    /// Sets `health_check_failed = true` once failures >= `threshold`.
+    pub fn record_health_check_failure(&self, name: &str, threshold: u32) -> u32 {
+        let count;
+        {
+            let mut data = self.inner.lock();
+            let acc = data.accounts.entry(name.to_owned()).or_default();
+            acc.health_check_failures = acc.health_check_failures.saturating_add(1);
+            count = acc.health_check_failures;
+            if count >= threshold {
+                acc.health_check_failed = true;
+            }
+        }
+        if count >= threshold {
+            self.persist();
+        }
+        count
+    }
+
+    /// Update last_health_check_ms to now. Returns the previous value.
+    pub fn update_last_health_check(&self, name: &str) -> u64 {
+        let mut data = self.inner.lock();
+        let acc = data.accounts.entry(name.to_owned()).or_default();
+        let prev = acc.last_health_check_ms;
+        acc.last_health_check_ms = now_ms();
+        prev
+    }
+
+    /// Get the last health check timestamp and consecutive failure count.
+    pub fn health_check_info(&self, name: &str) -> (u64, u32) {
+        let data = self.inner.lock();
+        match data.accounts.get(name) {
+            Some(acc) => (acc.last_health_check_ms, acc.health_check_failures),
+            None => (0, 0),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Stickiness (ephemeral — not persisted)
     // -----------------------------------------------------------------------
 
@@ -370,13 +450,6 @@ impl StateStore {
     // -----------------------------------------------------------------------
     // Quota tracking
     // -----------------------------------------------------------------------
-
-    /// Epoch-ms when the account's current window started.
-    /// Returns u64::MAX for accounts with no window (sorts last in earliest-expiry).
-    pub fn window_start_ms(&self, name: &str) -> u64 {
-        let data = self.inner.lock();
-        data.quota.get(name).map(|q| q.window_start_ms).unwrap_or(u64::MAX)
-    }
 
     /// Unix epoch seconds when this account's 5h window resets.
     /// Returns None if unknown or already past.
@@ -658,10 +731,10 @@ mod tests {
     fn test_sticky_ttl_expiry() {
         let store = StateStore::new_empty();
         let fp = "conv-fp-ttl";
-        store.set_sticky(fp, "account1", 1); // 1 ms TTL
+        store.set_sticky(fp, "account1", 500); // 500 ms TTL
         assert_eq!(store.get_sticky(fp).as_deref(), Some("account1"),
             "sticky should be available immediately");
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(600));
         assert!(store.get_sticky(fp).is_none(),
             "sticky must expire after TTL elapses");
     }
@@ -729,6 +802,91 @@ mod tests {
         assert_eq!(snap.len(), MAX_RECENT, "buffer must not grow beyond MAX_RECENT");
         // Most recent first
         assert!(snap[0].ts_ms > snap[snap.len() - 1].ts_ms, "snapshot must be newest-first");
+    }
+
+    #[test]
+    fn test_health_check_failed_round_trip() {
+        let store = StateStore::new_empty();
+        assert!(!store.is_health_check_failed("acc"), "fresh account should not be health-check-failed");
+
+        store.set_health_check_failed("acc");
+        assert!(store.is_health_check_failed("acc"), "should be marked unhealthy after set");
+
+        store.clear_health_check_failed("acc");
+        assert!(!store.is_health_check_failed("acc"), "should be cleared after clear");
+    }
+
+    #[test]
+    fn test_health_check_failure_threshold() {
+        let store = StateStore::new_empty();
+
+        // First failure: count=1, threshold=2 → not yet marked
+        let count = store.record_health_check_failure("acc", 2);
+        assert_eq!(count, 1);
+        assert!(!store.is_health_check_failed("acc"),
+            "should not be marked after 1 failure (threshold=2)");
+
+        // Second failure: count=2, threshold=2 → now marked
+        let count = store.record_health_check_failure("acc", 2);
+        assert_eq!(count, 2);
+        assert!(store.is_health_check_failed("acc"),
+            "should be marked after 2 failures (threshold=2)");
+    }
+
+    #[test]
+    fn test_clear_health_check_resets_failure_count() {
+        let store = StateStore::new_empty();
+        store.record_health_check_failure("acc", 2);
+        store.record_health_check_failure("acc", 2);
+        assert!(store.is_health_check_failed("acc"));
+
+        store.clear_health_check_failed("acc");
+        assert!(!store.is_health_check_failed("acc"));
+
+        let (_, failures) = store.health_check_info("acc");
+        assert_eq!(failures, 0, "failure count must reset to 0 after clear");
+    }
+
+    #[test]
+    fn test_health_check_info_and_last_check() {
+        let store = StateStore::new_empty();
+        let (last, failures) = store.health_check_info("acc");
+        assert_eq!(last, 0, "fresh account last_health_check_ms should be 0");
+        assert_eq!(failures, 0);
+
+        let prev = store.update_last_health_check("acc");
+        assert_eq!(prev, 0, "first update should return previous value 0");
+
+        let (last2, _) = store.health_check_info("acc");
+        assert!(last2 > 0, "last_health_check_ms should be updated to now");
+    }
+
+    #[test]
+    fn test_health_check_failed_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "shunt_test_hc_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        {
+            let store = StateStore::load(&path);
+            store.set_health_check_failed("acc");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+
+        let store2 = StateStore::load(&path);
+        assert!(store2.is_health_check_failed("acc"),
+            "health_check_failed must survive restart");
+
+        // Ephemeral fields should NOT persist
+        let (last, failures) = store2.health_check_info("acc");
+        assert_eq!(last, 0, "last_health_check_ms is ephemeral, should be 0 after reload");
+        assert_eq!(failures, 0, "health_check_failures is ephemeral, should be 0 after reload");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

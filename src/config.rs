@@ -171,6 +171,12 @@ struct RawServer {
     /// Set to true only when shunt sits behind a trusted reverse proxy (e.g. cloudflared).
     /// When false (default), all requests share one rate-limit bucket.
     trust_proxy_headers: Option<bool>,
+    /// Enable periodic health-check probes for all accounts (default: true).
+    health_check_enabled: Option<bool>,
+    /// Seconds between health-check probe rounds (default: 300 = 5 min).
+    health_check_interval_secs: Option<u64>,
+    /// Per-account probe timeout in seconds (default: 10).
+    health_check_timeout_secs: Option<u64>,
     /// URL of a shunt relay-server instance for multi-machine history aggregation.
     /// e.g. "http://relay.internal:3001"
     telemetry_url: Option<String>,
@@ -198,6 +204,9 @@ impl Default for RawServer {
             request_timeout_secs: None,
             rate_limit_rpm: None,
             trust_proxy_headers: None,
+            health_check_enabled: None,
+            health_check_interval_secs: None,
+            health_check_timeout_secs: None,
             telemetry_url: None,
             telemetry_token: None,
             instance_name: None,
@@ -318,6 +327,12 @@ pub struct ServerConfig {
     pub rate_limit_rpm: u32,
     /// Trust X-Real-IP for per-IP rate limiting (only when behind a trusted proxy).
     pub trust_proxy_headers: bool,
+    /// Enable periodic health-check probes for all accounts.
+    pub health_check_enabled: bool,
+    /// Seconds between health-check probe rounds.
+    pub health_check_interval_secs: u64,
+    /// Per-account probe timeout in seconds.
+    pub health_check_timeout_secs: u64,
     /// Optional relay-server URL for cross-instance history aggregation.
     pub telemetry_url: Option<String>,
     /// Bearer token for the relay-server.
@@ -343,6 +358,9 @@ impl Default for ServerConfig {
             request_timeout_secs: 600,
             rate_limit_rpm: 0,
             trust_proxy_headers: false,
+            health_check_enabled: true,
+            health_check_interval_secs: 300,
+            health_check_timeout_secs: 10,
             telemetry_url: None,
             telemetry_token: None,
             instance_name: default_instance_name(),
@@ -456,6 +474,9 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         request_timeout_secs: raw.server.request_timeout_secs.unwrap_or(600),
         rate_limit_rpm: raw.server.rate_limit_rpm.unwrap_or(0),
         trust_proxy_headers: raw.server.trust_proxy_headers.unwrap_or(false),
+        health_check_enabled: raw.server.health_check_enabled.unwrap_or(true),
+        health_check_interval_secs: raw.server.health_check_interval_secs.unwrap_or(300),
+        health_check_timeout_secs: raw.server.health_check_timeout_secs.unwrap_or(10),
         telemetry_url,
         telemetry_token,
         instance_name,

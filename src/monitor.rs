@@ -12,9 +12,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
     Frame, Terminal,
 };
 use serde::Deserialize;
@@ -42,10 +41,12 @@ struct StatusResponse {
     #[serde(default)]
     recent_requests: Vec<ReqLog>,
     #[serde(default)]
+    #[allow(dead_code)]
     savings: Option<SavingsInfo>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+#[allow(dead_code)]
 struct SavingsInfo {
     #[serde(default)] today_input: u64,
     #[serde(default)] today_output: u64,
@@ -62,6 +63,7 @@ struct AccountStatus {
     available: bool,
     #[serde(default)] disabled: bool,
     #[serde(default)] auth_failed: bool,
+    #[serde(default)] health_check_failed: bool,
     #[serde(default)] utilization_5h: f64,
     #[serde(default)] reset_5h: Option<u64>,
     #[serde(default)] status_5h: Option<String>,
@@ -78,7 +80,9 @@ struct ReqLog {
     model: String,
     #[allow(dead_code)]
     status: u16,
+    #[allow(dead_code)]
     input_tokens: u64,
+    #[allow(dead_code)]
     output_tokens: u64,
     duration_ms: u64,
 }
@@ -769,6 +773,8 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize, f
 
         let (status_sym, status_style) = if acc.disabled || acc.auth_failed {
             ("✗", style_red())
+        } else if acc.health_check_failed {
+            ("!", style_yellow())
         } else if !acc.available {
             ("↺", style_yellow())
         } else {

@@ -1839,40 +1839,6 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         store.save().ok();
     }
 
-    // Build running address: show the control port when alive.
-    let addr_str = if live.is_some() {
-        cyan(&format!(":{}", config.server.control_port))
-    } else {
-        String::new()
-    };
-
-    let proxy_line = if live.is_some() {
-        format!("{}  {}  {}", green(DOT), green_bold("running"), addr_str)
-    } else {
-        let log_hint = if log_path().exists() {
-            format!("  {}  {}", dim("·"), dim("shunt logs for details"))
-        } else {
-            String::new()
-        };
-        format!("{}  {}  {}{}", dim(EMPTY), dim("stopped"), dim("shunt start"), log_hint)
-    };
-
-    let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
-    // Build savings summary if proxy is running and has data.
-    let savings_line: Option<String> = live.as_ref().and_then(|v| {
-        let s = v.get("savings")?;
-        let today_in  = s["today_input"].as_u64().unwrap_or(0);
-        let today_out = s["today_output"].as_u64().unwrap_or(0);
-        let today_cost = s["today_cost_usd"].as_f64().unwrap_or(0.0);
-        let all_cost   = s["all_time_cost_usd"].as_f64().unwrap_or(0.0);
-        if today_in + today_out == 0 && all_cost == 0.0 { return None; }
-        let today_tok = crate::term::fmt_tokens(today_in + today_out);
-        let cost_str  = crate::pricing::fmt_cost(today_cost);
-        let all_str   = crate::pricing::fmt_cost(all_cost);
-        Some(format!("{}  today {}  {}  {}  all time {}",
-            dim("·"), dim(&today_tok), dim(&cost_str), dim("·"), dim(&all_str)))
-    });
-
     // Build per-provider account counts for the splash right panel.
     let provider_lines: Vec<String> = {
         let mut counts: Vec<(String, usize)> = vec![];
@@ -2823,7 +2789,8 @@ async fn serve_all_providers(
         tokio::spawn(crate::proxy::prefetch_rate_limits(cfg_arc.clone(), state.clone(), live_creds.clone()));
         tokio::spawn(crate::proxy::openai_token_refresh_loop(cfg_arc.clone(), state.clone(), live_creds.clone()));
         tokio::spawn(crate::proxy::cooldown_watcher(cfg_arc.clone(), state.clone(), live_creds.clone()));
-        tokio::spawn(crate::proxy::recovery_watcher(cfg_arc, state.clone(), live_creds));
+        tokio::spawn(crate::proxy::recovery_watcher(cfg_arc.clone(), state.clone(), live_creds.clone()));
+        tokio::spawn(crate::proxy::health_check_loop(cfg_arc, state.clone(), live_creds));
         handles.push(tokio::spawn(async move {
             axum::serve(listener, app).await
         }));
@@ -3665,7 +3632,6 @@ fn cf_api_get_token(config_p: &std::path::Path) -> Result<String> {
         }
     }
     // prompt — do NOT write to config
-    use std::io::Write;
     println!();
     println!("  {} A Cloudflare API token is needed to create the tunnel and DNS record.", dim("·"));
     println!("  {} Create one at {} with permissions:", dim("·"), cyan("https://dash.cloudflare.com/profile/api-tokens"));
@@ -3807,7 +3773,6 @@ fn cf_api_upsert_dns(token: &str, zone_id: &str, hostname: &str, tunnel_id: &str
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
     // simple base64 without external dep — use the alphabet
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();

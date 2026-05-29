@@ -158,7 +158,9 @@ pub fn pick_account<'a>(
         if let Some(sticky_name) = state.get_sticky(fp) {
             if !tried.contains(&sticky_name) {
                 if let Some(acc) = accounts.iter().find(|a| a.name == sticky_name) {
-                    if state.is_available(&acc.name) && !state.is_exhausted(&acc.name) {
+                    if state.is_available(&acc.name) && !state.is_exhausted(&acc.name)
+                        && !state.is_health_check_failed(&acc.name)
+                    {
                         return Some(acc);
                     }
                 }
@@ -166,10 +168,16 @@ pub fn pick_account<'a>(
         }
     }
 
-    // Gather candidates: available (not on cooldown/disabled), not exhausted, not already tried.
+    // Gather candidates: available (not on cooldown/disabled), not exhausted,
+    // not health-check-failed, not already tried.
     let candidates: Vec<&AccountConfig> = accounts
         .iter()
-        .filter(|a| !tried.contains(&a.name) && state.is_available(&a.name) && !state.is_exhausted(&a.name))
+        .filter(|a| {
+            !tried.contains(&a.name)
+                && state.is_available(&a.name)
+                && !state.is_exhausted(&a.name)
+                && !state.is_health_check_failed(&a.name)
+        })
         .collect();
 
     if candidates.is_empty() {
@@ -494,5 +502,60 @@ mod tests {
 
         assert_eq!(pick(&accounts, &state, RoutingStrategy::Maximus).as_deref(), Some("fresh"),
             "maximus: fresh account should beat heavily utilised one");
+    }
+
+    // ── Health-check-failed tests ───────────────────────────────────────────
+
+    #[test]
+    fn all_strategies_skip_health_check_failed() {
+        for strategy in [RoutingStrategy::Reaper, RoutingStrategy::Carousel,
+                         RoutingStrategy::Cushion, RoutingStrategy::Maximus] {
+            let accounts = vec![make_account("unhealthy"), make_account("healthy")];
+            let state = StateStore::new_empty();
+            state.set_health_check_failed("unhealthy");
+            assert_eq!(pick(&accounts, &state, strategy).as_deref(), Some("healthy"),
+                "{strategy:?}: should skip health-check-failed account");
+        }
+    }
+
+    #[test]
+    fn health_check_failed_cleared_allows_routing() {
+        let accounts = vec![make_account("acc")];
+        let state = StateStore::new_empty();
+        state.set_health_check_failed("acc");
+        assert!(pick(&accounts, &state, RoutingStrategy::Maximus).is_none(),
+            "should not route to unhealthy account");
+
+        state.clear_health_check_failed("acc");
+        assert_eq!(pick(&accounts, &state, RoutingStrategy::Maximus).as_deref(), Some("acc"),
+            "should route after health check clears");
+    }
+
+    #[test]
+    fn sticky_skips_health_check_failed() {
+        let accounts = vec![make_account("sticky_acc"), make_account("fallback")];
+        let state = StateStore::new_empty();
+
+        // Set up sticky binding
+        state.set_sticky("fp1", "sticky_acc", 600_000);
+        // Now mark sticky account unhealthy
+        state.set_health_check_failed("sticky_acc");
+
+        let result = pick_account(
+            &accounts, &state, Some("fp1"), &HashSet::new(),
+            600_000, 1800, RoutingStrategy::Maximus,
+        );
+        assert_eq!(result.map(|a| a.name.as_str()), Some("fallback"),
+            "sticky account should be skipped when health-check-failed, fallback used instead");
+    }
+
+    #[test]
+    fn all_unhealthy_returns_none() {
+        let accounts = vec![make_account("a"), make_account("b")];
+        let state = StateStore::new_empty();
+        state.set_health_check_failed("a");
+        state.set_health_check_failed("b");
+        assert!(pick(&accounts, &state, RoutingStrategy::Maximus).is_none(),
+            "should return None when all accounts are health-check-failed");
     }
 }
