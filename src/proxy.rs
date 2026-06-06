@@ -759,13 +759,21 @@ async fn proxy_handler(
             }
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
-                // Sleep until the actual reset time if the headers tell us when that is.
-                // Fall back to Retry-After (per-minute rate limits), then 60s.
+                // Use Retry-After header for burst limits, or derive from reset window for
+                // quota exhaustion. Cap at 5 min — the `exhausted` flag (set by
+                // update_rate_limits below) already excludes the account from routing until
+                // reset_5h/7d passes, so a long cooldown is redundant and just causes the
+                // "all accounts cooling" wait to block requests for hours.
+                // Add 30s to burst-limit retry-after to prevent immediate re-selection:
+                // after a burst 429, maximus would pick the same account again (its 5h/7d
+                // quota looks fine), immediately hitting the limit again. The 30s buffer
+                // gives other accounts time in the window before this one recovers.
                 let retry_after_ms = response.headers()
                     .get("retry-after")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
-                    .map(|secs| secs.saturating_mul(1_000).max(500));
+                    .map(|secs| secs.saturating_mul(1_000).max(500).saturating_add(30_000));
+                const MAX_429_COOLDOWN_MS: u64 = 5 * 60_000;
                 let cooldown_ms = info.as_ref()
                     .and_then(|i| i.reset_5h.or(i.reset_7d))
                     .map(|reset_secs| {
@@ -773,8 +781,9 @@ async fn proxy_handler(
                         reset_ms.saturating_sub(now_ms()).saturating_add(500) // +500ms buffer
                     })
                     .or(retry_after_ms)
-                    .unwrap_or(60_000);
-                warn!(account = %account_name, cooldown_ms, "429 rate-limited — cooling until reset");
+                    .unwrap_or(90_000) // 90s default (was 60s) — avoids immediate re-cycle
+                    .min(MAX_429_COOLDOWN_MS);
+                warn!(account = %account_name, cooldown_ms, "429 rate-limited — cooling");
                 if let Some(info) = info {
                     s.state.update_rate_limits(&account_name, info);
                 }

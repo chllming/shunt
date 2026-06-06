@@ -15,7 +15,7 @@ use reqwest::Client;
 use serde_json::json;
 use tokio::net::TcpListener;
 
-use shunt::config::{AccountConfig, Config, ServerConfig};
+use shunt::config::{AccountConfig, Config, RoutingStrategy, ServerConfig};
 use shunt::credential::Credential;
 use shunt::oauth::OAuthCredential;
 use shunt::provider::Provider;
@@ -424,6 +424,10 @@ async fn setup_multi() -> (TestServer, TestServer, Captures, Client) {
             host: "127.0.0.1".into(),
             port: 0,
             log_level: "error".into(),
+            // Carousel ensures deterministic ordering (account1 first) and a short
+            // request_timeout avoids waiting for cooldowns in tests.
+            routing_strategy: RoutingStrategy::Carousel,
+            request_timeout_secs: 1,
             ..ServerConfig::default()
         },
         accounts: vec![test_account(), test_account2()],
@@ -521,6 +525,9 @@ async fn test_all_accounts_exhausted_returns_503() {
             host: "127.0.0.1".into(),
             port: 0,
             log_level: "error".into(),
+            // Short timeout: don't wait for cooldowns to expire during the test.
+            request_timeout_secs: 1,
+            routing_strategy: RoutingStrategy::Carousel,
             ..ServerConfig::default()
         },
         accounts: vec![test_account(), test_account2()],
@@ -971,6 +978,8 @@ async fn test_interop_failover_anthropic_to_openai() {
             host: "127.0.0.1".into(),
             port: 0,
             log_level: "error".into(),
+            routing_strategy: RoutingStrategy::Carousel,
+            request_timeout_secs: 1,
             ..ServerConfig::default()
         },
         accounts: vec![

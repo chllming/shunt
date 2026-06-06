@@ -86,16 +86,18 @@ fn most_urgent_window(d: &AccountRoutingData) -> (f64, Option<u64>) {
 ///   time_fraction = secs_to_reset / window_duration  (0.0 = resetting now, 1.0 = just started)
 ///   health        = 1.0 - time_fraction × utilization
 ///
-/// score = health_5h × health_7d
+/// score = health_5h × health_7d × burst_penalty
 ///
-/// This rewards accounts where:
-///   - quota is mostly unused (low utilization)
-///   - any depleted window is about to refresh (low time_fraction)
+/// burst_penalty decays linearly from 0 → 1 over 5 minutes after the last
+/// cooldown expires. This prevents maximus from immediately re-selecting an
+/// account that just recovered from a burst 429 — giving other accounts time
+/// in the window before it re-enters full competition.
 ///
-/// Fresh accounts with no rate-limit data score 1.0 (best possible).
+/// Fresh accounts with no rate-limit data and no cooldown history score 1.0.
 fn maximus_score(d: &AccountRoutingData, now_secs: u64) -> f64 {
     const WINDOW_5H_SECS: f64 = 5.0 * 3600.0;
     const WINDOW_7D_SECS: f64 = 7.0 * 24.0 * 3600.0;
+    const BURST_DECAY_MS: f64 = 5.0 * 60.0 * 1_000.0; // 5 min
 
     let time_frac_5h = d.reset_5h_secs
         .map(|r| (r.saturating_sub(now_secs) as f64 / WINDOW_5H_SECS).min(1.0))
@@ -108,7 +110,16 @@ fn maximus_score(d: &AccountRoutingData, now_secs: u64) -> f64 {
     let health_5h = 1.0 - time_frac_5h * d.util_5h;
     let health_7d = 1.0 - time_frac_7d * d.util_7d;
 
-    health_5h * health_7d
+    // Penalty for recently-cooled accounts: 0.0 right after cooldown, 1.0 after 5 min.
+    let burst_penalty = if d.cooldown_until_ms > 0 {
+        let now_ms = now_secs * 1_000;
+        let age_ms = now_ms.saturating_sub(d.cooldown_until_ms) as f64;
+        (age_ms / BURST_DECAY_MS).min(1.0)
+    } else {
+        1.0
+    };
+
+    health_5h * health_7d * burst_penalty
 }
 
 /// Helper: check if an account is a viable candidate from the snapshot.
