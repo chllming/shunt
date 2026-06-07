@@ -787,7 +787,7 @@ async fn proxy_handler(
                 if let Some(info) = info {
                     s.state.update_rate_limits(&account_name, info);
                 }
-                s.state.set_cooldown(&account_name, cooldown_ms);
+                s.state.set_cooldown_staggered(&account_name, cooldown_ms);
                 if cooldown_ms >= 5 * 60_000 && !s.state.get_alerts_muted() {
                     let mins = cooldown_ms / 60_000;
                     notify(
@@ -1514,6 +1514,20 @@ async fn post_cooldown_prefetch(
     let url = format!("{upstream_url}{path}");
     match prefetch_send(client, &url, &account.provider, token, &body).await {
         Ok(r) => {
+            // If the prefetch itself gets 429'd, the upstream rate limit hasn't
+            // actually reset yet — re-cool the account to prevent waiting
+            // requests from immediately hitting the same 429.
+            if r.status().as_u16() == 429 {
+                let retry_after_ms = r.headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(|secs| secs.saturating_mul(1_000).max(500))
+                    .unwrap_or(30_000);
+                tracing::warn!(account = %account.name, retry_after_ms, "post-cooldown prefetch got 429 — re-cooling");
+                state.set_cooldown_staggered(&account.name, retry_after_ms);
+                return;
+            }
             if let Some(info) = account.provider.parse_rate_limits(r.headers()) {
                 state.update_rate_limits(&account.name, info);
                 tracing::info!(account = %account.name, "post-cooldown prefetch: quota refreshed");

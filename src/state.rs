@@ -380,6 +380,33 @@ impl StateStore {
         self.persist();
     }
 
+    /// Like `set_cooldown`, but staggers the deadline so it doesn't collide with
+    /// other accounts already cooling. Prevents the cascade where both accounts
+    /// expire simultaneously, both get 429'd again, and loop forever.
+    /// Adds 5s offset per account already cooling within ±5s of our target deadline.
+    pub fn set_cooldown_staggered(&self, name: &str, duration_ms: u64) {
+        const STAGGER_MS: u64 = 5_000;
+        {
+            let mut data = self.inner.lock();
+            let now = now_ms();
+            let target = now + duration_ms;
+
+            // Count other accounts with cooldowns expiring within STAGGER_MS of our target
+            let nearby_count = data.accounts.iter()
+                .filter(|(n, a)| {
+                    *n != name
+                        && a.cooldown_until_ms > now
+                        && (a.cooldown_until_ms as i64 - target as i64).unsigned_abs() < STAGGER_MS
+                })
+                .count() as u64;
+
+            let offset = nearby_count.saturating_mul(STAGGER_MS);
+            let acc = data.accounts.entry(name.to_owned()).or_default();
+            acc.cooldown_until_ms = target + offset;
+        }
+        self.persist();
+    }
+
     pub fn disable_account(&self, name: &str) {
         {
             let mut data = self.inner.lock();
