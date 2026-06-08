@@ -3520,9 +3520,12 @@ async fn cmd_update() -> Result<()> {
         {
             if let Ok(v) = r.json::<serde_json::Value>().await {
                 let daemon_ver = v["version"].as_str().unwrap_or("");
-                if !daemon_ver.is_empty() && parse_version(daemon_ver) < parse_version(latest) {
+                // If version field is missing, it's a pre-v0.1.137 daemon — treat as outdated.
+                let is_outdated = daemon_ver.is_empty() || parse_version(daemon_ver) < parse_version(latest);
+                if is_outdated {
+                    let ver_display = if daemon_ver.is_empty() { "old version".to_owned() } else { format!("v{daemon_ver}") };
                     println!("  {} Daemon is still running {}. Restart now? [Y/n] ",
-                        yellow("!"), dim(&format!("v{daemon_ver}")));
+                        yellow("!"), dim(&ver_display));
                     let mut input = String::new();
                     std::io::stdin().read_line(&mut input).ok();
                     let input = input.trim().to_lowercase();
