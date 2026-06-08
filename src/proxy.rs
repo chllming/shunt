@@ -259,7 +259,7 @@ pub fn build_status_snapshot(config: &Config, state: &StateStore, started_ms: u6
 }
 
 async fn health() -> impl IntoResponse {
-    axum::Json(json!({"status": "ok"}))
+    axum::Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
 async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {

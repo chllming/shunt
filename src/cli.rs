@@ -3508,6 +3508,33 @@ async fn cmd_update() -> Result<()> {
 
     status!("  {} Updated to {}", green(CHECK), bold_white(&format!("v{latest}")));
     println!();
+
+    // If the daemon is running an older version, offer to restart it.
+    let config = crate::config::load_config(None).ok();
+    if let Some(cfg) = config {
+        let health_url = format!("http://{}:{}/health", cfg.server.host, cfg.server.control_port);
+        if let Ok(r) = reqwest::Client::new()
+            .get(&health_url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send().await
+        {
+            if let Ok(v) = r.json::<serde_json::Value>().await {
+                let daemon_ver = v["version"].as_str().unwrap_or("");
+                if !daemon_ver.is_empty() && parse_version(daemon_ver) < parse_version(latest) {
+                    println!("  {} Daemon is still running {}. Restart now? [Y/n] ",
+                        yellow("!"), dim(&format!("v{daemon_ver}")));
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).ok();
+                    let input = input.trim().to_lowercase();
+                    if input.is_empty() || input == "y" || input == "yes" {
+                        println!();
+                        cmd_restart(None).await?;
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
