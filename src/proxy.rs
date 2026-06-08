@@ -174,6 +174,7 @@ pub fn create_control_app(
         .route("/burst-limit", get(burst_limit_get_handler).post(burst_limit_set_handler).delete(burst_limit_clear_handler))
         .route("/fallback", get(fallback_get_handler).post(fallback_set_handler).delete(fallback_clear_handler))
         .route("/effort", get(effort_get_handler).post(effort_set_handler).delete(effort_clear_handler))
+        .route("/thinking", get(thinking_get_handler).post(thinking_set_handler).delete(thinking_clear_handler))
         .route("/alerts", get(alerts_get_handler).post(alerts_set_handler))
         .with_state(app_state);
 
@@ -201,6 +202,7 @@ pub fn create_app_with_state(
         .route("/burst-limit", get(burst_limit_get_handler).post(burst_limit_set_handler).delete(burst_limit_clear_handler))
         .route("/fallback", get(fallback_get_handler).post(fallback_set_handler).delete(fallback_clear_handler))
         .route("/effort", get(effort_get_handler).post(effort_set_handler).delete(effort_clear_handler))
+        .route("/thinking", get(thinking_get_handler).post(thinking_set_handler).delete(thinking_clear_handler))
         .route("/alerts", get(alerts_get_handler).post(alerts_set_handler))
         // Proxy routes
         .route("/v1/messages", post(proxy_handler))
@@ -524,6 +526,35 @@ async fn effort_clear_handler(State(s): State<AppState>) -> impl IntoResponse {
     axum::Json(json!({ "effort": null, "source": "passthrough" }))
 }
 
+async fn thinking_get_handler(State(s): State<AppState>) -> impl IntoResponse {
+    match s.state.get_thinking_override() {
+        Some(mode) => axum::Json(json!({ "thinking": mode, "source": "override" })),
+        None => axum::Json(json!({ "thinking": null, "source": "passthrough" })),
+    }
+}
+
+async fn thinking_set_handler(
+    State(s): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    let Some(mode) = body["thinking"].as_str() else {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "missing thinking string field" }))).into_response();
+    };
+    let valid = ["adaptive", "disabled"];
+    if !valid.contains(&mode) {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "thinking must be one of: adaptive, disabled" }))).into_response();
+    }
+    s.state.set_thinking_override(mode.to_owned());
+    info!(mode, "thinking override set");
+    axum::Json(json!({ "thinking": mode, "source": "override" })).into_response()
+}
+
+async fn thinking_clear_handler(State(s): State<AppState>) -> impl IntoResponse {
+    s.state.clear_thinking_override();
+    info!("thinking override cleared");
+    axum::Json(json!({ "thinking": null, "source": "passthrough" }))
+}
+
 async fn alerts_get_handler(State(s): State<AppState>) -> impl IntoResponse {
     let muted = s.state.get_alerts_muted();
     axum::Json(json!({ "muted": muted }))
@@ -612,6 +643,11 @@ async fn proxy_handler(
                 val["output_config"] = serde_json::json!({});
             }
             val["output_config"]["effort"] = serde_json::Value::String(effort);
+            changed = true;
+        }
+        // Apply thinking mode override: inject thinking object before simple-model stripping.
+        if let Some(thinking_mode) = s.state.get_thinking_override() {
+            val["thinking"] = serde_json::json!({ "type": thinking_mode });
             changed = true;
         }
         let resolved_model = val["model"].as_str().unwrap_or("").to_owned();

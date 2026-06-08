@@ -245,6 +245,22 @@ enum Command {
         #[command(subcommand)]
         action: Option<EffortAction>,
     },
+    /// Set the thinking mode for all proxied requests
+    ///
+    /// Controls extended thinking via the thinking parameter.
+    /// Default is passthrough (don't modify client requests).
+    ///
+    /// Examples:
+    ///   shunt thinking               — show current thinking override
+    ///   shunt thinking set adaptive  — force adaptive thinking on all requests
+    ///   shunt thinking set off       — disable thinking on all requests
+    ///   shunt thinking clear         — restore passthrough (don't modify)
+    Thinking {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<ThinkingAction>,
+    },
     /// Mute or unmute daemon alert notifications
     ///
     /// Examples:
@@ -351,6 +367,17 @@ enum EffortAction {
 }
 
 #[derive(Subcommand)]
+enum ThinkingAction {
+    /// Set thinking mode (adaptive or off)
+    Set {
+        /// Thinking mode: adaptive or off
+        mode: String,
+    },
+    /// Clear the override and restore passthrough
+    Clear,
+}
+
+#[derive(Subcommand)]
 enum AlertsAction {
     /// Suppress all daemon alert notifications
     Mute,
@@ -411,6 +438,7 @@ pub async fn run() -> Result<()> {
         Command::BurstLimit { config, action } => cmd_burst_limit(config, action).await,
         Command::Fallback { config, action } => cmd_fallback(config, action).await,
         Command::Effort { config, action } => cmd_effort(config, action).await,
+        Command::Thinking { config, action } => cmd_thinking(config, action).await,
         Command::Alerts { config, action } => cmd_alerts(config, action).await,
         Command::Live { config, subdomain, relay } => cmd_live(config, subdomain, relay).await,
         Command::Relay { action } => match action {
@@ -2551,6 +2579,55 @@ async fn cmd_effort(config_override: Option<PathBuf>, action: Option<EffortActio
             match resp {
                 Ok(r) if r.status().is_success() => {
                     println!("  {} Effort override cleared  ·  {}", green(CHECK), dim("passthrough restored"));
+                }
+                Ok(r) => { let body = r.text().await.unwrap_or_default(); anyhow::bail!("Proxy returned error: {body}"); }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_thinking(config_override: Option<PathBuf>, action: Option<ThinkingAction>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let url = format!("http://{}:{}/thinking", config.server.host, config.server.control_port);
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            let resp = client.get(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let source = v["source"].as_str().unwrap_or("unknown");
+                    if source == "override" {
+                        let mode = v["thinking"].as_str().unwrap_or("adaptive");
+                        let display = if mode == "disabled" { "off" } else { mode };
+                        println!("  {} Thinking: {}  ·  {}  ·  {}", green(CHECK), bold(display), dim("runtime override"), dim("shunt thinking clear to restore"));
+                    } else {
+                        println!("  {} Thinking: {}  ·  {}", dim(DOT), bold("passthrough"), dim("client requests unmodified"));
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(ThinkingAction::Set { mode }) => {
+            let api_mode = if mode == "off" { "disabled" } else { &mode };
+            let resp = client.post(&url).json(&serde_json::json!({ "thinking": api_mode })).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {} Thinking set: {}  ·  {}", green(CHECK), bold(&mode), dim("shunt thinking clear to restore"));
+                }
+                Ok(r) => { let body = r.text().await.unwrap_or_default(); anyhow::bail!("Proxy returned error: {body}"); }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(ThinkingAction::Clear) => {
+            let resp = client.delete(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {} Thinking override cleared  ·  {}", green(CHECK), dim("passthrough restored"));
                 }
                 Ok(r) => { let body = r.text().await.unwrap_or_default(); anyhow::bail!("Proxy returned error: {body}"); }
                 Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),

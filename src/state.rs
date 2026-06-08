@@ -206,6 +206,9 @@ struct StateData {
     /// Runtime effort override (ephemeral). None = passthrough, Some("max") = override.
     #[serde(skip)]
     effort_override: Option<String>,
+    /// Runtime thinking mode override (ephemeral). None = passthrough, Some("adaptive"/"disabled") = override.
+    #[serde(skip)]
+    thinking_override: Option<String>,
     /// Daily token + cost buckets keyed by "YYYY-MM-DD" (all accounts combined).
     #[serde(default)]
     global_daily: HashMap<String, DailyBucket>,
@@ -828,6 +831,22 @@ impl StateStore {
 
     pub fn clear_effort_override(&self) {
         self.inner.lock().effort_override = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // Thinking mode override
+    // -----------------------------------------------------------------------
+
+    pub fn get_thinking_override(&self) -> Option<String> {
+        self.inner.lock().thinking_override.clone()
+    }
+
+    pub fn set_thinking_override(&self, mode: String) {
+        self.inner.lock().thinking_override = Some(mode);
+    }
+
+    pub fn clear_thinking_override(&self) {
+        self.inner.lock().thinking_override = None;
     }
 
     // -----------------------------------------------------------------------

@@ -310,7 +310,7 @@ impl StrategyPicker {
 // Unified settings menu
 // ---------------------------------------------------------------------------
 
-const MENU_ITEMS: usize = 8;
+const MENU_ITEMS: usize = 9;
 
 struct Menu {
     cursor: usize,
@@ -405,6 +405,29 @@ impl EffortPicker {
     fn selected_id(&self) -> &str { EFFORT_PRESETS[self.cursor].0 }
 }
 
+const THINKING_PRESETS: &[(&str, &str)] = &[
+    ("auto", "Passthrough (don't modify)"),
+    ("adaptive", "Adaptive — model decides when to think"),
+    ("disabled", "Off — disable extended thinking"),
+];
+
+struct ThinkingPicker {
+    cursor: usize,
+}
+
+impl ThinkingPicker {
+    fn new(current: Option<&str>) -> Self {
+        let cursor = match current {
+            None => 0,
+            Some(m) => THINKING_PRESETS.iter().position(|(id, _)| *id == m).unwrap_or(0),
+        };
+        Self { cursor }
+    }
+    fn up(&mut self)   { self.cursor = self.cursor.checked_sub(1).unwrap_or(THINKING_PRESETS.len() - 1); }
+    fn down(&mut self) { self.cursor = (self.cursor + 1) % THINKING_PRESETS.len(); }
+    fn selected_id(&self) -> &str { THINKING_PRESETS[self.cursor].0 }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -419,6 +442,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let burst_limit_url = format!("{base}/burst-limit");
     let fallback_url = format!("{base}/fallback");
     let effort_url = format!("{base}/effort");
+    let thinking_url = format!("{base}/thinking");
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -456,9 +480,11 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let mut burst_limit_picker: Option<BurstLimitPicker> = None;
     let mut fallback_picker: Option<FallbackPicker> = None;
     let mut effort_picker: Option<EffortPicker> = None;
+    let mut thinking_picker: Option<ThinkingPicker> = None;
     let mut current_burst_limit: u32 = 10;
     let mut current_fallback: Option<String> = None; // None = auto
     let mut current_effort: Option<String> = None; // None = passthrough
+    let mut current_thinking: Option<String> = None; // None = passthrough
     let mut focus = Focus::Accounts;
     let mut chart_window = TimeWindow::FifteenMin;
     let start_time = Instant::now();
@@ -542,6 +568,21 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     }
                 }
             }
+            // Fetch thinking override
+            if let Ok(r) = reqwest::Client::new()
+                .get(&thinking_url)
+                .timeout(Duration::from_secs(2))
+                .send().await
+            {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    let src = v["source"].as_str().unwrap_or("passthrough");
+                    if src == "override" {
+                        current_thinking = v["thinking"].as_str().map(|s| s.to_owned());
+                    } else {
+                        current_thinking = None;
+                    }
+                }
+            }
             last_fetch = Instant::now();
         }
 
@@ -551,7 +592,8 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                  &strategy_picker, &current_strategy, &strategy_source,
                  alerts_muted, show_help, refresh_ms, focus, chart_window, start_time,
                  &menu, &speed_picker, &burst_limit_picker, &fallback_picker,
-                 &effort_picker, current_burst_limit, &current_fallback, &current_effort)
+                 &effort_picker, &thinking_picker, current_burst_limit,
+                 &current_fallback, &current_effort, &current_thinking)
         })?;
 
         if event::poll(Duration::from_millis(200))? {
@@ -669,6 +711,36 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                                     .timeout(Duration::from_secs(3))
                                     .send().await;
                                 current_effort = Some(chosen);
+                            }
+                            last_fetch = Instant::now() - Duration::from_secs(10);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Thinking picker (launched from menu)
+                if let Some(ref mut tp) = thinking_picker {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => { thinking_picker = None; }
+                        KeyCode::Up   | KeyCode::Char('k') => tp.up(),
+                        KeyCode::Down | KeyCode::Char('j') => tp.down(),
+                        KeyCode::Enter => {
+                            let chosen = tp.selected_id().to_owned();
+                            thinking_picker = None;
+                            menu = None;
+                            let client = reqwest::Client::new();
+                            if chosen == "auto" {
+                                let _ = client.delete(&thinking_url)
+                                    .timeout(Duration::from_secs(3))
+                                    .send().await;
+                                current_thinking = None;
+                            } else {
+                                let _ = client.post(&thinking_url)
+                                    .json(&serde_json::json!({ "thinking": chosen }))
+                                    .timeout(Duration::from_secs(3))
+                                    .send().await;
+                                current_thinking = Some(chosen);
                             }
                             last_fetch = Instant::now() - Duration::from_secs(10);
                         }
@@ -795,6 +867,9 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                                 7 => { // effort
                                     effort_picker = Some(EffortPicker::new(current_effort.as_deref()));
                                 }
+                                8 => { // thinking
+                                    thinking_picker = Some(ThinkingPicker::new(current_thinking.as_deref()));
+                                }
                                 _ => {}
                             }
                         }
@@ -899,9 +974,11 @@ fn draw(
     burst_limit_picker: &Option<BurstLimitPicker>,
     fallback_picker: &Option<FallbackPicker>,
     effort_picker: &Option<EffortPicker>,
+    thinking_picker: &Option<ThinkingPicker>,
     current_burst_limit: u32,
     current_fallback: &Option<String>,
     current_effort: &Option<String>,
+    current_thinking: &Option<String>,
 ) {
     let area = f.area();
 
@@ -924,13 +1001,13 @@ fn draw(
     let any_overlay = menu.is_some() || picker.is_some() || model_picker.is_some()
         || strategy_picker.is_some() || speed_picker.is_some()
         || burst_limit_picker.is_some() || fallback_picker.is_some()
-        || effort_picker.is_some();
+        || effort_picker.is_some() || thinking_picker.is_some();
     draw_footer(f, chunks[2], any_overlay, focus);
 
     // Overlays — draw order: menu first (background), sub-pickers on top
     if let Some(m) = menu {
         draw_menu(f, m, state, model_override, current_strategy, alerts_muted, refresh_ms,
-                  current_burst_limit, current_fallback, current_effort, area);
+                  current_burst_limit, current_fallback, current_effort, current_thinking, area);
     }
     if let Some(p) = picker { draw_picker(f, p, current_strategy.as_deref(), area); }
     if let Some(mp) = model_picker { draw_model_picker(f, mp, model_override.as_deref(), area); }
@@ -939,6 +1016,7 @@ fn draw(
     if let Some(bp) = burst_limit_picker { draw_burst_limit_picker(f, bp, current_burst_limit, area); }
     if let Some(fp) = fallback_picker { draw_fallback_picker(f, fp, current_fallback, area); }
     if let Some(ep) = effort_picker { draw_effort_picker(f, ep, current_effort, area); }
+    if let Some(tp) = thinking_picker { draw_thinking_picker(f, tp, current_thinking, area); }
     if show_help { draw_help_overlay(f, area); }
 }
 
@@ -1576,6 +1654,7 @@ fn draw_menu(
     current_burst_limit: u32,
     current_fallback: &Option<String>,
     current_effort: &Option<String>,
+    current_thinking: &Option<String>,
     area: Rect,
 ) {
     let h = (MENU_ITEMS + 4) as u16;
@@ -1615,6 +1694,11 @@ fn draw_menu(
             Some(m) => shorten_model(m),
         }),
         ("effort",        current_effort.as_deref().unwrap_or("auto").to_owned()),
+        ("thinking",      match current_thinking.as_deref() {
+            None => "auto".to_owned(),
+            Some("disabled") => "off".to_owned(),
+            Some(m) => m.to_owned(),
+        }),
     ];
 
     let rows: Vec<Row> = items.iter().enumerate().map(|(i, (label, value))| {
@@ -1770,6 +1854,48 @@ fn draw_effort_picker(f: &mut Frame, ep: &EffortPicker, current: &Option<String>
         let is_current = match (id, current.as_deref()) {
             ("auto", None) => true,
             (e, Some(c)) if e == c => true,
+            _ => false,
+        };
+        let bullet = if is_sel { "◆" } else { " " };
+        let check  = if is_current { " ✓" } else { "  " };
+        let name_style = if is_sel {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            style_white()
+        };
+        Row::new(vec![
+            Cell::from(Span::styled(format!("  {bullet}"), style_dim())),
+            Cell::from(Span::styled(format!("{desc}{check}"), name_style)),
+        ])
+    }).collect();
+
+    f.render_widget(
+        Table::new(rows, [Constraint::Length(4), Constraint::Min(0)])
+            .column_spacing(1),
+        inner,
+    );
+}
+
+fn draw_thinking_picker(f: &mut Frame, tp: &ThinkingPicker, current: &Option<String>, area: Rect) {
+    let h = (THINKING_PRESETS.len() + 4) as u16;
+    let w = 42u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup_area = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
+
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(" thinking mode ", style_dim())))
+        .borders(Borders::ALL)
+        .border_style(style_dkgreen());
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let rows: Vec<Row> = THINKING_PRESETS.iter().enumerate().map(|(i, &(id, desc))| {
+        let is_sel = i == tp.cursor;
+        let is_current = match (id, current.as_deref()) {
+            ("auto", None) => true,
+            (m, Some(c)) if m == c => true,
             _ => false,
         };
         let bullet = if is_sel { "◆" } else { " " };
