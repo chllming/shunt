@@ -40,6 +40,7 @@ pub struct AccountRoutingData {
     pub util_7d: f64,
     pub reset_5h_secs: Option<u64>,
     pub reset_7d_secs: Option<u64>,
+    pub burst_request_count: usize,
 }
 
 /// Snapshot of all routing-relevant state, taken with a single lock.
@@ -192,6 +193,9 @@ struct StateData {
     /// Runtime routing strategy override (ephemeral — not persisted).
     #[serde(skip)]
     routing_strategy_override: Option<RoutingStrategy>,
+    /// Per-account burst window: timestamps of recent requests (ephemeral).
+    #[serde(skip)]
+    burst_windows: HashMap<String, VecDeque<u64>>,
     /// Daily token + cost buckets keyed by "YYYY-MM-DD" (all accounts combined).
     #[serde(default)]
     global_daily: HashMap<String, DailyBucket>,
@@ -327,13 +331,26 @@ impl StateStore {
     pub fn routing_snapshot(&self) -> RoutingSnapshot {
         let now_ms  = now_ms();
         let now_secs = now_ms / 1_000;
-        let data = self.inner.lock();
+        let mut data = self.inner.lock();
 
         // Collect all account names from both accounts and rate_limits maps.
-        let mut all_names: HashSet<&String> = data.accounts.keys().collect();
-        all_names.extend(data.rate_limits.keys());
+        let all_names: Vec<String> = {
+            let mut names: HashSet<&String> = data.accounts.keys().collect();
+            names.extend(data.rate_limits.keys());
+            names.into_iter().cloned().collect()
+        };
 
-        let accounts: HashMap<String, AccountRoutingData> = all_names.into_iter().map(|name| {
+        // Pre-compute burst counts (needs mutable access for pruning).
+        let burst_counts: HashMap<String, usize> = all_names.iter()
+            .map(|name| {
+                let count = data.burst_windows.get_mut(name)
+                    .map(|deque| Self::burst_count_inner(deque, 60_000))
+                    .unwrap_or(0);
+                (name.clone(), count)
+            })
+            .collect();
+
+        let accounts: HashMap<String, AccountRoutingData> = all_names.iter().map(|name| {
             let acc = data.accounts.get(name);
             let available = acc.map(|a| !a.disabled && !a.auth_failed && now_ms >= a.cooldown_until_ms).unwrap_or(true);
             let health_check_failed = acc.map(|a| a.health_check_failed).unwrap_or(false);
@@ -352,6 +369,8 @@ impl StateStore {
                     (0.0, None, 0.0, None, false)
                 };
 
+            let burst_request_count = burst_counts.get(name).copied().unwrap_or(0);
+
             (name.clone(), AccountRoutingData {
                 available,
                 health_check_failed,
@@ -361,10 +380,31 @@ impl StateStore {
                 util_7d,
                 reset_5h_secs: reset_5h,
                 reset_7d_secs: reset_7d,
+                burst_request_count,
             })
         }).collect();
 
         RoutingSnapshot { accounts, now_secs }
+    }
+
+    // -----------------------------------------------------------------------
+    // Burst window tracking
+    // -----------------------------------------------------------------------
+
+    /// Record a request timestamp for burst-rate tracking.
+    pub fn record_request_burst(&self, name: &str) {
+        let mut data = self.inner.lock();
+        data.burst_windows.entry(name.to_owned()).or_default().push_back(now_ms());
+    }
+
+    /// Count requests in the last `window_ms` for an account.
+    fn burst_count_inner(deque: &mut VecDeque<u64>, window_ms: u64) -> usize {
+        let cutoff = now_ms().saturating_sub(window_ms);
+        // Prune old entries from front
+        while deque.front().map(|&t| t < cutoff).unwrap_or(false) {
+            deque.pop_front();
+        }
+        deque.len()
     }
 
     // -----------------------------------------------------------------------
@@ -1031,6 +1071,29 @@ mod tests {
             "last_used_account must survive restart");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_burst_window_tracking() {
+        let store = StateStore::new_empty();
+        // Record 5 requests
+        for _ in 0..5 {
+            store.record_request_burst("acc");
+        }
+        // Snapshot should show 5 in burst_request_count
+        let snap = store.routing_snapshot();
+        let data = snap.accounts.get("acc");
+        assert!(data.is_none() || data.unwrap().burst_request_count == 0,
+            "no account state yet, burst tracked separately");
+        // Now create account state so it appears in snapshot
+        store.set_cooldown("acc", 0); // creates the AccountState entry
+        for _ in 0..3 {
+            store.record_request_burst("acc");
+        }
+        let snap = store.routing_snapshot();
+        let data = snap.accounts.get("acc").expect("acc should exist in snapshot");
+        // Should have all 8 requests (5 + 3) since they're within the 60s window
+        assert_eq!(data.burst_request_count, 8, "should count all recent requests");
     }
 }
 

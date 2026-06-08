@@ -493,7 +493,7 @@ async fn proxy_handler(
     // Apply model override: if set, patch the `model` field in the JSON body before forwarding.
     // Also strip unsupported params for models that don't support them (e.g. Haiku).
     // Parse once and reuse the value to extract the model name (avoids double-parse).
-    let (body_bytes, model) = if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+    let (mut body_bytes, model) = if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
         let mut changed = false;
         if let Some(override_model) = s.state.get_model_override() {
             if val.get("model").is_some() {
@@ -561,6 +561,8 @@ async fn proxy_handler(
     let mut tried: HashSet<String> = HashSet::new();
     // Track accounts we've already attempted a token refresh for this request.
     let mut refreshed: HashSet<String> = HashSet::new();
+    // Guard: only attempt model fallback once per request.
+    let mut fell_back = false;
     // Cap wait to the configured request timeout — the client's TCP connection
     // won't survive 5 hours anyway; return 503 so the client can retry.
     let wait_deadline_ms = now_ms() + s.config.server.request_timeout_secs.saturating_mul(1_000);
@@ -572,10 +574,27 @@ async fn proxy_handler(
         let account = match router::pick_account(
             &s.config.accounts, &s.state, &snap, fp_ref, &tried,
             s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
-            effective_strategy,
+            effective_strategy, s.config.server.burst_rpm_limit,
         ) {
             Some(a) => a,
             None => {
+                // Model fallback: before waiting, try switching to a cheaper model.
+                // Rate limits are often per-model, so the fallback may succeed immediately.
+                if !fell_back {
+                    if let Some(ref fallback) = s.config.server.fallback_model {
+                        if !model.is_empty() && model != *fallback {
+                            if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                                warn!(from = %model, to = %fallback, "all accounts cooling — falling back to cheaper model");
+                                val["model"] = serde_json::Value::String(fallback.clone());
+                                body_bytes = Bytes::from(serde_json::to_vec(&val).unwrap_or_else(|_| body_bytes.to_vec()));
+                                fell_back = true;
+                                tried.clear();
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 // Check whether any accounts are just temporarily cooling down
                 // (429/529 backoff) rather than permanently disabled / auth_failed.
                 // If so, wait for the soonest one to recover and retry.
@@ -603,6 +622,7 @@ async fn proxy_handler(
         };
 
         let account_name = account.name.clone();
+        s.state.record_request_burst(&account_name);
 
         // Use the live (possibly refreshed) token rather than the one baked into config.
         // For OpenAI/chatgpt.com accounts, Credential::bearer_token() returns id_token

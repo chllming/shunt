@@ -185,6 +185,12 @@ struct RawServer {
     /// Human-readable name for this shunt instance (shown in the relay dashboard).
     /// Defaults to the system hostname.
     instance_name: Option<String>,
+    /// Per-account burst rate limit in requests per minute (0 = disabled, default disabled).
+    /// When set, accounts approaching this limit are deprioritized in routing.
+    burst_rpm_limit: Option<u32>,
+    /// Fallback model to use when all accounts are on cooldown.
+    /// If set, requests are retried with this model before waiting.
+    fallback_model: Option<String>,
 }
 
 impl Default for RawServer {
@@ -210,6 +216,8 @@ impl Default for RawServer {
             telemetry_url: None,
             telemetry_token: None,
             instance_name: None,
+            burst_rpm_limit: None,
+            fallback_model: None,
         }
     }
 }
@@ -339,6 +347,10 @@ pub struct ServerConfig {
     pub telemetry_token: Option<String>,
     /// Identifier for this shunt instance sent in telemetry payloads.
     pub instance_name: String,
+    /// Per-account burst rate limit in requests per minute (0 = disabled).
+    pub burst_rpm_limit: u32,
+    /// Fallback model when all accounts are on cooldown.
+    pub fallback_model: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -364,6 +376,8 @@ impl Default for ServerConfig {
             telemetry_url: None,
             telemetry_token: None,
             instance_name: default_instance_name(),
+            burst_rpm_limit: 0,
+            fallback_model: None,
         }
     }
 }
@@ -480,6 +494,8 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         telemetry_url,
         telemetry_token,
         instance_name,
+        burst_rpm_limit: raw.server.burst_rpm_limit.unwrap_or(0),
+        fallback_model: raw.server.fallback_model,
     };
 
     if raw.accounts.is_empty() {

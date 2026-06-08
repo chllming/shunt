@@ -94,7 +94,7 @@ fn most_urgent_window(d: &AccountRoutingData) -> (f64, Option<u64>) {
 /// in the window before it re-enters full competition.
 ///
 /// Fresh accounts with no rate-limit data and no cooldown history score 1.0.
-fn maximus_score(d: &AccountRoutingData, now_secs: u64) -> f64 {
+fn maximus_score(d: &AccountRoutingData, now_secs: u64, burst_rpm_limit: u32) -> f64 {
     const WINDOW_5H_SECS: f64 = 5.0 * 3600.0;
     const WINDOW_7D_SECS: f64 = 7.0 * 24.0 * 3600.0;
     const BURST_DECAY_MS: f64 = 5.0 * 60.0 * 1_000.0; // 5 min
@@ -119,14 +119,34 @@ fn maximus_score(d: &AccountRoutingData, now_secs: u64) -> f64 {
         1.0
     };
 
-    health_5h * health_7d * burst_penalty
+    // Pacing penalty: penalize accounts approaching the burst RPM limit.
+    // Kicks in at 70% of limit, linearly reducing score to 0 at limit.
+    let pacing_penalty = if burst_rpm_limit > 0 {
+        let threshold = (burst_rpm_limit as f64 * 0.7).floor() as usize;
+        if d.burst_request_count >= burst_rpm_limit as usize {
+            0.0
+        } else if d.burst_request_count >= threshold {
+            let remaining = burst_rpm_limit as usize - d.burst_request_count;
+            let range = burst_rpm_limit as usize - threshold;
+            remaining as f64 / range as f64
+        } else {
+            1.0
+        }
+    } else {
+        1.0
+    };
+
+    health_5h * health_7d * burst_penalty * pacing_penalty
 }
 
 /// Helper: check if an account is a viable candidate from the snapshot.
-fn is_candidate(name: &str, snap: &RoutingSnapshot, tried: &HashSet<String>) -> bool {
+fn is_candidate(name: &str, snap: &RoutingSnapshot, tried: &HashSet<String>, burst_rpm_limit: u32) -> bool {
     if tried.contains(name) { return false; }
     match snap.accounts.get(name) {
-        Some(d) => d.available && !d.exhausted && !d.health_check_failed,
+        Some(d) => {
+            d.available && !d.exhausted && !d.health_check_failed
+                && (burst_rpm_limit == 0 || d.burst_request_count < burst_rpm_limit as usize)
+        }
         None => true, // no state data = fresh account, available
     }
 }
@@ -142,6 +162,7 @@ fn get_data(name: &str, snap: &RoutingSnapshot) -> AccountRoutingData {
         util_7d: 0.0,
         reset_5h_secs: None,
         reset_7d_secs: None,
+        burst_request_count: 0,
     })
 }
 
@@ -170,6 +191,7 @@ pub fn pick_account<'a>(
     sticky_ttl_ms: u64,
     expiry_soon_secs: u64,
     strategy: RoutingStrategy,
+    burst_rpm_limit: u32,
 ) -> Option<&'a AccountConfig> {
     // Pinned account overrides everything — user explicitly chose this one
     if let Some(pinned) = state.get_pinned() {
@@ -187,7 +209,7 @@ pub fn pick_account<'a>(
     if let Some(fp) = fp {
         if let Some(sticky_name) = state.get_sticky(fp) {
             if let Some(acc) = accounts.iter().find(|a| a.name == sticky_name) {
-                if is_candidate(&acc.name, snap, tried) {
+                if is_candidate(&acc.name, snap, tried, burst_rpm_limit) {
                     return Some(acc);
                 }
             }
@@ -197,7 +219,7 @@ pub fn pick_account<'a>(
     // Gather candidates: available, not exhausted, not health-check-failed, not tried.
     let candidates: Vec<&AccountConfig> = accounts
         .iter()
-        .filter(|a| is_candidate(&a.name, snap, tried))
+        .filter(|a| is_candidate(&a.name, snap, tried, burst_rpm_limit))
         .collect();
 
     if candidates.is_empty() {
@@ -233,8 +255,8 @@ pub fn pick_account<'a>(
             candidates.iter().copied().max_by(|a, b| {
                 let da = get_data(&a.name, snap);
                 let db = get_data(&b.name, snap);
-                let sa = maximus_score(&da, snap.now_secs);
-                let sb = maximus_score(&db, snap.now_secs);
+                let sa = maximus_score(&da, snap.now_secs, burst_rpm_limit);
+                let sb = maximus_score(&db, snap.now_secs, burst_rpm_limit);
                 sa.partial_cmp(&sb).unwrap_or(Ordering::Equal)
             })?
         }
@@ -356,7 +378,7 @@ mod tests {
 
     fn pick(accounts: &[AccountConfig], state: &StateStore, strategy: RoutingStrategy) -> Option<String> {
         let snap = state.routing_snapshot();
-        pick_account(accounts, state, &snap, None, &HashSet::new(), 600_000, 1800, strategy)
+        pick_account(accounts, state, &snap, None, &HashSet::new(), 600_000, 1800, strategy, 0)
             .map(|a| a.name.clone())
     }
 
@@ -550,7 +572,7 @@ mod tests {
         let snap = state.routing_snapshot();
         let result = pick_account(
             &accounts, &state, &snap, Some("fp1"), &HashSet::new(),
-            600_000, 1800, RoutingStrategy::Maximus,
+            600_000, 1800, RoutingStrategy::Maximus, 0,
         );
         assert_eq!(result.map(|a| a.name.as_str()), Some("fallback"),
             "sticky account should be skipped when health-check-failed, fallback used instead");
@@ -564,5 +586,40 @@ mod tests {
         state.set_health_check_failed("b");
         assert!(pick(&accounts, &state, RoutingStrategy::Maximus).is_none(),
             "should return None when all accounts are health-check-failed");
+    }
+
+    #[test]
+    fn pacing_deprioritizes_busy_account() {
+        let accounts = vec![make_account("busy"), make_account("idle")];
+        let state = StateStore::new_empty();
+        // Simulate 10 recent requests on "busy"
+        for _ in 0..10 {
+            state.record_request_burst("busy");
+        }
+        // With burst_rpm_limit=10, "busy" should be excluded (at limit)
+        let snap = state.routing_snapshot();
+        let result = pick_account(
+            &accounts, &state, &snap, None, &HashSet::new(),
+            600_000, 1800, RoutingStrategy::Maximus, 10,
+        );
+        assert_eq!(result.map(|a| a.name.as_str()), Some("idle"),
+            "busy account at burst limit should be skipped, idle account chosen");
+    }
+
+    #[test]
+    fn pacing_disabled_when_limit_zero() {
+        let accounts = vec![make_account("busy")];
+        let state = StateStore::new_empty();
+        for _ in 0..20 {
+            state.record_request_burst("busy");
+        }
+        // With burst_rpm_limit=0 (disabled), "busy" should still be chosen
+        let snap = state.routing_snapshot();
+        let result = pick_account(
+            &accounts, &state, &snap, None, &HashSet::new(),
+            600_000, 1800, RoutingStrategy::Maximus, 0,
+        );
+        assert_eq!(result.map(|a| a.name.as_str()), Some("busy"),
+            "burst pacing should not filter when limit is 0");
     }
 }
