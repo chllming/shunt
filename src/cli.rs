@@ -228,6 +228,22 @@ enum Command {
         #[command(subcommand)]
         action: Option<FallbackAction>,
     },
+    /// Set the effort level for all proxied requests
+    ///
+    /// Controls reasoning depth via output_config.effort.
+    /// Default is passthrough (don't modify client requests).
+    ///
+    /// Examples:
+    ///   shunt effort           — show current effort override
+    ///   shunt effort set max   — override to maximum reasoning
+    ///   shunt effort set low   — override to fast & cheap
+    ///   shunt effort clear     — restore passthrough (don't modify)
+    Effort {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<EffortAction>,
+    },
     /// Mute or unmute daemon alert notifications
     ///
     /// Examples:
@@ -323,6 +339,17 @@ enum FallbackAction {
 }
 
 #[derive(Subcommand)]
+enum EffortAction {
+    /// Set effort level (low, medium, high, max)
+    Set {
+        /// Effort level: low, medium, high, or max
+        level: String,
+    },
+    /// Clear the override and restore passthrough
+    Clear,
+}
+
+#[derive(Subcommand)]
 enum AlertsAction {
     /// Suppress all daemon alert notifications
     Mute,
@@ -382,6 +409,7 @@ pub async fn run() -> Result<()> {
         Command::Strategy { config, action } => cmd_strategy(config, action).await,
         Command::BurstLimit { config, action } => cmd_burst_limit(config, action).await,
         Command::Fallback { config, action } => cmd_fallback(config, action).await,
+        Command::Effort { config, action } => cmd_effort(config, action).await,
         Command::Alerts { config, action } => cmd_alerts(config, action).await,
         Command::Live { config, subdomain, relay } => cmd_live(config, subdomain, relay).await,
         Command::Relay { action } => match action {
@@ -2475,6 +2503,53 @@ async fn cmd_fallback(config_override: Option<PathBuf>, action: Option<FallbackA
                     let source = v["source"].as_str().unwrap_or("auto");
                     let model = v["fallback_model"].as_str().unwrap_or("auto");
                     println!("  {} Fallback override cleared  ·  {}  ·  {}", green(CHECK), bold(model), dim(&format!("from {source}")));
+                }
+                Ok(r) => { let body = r.text().await.unwrap_or_default(); anyhow::bail!("Proxy returned error: {body}"); }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_effort(config_override: Option<PathBuf>, action: Option<EffortAction>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let url = format!("http://{}:{}/effort", config.server.host, config.server.control_port);
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            let resp = client.get(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let source = v["source"].as_str().unwrap_or("unknown");
+                    if source == "override" {
+                        let effort = v["effort"].as_str().unwrap_or("high");
+                        println!("  {} Effort: {}  ·  {}  ·  {}", green(CHECK), bold(effort), dim("runtime override"), dim("shunt effort clear to restore"));
+                    } else {
+                        println!("  {} Effort: {}  ·  {}", dim(DOT), bold("passthrough"), dim("client requests unmodified"));
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(EffortAction::Set { level }) => {
+            let resp = client.post(&url).json(&serde_json::json!({ "effort": level })).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {} Effort set: {}  ·  {}", green(CHECK), bold(&level), dim("shunt effort clear to restore"));
+                }
+                Ok(r) => { let body = r.text().await.unwrap_or_default(); anyhow::bail!("Proxy returned error: {body}"); }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(EffortAction::Clear) => {
+            let resp = client.delete(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("  {} Effort override cleared  ·  {}", green(CHECK), dim("passthrough restored"));
                 }
                 Ok(r) => { let body = r.text().await.unwrap_or_default(); anyhow::bail!("Proxy returned error: {body}"); }
                 Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),

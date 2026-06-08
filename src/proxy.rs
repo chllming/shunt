@@ -173,6 +173,7 @@ pub fn create_control_app(
         .route("/strategy", get(strategy_get_handler).post(strategy_set_handler).delete(strategy_clear_handler))
         .route("/burst-limit", get(burst_limit_get_handler).post(burst_limit_set_handler).delete(burst_limit_clear_handler))
         .route("/fallback", get(fallback_get_handler).post(fallback_set_handler).delete(fallback_clear_handler))
+        .route("/effort", get(effort_get_handler).post(effort_set_handler).delete(effort_clear_handler))
         .route("/alerts", get(alerts_get_handler).post(alerts_set_handler))
         .with_state(app_state);
 
@@ -199,6 +200,7 @@ pub fn create_app_with_state(
         .route("/strategy", get(strategy_get_handler).post(strategy_set_handler).delete(strategy_clear_handler))
         .route("/burst-limit", get(burst_limit_get_handler).post(burst_limit_set_handler).delete(burst_limit_clear_handler))
         .route("/fallback", get(fallback_get_handler).post(fallback_set_handler).delete(fallback_clear_handler))
+        .route("/effort", get(effort_get_handler).post(effort_set_handler).delete(effort_clear_handler))
         .route("/alerts", get(alerts_get_handler).post(alerts_set_handler))
         // Proxy routes
         .route("/v1/messages", post(proxy_handler))
@@ -493,6 +495,35 @@ async fn fallback_clear_handler(State(s): State<AppState>) -> impl IntoResponse 
     }
 }
 
+async fn effort_get_handler(State(s): State<AppState>) -> impl IntoResponse {
+    match s.state.get_effort_override() {
+        Some(effort) => axum::Json(json!({ "effort": effort, "source": "override" })),
+        None => axum::Json(json!({ "effort": null, "source": "passthrough" })),
+    }
+}
+
+async fn effort_set_handler(
+    State(s): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    let Some(effort) = body["effort"].as_str() else {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "missing effort string field" }))).into_response();
+    };
+    let valid = ["low", "medium", "high", "max"];
+    if !valid.contains(&effort) {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": "effort must be one of: low, medium, high, max" }))).into_response();
+    }
+    s.state.set_effort_override(effort.to_owned());
+    info!(effort, "effort override set");
+    axum::Json(json!({ "effort": effort, "source": "override" })).into_response()
+}
+
+async fn effort_clear_handler(State(s): State<AppState>) -> impl IntoResponse {
+    s.state.clear_effort_override();
+    info!("effort override cleared");
+    axum::Json(json!({ "effort": null, "source": "passthrough" }))
+}
+
 async fn alerts_get_handler(State(s): State<AppState>) -> impl IntoResponse {
     let muted = s.state.get_alerts_muted();
     axum::Json(json!({ "muted": muted }))
@@ -574,6 +605,14 @@ async fn proxy_handler(
                 val["model"] = serde_json::Value::String(override_model);
                 changed = true;
             }
+        }
+        // Apply effort override: inject output_config.effort before simple-model stripping.
+        if let Some(effort) = s.state.get_effort_override() {
+            if val.get("output_config").is_none() {
+                val["output_config"] = serde_json::json!({});
+            }
+            val["output_config"]["effort"] = serde_json::Value::String(effort);
+            changed = true;
         }
         let resolved_model = val["model"].as_str().unwrap_or("").to_owned();
         if is_simple_model(&resolved_model) {

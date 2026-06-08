@@ -310,7 +310,7 @@ impl StrategyPicker {
 // Unified settings menu
 // ---------------------------------------------------------------------------
 
-const MENU_ITEMS: usize = 7;
+const MENU_ITEMS: usize = 8;
 
 struct Menu {
     cursor: usize,
@@ -379,6 +379,31 @@ impl FallbackPicker {
     fn selected_id(&self) -> &str { FALLBACK_PRESETS[self.cursor].0 }
 }
 
+const EFFORT_PRESETS: &[(&str, &str)] = &[
+    ("auto", "Passthrough (don't modify)"),
+    ("low", "Low — fast & cheap"),
+    ("medium", "Medium — balanced"),
+    ("high", "High — default quality"),
+    ("max", "Max — maximum reasoning"),
+];
+
+struct EffortPicker {
+    cursor: usize,
+}
+
+impl EffortPicker {
+    fn new(current: Option<&str>) -> Self {
+        let cursor = match current {
+            None => 0, // auto/passthrough
+            Some(e) => EFFORT_PRESETS.iter().position(|(id, _)| *id == e).unwrap_or(0),
+        };
+        Self { cursor }
+    }
+    fn up(&mut self)   { self.cursor = self.cursor.checked_sub(1).unwrap_or(EFFORT_PRESETS.len() - 1); }
+    fn down(&mut self) { self.cursor = (self.cursor + 1) % EFFORT_PRESETS.len(); }
+    fn selected_id(&self) -> &str { EFFORT_PRESETS[self.cursor].0 }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -392,6 +417,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let alerts_url = format!("{base}/alerts");
     let burst_limit_url = format!("{base}/burst-limit");
     let fallback_url = format!("{base}/fallback");
+    let effort_url = format!("{base}/effort");
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -428,8 +454,10 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
     let mut speed_picker: Option<SpeedPicker> = None;
     let mut burst_limit_picker: Option<BurstLimitPicker> = None;
     let mut fallback_picker: Option<FallbackPicker> = None;
+    let mut effort_picker: Option<EffortPicker> = None;
     let mut current_burst_limit: u32 = 10;
     let mut current_fallback: Option<String> = None; // None = auto
+    let mut current_effort: Option<String> = None; // None = passthrough
     let mut focus = Focus::Accounts;
     let mut chart_window = TimeWindow::FifteenMin;
     let start_time = Instant::now();
@@ -498,6 +526,21 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                     }
                 }
             }
+            // Fetch effort override
+            if let Ok(r) = reqwest::Client::new()
+                .get(&effort_url)
+                .timeout(Duration::from_secs(2))
+                .send().await
+            {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    let src = v["source"].as_str().unwrap_or("passthrough");
+                    if src == "override" {
+                        current_effort = v["effort"].as_str().map(|s| s.to_owned());
+                    } else {
+                        current_effort = None;
+                    }
+                }
+            }
             last_fetch = Instant::now();
         }
 
@@ -507,7 +550,7 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                  &strategy_picker, &current_strategy, &strategy_source,
                  alerts_muted, show_help, refresh_ms, focus, chart_window, start_time,
                  &menu, &speed_picker, &burst_limit_picker, &fallback_picker,
-                 current_burst_limit, &current_fallback)
+                 &effort_picker, current_burst_limit, &current_fallback, &current_effort)
         })?;
 
         if event::poll(Duration::from_millis(200))? {
@@ -595,6 +638,36 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                                         .send().await;
                                     current_fallback = Some(model.to_owned());
                                 }
+                            }
+                            last_fetch = Instant::now() - Duration::from_secs(10);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Effort picker (launched from menu)
+                if let Some(ref mut ep) = effort_picker {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => { effort_picker = None; }
+                        KeyCode::Up   | KeyCode::Char('k') => ep.up(),
+                        KeyCode::Down | KeyCode::Char('j') => ep.down(),
+                        KeyCode::Enter => {
+                            let chosen = ep.selected_id().to_owned();
+                            effort_picker = None;
+                            menu = None;
+                            let client = reqwest::Client::new();
+                            if chosen == "auto" {
+                                let _ = client.delete(&effort_url)
+                                    .timeout(Duration::from_secs(3))
+                                    .send().await;
+                                current_effort = None;
+                            } else {
+                                let _ = client.post(&effort_url)
+                                    .json(&serde_json::json!({ "effort": chosen }))
+                                    .timeout(Duration::from_secs(3))
+                                    .send().await;
+                                current_effort = Some(chosen);
                             }
                             last_fetch = Instant::now() - Duration::from_secs(10);
                         }
@@ -718,6 +791,9 @@ pub async fn run_monitor(base_url: &str) -> Result<()> {
                                 6 => { // fallback model
                                     fallback_picker = Some(FallbackPicker::new(current_fallback.as_deref()));
                                 }
+                                7 => { // effort
+                                    effort_picker = Some(EffortPicker::new(current_effort.as_deref()));
+                                }
                                 _ => {}
                             }
                         }
@@ -821,8 +897,10 @@ fn draw(
     speed_picker: &Option<SpeedPicker>,
     burst_limit_picker: &Option<BurstLimitPicker>,
     fallback_picker: &Option<FallbackPicker>,
+    effort_picker: &Option<EffortPicker>,
     current_burst_limit: u32,
     current_fallback: &Option<String>,
+    current_effort: &Option<String>,
 ) {
     let area = f.area();
 
@@ -844,13 +922,14 @@ fn draw(
 
     let any_overlay = menu.is_some() || picker.is_some() || model_picker.is_some()
         || strategy_picker.is_some() || speed_picker.is_some()
-        || burst_limit_picker.is_some() || fallback_picker.is_some();
+        || burst_limit_picker.is_some() || fallback_picker.is_some()
+        || effort_picker.is_some();
     draw_footer(f, chunks[2], any_overlay, focus);
 
     // Overlays — draw order: menu first (background), sub-pickers on top
     if let Some(m) = menu {
         draw_menu(f, m, state, model_override, current_strategy, alerts_muted, refresh_ms,
-                  current_burst_limit, current_fallback, area);
+                  current_burst_limit, current_fallback, current_effort, area);
     }
     if let Some(p) = picker { draw_picker(f, p, current_strategy.as_deref(), area); }
     if let Some(mp) = model_picker { draw_model_picker(f, mp, model_override.as_deref(), area); }
@@ -858,6 +937,7 @@ fn draw(
     if let Some(sp) = speed_picker { draw_speed_picker(f, sp, refresh_ms, area); }
     if let Some(bp) = burst_limit_picker { draw_burst_limit_picker(f, bp, current_burst_limit, area); }
     if let Some(fp) = fallback_picker { draw_fallback_picker(f, fp, current_fallback, area); }
+    if let Some(ep) = effort_picker { draw_effort_picker(f, ep, current_effort, area); }
     if show_help { draw_help_overlay(f, area); }
 }
 
@@ -1494,6 +1574,7 @@ fn draw_menu(
     refresh_ms: u64,
     current_burst_limit: u32,
     current_fallback: &Option<String>,
+    current_effort: &Option<String>,
     area: Rect,
 ) {
     let h = (MENU_ITEMS + 4) as u16;
@@ -1532,6 +1613,7 @@ fn draw_menu(
             Some("off") => "off".to_owned(),
             Some(m) => shorten_model(m),
         }),
+        ("effort",        current_effort.as_deref().unwrap_or("auto").to_owned()),
     ];
 
     let rows: Vec<Row> = items.iter().enumerate().map(|(i, (label, value))| {
@@ -1645,6 +1727,48 @@ fn draw_fallback_picker(f: &mut Frame, fp: &FallbackPicker, current: &Option<Str
             ("auto", None) => true,
             ("off", Some("off")) => true,
             (m, Some(c)) if m == c => true,
+            _ => false,
+        };
+        let bullet = if is_sel { "◆" } else { " " };
+        let check  = if is_current { " ✓" } else { "  " };
+        let name_style = if is_sel {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        } else {
+            style_white()
+        };
+        Row::new(vec![
+            Cell::from(Span::styled(format!("  {bullet}"), style_dim())),
+            Cell::from(Span::styled(format!("{desc}{check}"), name_style)),
+        ])
+    }).collect();
+
+    f.render_widget(
+        Table::new(rows, [Constraint::Length(4), Constraint::Min(0)])
+            .column_spacing(1),
+        inner,
+    );
+}
+
+fn draw_effort_picker(f: &mut Frame, ep: &EffortPicker, current: &Option<String>, area: Rect) {
+    let h = (EFFORT_PRESETS.len() + 4) as u16;
+    let w = 38u16;
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let popup_area = Rect { x, y, width: w.min(area.width), height: h.min(area.height) };
+
+    f.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(Line::from(Span::styled(" effort level ", style_dim())))
+        .borders(Borders::ALL)
+        .border_style(style_dkgreen());
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let rows: Vec<Row> = EFFORT_PRESETS.iter().enumerate().map(|(i, &(id, desc))| {
+        let is_sel = i == ep.cursor;
+        let is_current = match (id, current.as_deref()) {
+            ("auto", None) => true,
+            (e, Some(c)) if e == c => true,
             _ => false,
         };
         let bullet = if is_sel { "◆" } else { " " };

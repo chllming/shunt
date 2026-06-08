@@ -203,6 +203,9 @@ struct StateData {
     /// `Some(Some("model"))` = explicit override, `Some(None)` = explicitly disabled, `None` = use config/auto.
     #[serde(skip)]
     fallback_model_override: Option<Option<String>>,
+    /// Runtime effort override (ephemeral). None = passthrough, Some("max") = override.
+    #[serde(skip)]
+    effort_override: Option<String>,
     /// Daily token + cost buckets keyed by "YYYY-MM-DD" (all accounts combined).
     #[serde(default)]
     global_daily: HashMap<String, DailyBucket>,
@@ -809,6 +812,22 @@ impl StateStore {
 
     pub fn clear_fallback_model_override(&self) {
         self.inner.lock().fallback_model_override = None;
+    }
+
+    // -----------------------------------------------------------------------
+    // Effort override
+    // -----------------------------------------------------------------------
+
+    pub fn get_effort_override(&self) -> Option<String> {
+        self.inner.lock().effort_override.clone()
+    }
+
+    pub fn set_effort_override(&self, effort: String) {
+        self.inner.lock().effort_override = Some(effort);
+    }
+
+    pub fn clear_effort_override(&self) {
+        self.inner.lock().effort_override = None;
     }
 
     // -----------------------------------------------------------------------
