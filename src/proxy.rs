@@ -21,7 +21,7 @@ use crate::forwarder::Forwarder;
 use crate::provider::Provider;
 use crate::quota;
 use crate::router;
-use crate::state::StateStore;
+use crate::state::{RateLimitInfo, StateStore};
 use crate::telemetry::{SupabaseTelemetry, TelemetryClient};
 
 /// 100 MB limit — sufficient for any LLM request including large context windows.
@@ -942,31 +942,15 @@ async fn proxy_handler(
             }
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
-                // Use Retry-After header for burst limits, or derive from reset window for
-                // quota exhaustion. Cap at 5 min — the `exhausted` flag (set by
-                // update_rate_limits below) already excludes the account from routing until
-                // reset_5h/7d passes, so a long cooldown is redundant and just causes the
-                // "all accounts cooling" wait to block requests for hours.
                 // Add 30s to burst-limit retry-after to prevent immediate re-selection:
                 // after a burst 429, maximus would pick the same account again (its 5h/7d
                 // quota looks fine), immediately hitting the limit again. The 30s buffer
                 // gives other accounts time in the window before this one recovers.
-                let retry_after_ms = response.headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .map(|secs| secs.saturating_mul(1_000).max(500).saturating_add(30_000));
-                const MAX_429_COOLDOWN_MS: u64 = 5 * 60_000;
-                let cooldown_ms = info.as_ref()
-                    .and_then(|i| i.reset_5h.or(i.reset_7d))
-                    .map(|reset_secs| {
-                        let reset_ms = reset_secs.saturating_mul(1_000);
-                        reset_ms.saturating_sub(now_ms()).saturating_add(500) // +500ms buffer
-                    })
-                    .or(retry_after_ms)
-                    .unwrap_or(90_000) // 90s default (was 60s) — avoids immediate re-cycle
-                    .min(MAX_429_COOLDOWN_MS);
-                warn!(account = %account_name, cooldown_ms, "429 rate-limited — cooling");
+                let retry_after_ms = parse_retry_after_ms(response.headers())
+                    .map(|ms| ms.saturating_add(30_000));
+                let is_exhausted = is_exhausted_response(info.as_ref());
+                let cooldown_ms = compute_429_cooldown_ms(info.as_ref(), retry_after_ms, is_exhausted);
+                warn!(account = %account_name, cooldown_ms, exhausted = is_exhausted, "429 rate-limited — cooling");
                 if let Some(info) = info {
                     s.state.update_rate_limits(&account_name, info);
                 }
@@ -1725,18 +1709,19 @@ async fn post_cooldown_prefetch(
             // If the prefetch itself gets 429'd, the upstream rate limit hasn't
             // actually reset yet — re-cool the account to prevent waiting
             // requests from immediately hitting the same 429.
+            let info = account.provider.parse_rate_limits(r.headers());
             if r.status().as_u16() == 429 {
-                let retry_after_ms = r.headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .map(|secs| secs.saturating_mul(1_000).max(500))
-                    .unwrap_or(30_000);
-                tracing::warn!(account = %account.name, retry_after_ms, "post-cooldown prefetch got 429 — re-cooling");
-                state.set_cooldown_staggered(&account.name, retry_after_ms);
+                let retry_after_ms = parse_retry_after_ms(r.headers());
+                let is_exhausted = is_exhausted_response(info.as_ref());
+                let cooldown_ms = compute_429_cooldown_ms(info.as_ref(), retry_after_ms, is_exhausted);
+                tracing::warn!(account = %account.name, cooldown_ms, exhausted = is_exhausted, "post-cooldown prefetch got 429 — re-cooling");
+                if let Some(info) = info {
+                    state.update_rate_limits(&account.name, info);
+                }
+                state.set_cooldown_staggered(&account.name, cooldown_ms);
                 return;
             }
-            if let Some(info) = account.provider.parse_rate_limits(r.headers()) {
+            if let Some(info) = info {
                 state.update_rate_limits(&account.name, info);
                 tracing::info!(account = %account.name, "post-cooldown prefetch: quota refreshed");
             }
@@ -2189,6 +2174,63 @@ async fn fetch_sentinel_token(client: &reqwest::Client, upstream: &str, token: &
 }
 
 
+/// Parse a 429 response's retry delay, preferring the millisecond-precision
+/// `retry-after-ms` header (used by Anthropic's SDK-level burst throttling)
+/// over the standard `retry-after` (whole seconds).
+fn parse_retry_after_ms(headers: &axum::http::HeaderMap) -> Option<u64> {
+    if let Some(ms) = headers.get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        return Some(ms.max(500));
+    }
+    headers.get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|secs| secs.saturating_mul(1_000).max(500))
+}
+
+/// Mirrors `StateStore::is_exhausted`'s semantics: a window only counts as
+/// exhausted if Anthropic's status says so AND its reset is still in the future.
+fn is_exhausted_response(info: Option<&RateLimitInfo>) -> bool {
+    let Some(info) = info else { return false };
+    let now_secs = now_ms() / 1_000;
+    let exhausted_5h = info.status_5h.as_deref() == Some("exhausted")
+        && info.reset_5h.map(|t| t > now_secs).unwrap_or(false);
+    let exhausted_7d = info.status_7d.as_deref() == Some("exhausted")
+        && info.reset_7d.map(|t| t > now_secs).unwrap_or(false);
+    exhausted_5h || exhausted_7d
+}
+
+/// Compute how long to cool an account after a 429.
+///
+/// Anthropic's unified rate limiter reports `reset_5h`/`reset_7d` on essentially
+/// every response once an account has made one request — even when the 429 was
+/// just a transient per-minute burst throttle, not real quota exhaustion. Treating
+/// every 429 as "derive cooldown from reset_5h/7d" therefore forced a near-5-minute
+/// cooldown on routine burst hits, which is the dominant case with only 1-2
+/// accounts in the pool and made simultaneous "all accounts cooling" stalls likely.
+///
+/// Only use the long reset-derived cooldown when a window is genuinely exhausted;
+/// otherwise trust `Retry-After`, which Anthropic sets to the real, short burst
+/// delay (seconds, occasionally given as `retry-after-ms`).
+fn compute_429_cooldown_ms(info: Option<&RateLimitInfo>, retry_after_ms: Option<u64>, is_exhausted: bool) -> u64 {
+    const MAX_EXHAUSTED_COOLDOWN_MS: u64 = 5 * 60_000;
+    const MAX_BURST_COOLDOWN_MS: u64 = 2 * 60_000;
+    if is_exhausted {
+        info.and_then(|i| i.reset_5h.or(i.reset_7d))
+            .map(|reset_secs| {
+                let reset_ms = reset_secs.saturating_mul(1_000);
+                reset_ms.saturating_sub(now_ms()).saturating_add(500) // +500ms buffer
+            })
+            .or(retry_after_ms)
+            .unwrap_or(90_000)
+            .min(MAX_EXHAUSTED_COOLDOWN_MS)
+    } else {
+        retry_after_ms.unwrap_or(60_000).min(MAX_BURST_COOLDOWN_MS)
+    }
+}
+
 /// Returns true if the model lacks support for extended thinking / effort.
 /// These params must be stripped before forwarding.
 fn is_simple_model(model: &str) -> bool {
@@ -2233,3 +2275,84 @@ fn resolve_model(
     incoming.to_owned()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_info(status_5h: Option<&str>, reset_5h: Option<u64>, status_7d: Option<&str>, reset_7d: Option<u64>) -> RateLimitInfo {
+        RateLimitInfo {
+            status_5h: status_5h.map(str::to_owned),
+            reset_5h,
+            status_7d: status_7d.map(str::to_owned),
+            reset_7d,
+            utilization_5h: Some(0.5),
+            utilization_7d: Some(0.3),
+            ..Default::default()
+        }
+    }
+
+    fn future_secs() -> u64 {
+        now_ms() / 1_000 + 3600
+    }
+
+    #[test]
+    fn burst_429_uses_retry_after() {
+        let info = make_info(Some("allowed"), Some(future_secs()), Some("allowed"), None);
+        let retry_ms = Some(45_000u64); // 45s (15s retry-after + 30s buffer)
+        let cd = compute_429_cooldown_ms(Some(&info), retry_ms, false);
+        assert_eq!(cd, 45_000, "burst 429 should use retry_after directly");
+    }
+
+    #[test]
+    fn burst_429_caps_at_2_min() {
+        let cd = compute_429_cooldown_ms(None, Some(999_999), false);
+        assert_eq!(cd, 2 * 60_000, "burst cooldown should cap at 2 min");
+    }
+
+    #[test]
+    fn burst_429_default_when_no_retry_after() {
+        let cd = compute_429_cooldown_ms(None, None, false);
+        assert_eq!(cd, 60_000, "burst cooldown should default to 60s");
+    }
+
+    #[test]
+    fn exhausted_429_uses_reset_derived_cooldown() {
+        let reset = now_ms() / 1_000 + 120; // resets in 2 min
+        let info = make_info(Some("exhausted"), Some(reset), Some("allowed"), None);
+        let cd = compute_429_cooldown_ms(Some(&info), Some(5_000), true);
+        assert!(cd > 60_000 && cd <= 120_500, "exhausted should use reset-derived cooldown (~120s), got {cd}");
+    }
+
+    #[test]
+    fn exhausted_429_caps_at_5_min() {
+        let reset = now_ms() / 1_000 + 7200; // resets in 2 hours
+        let info = make_info(Some("exhausted"), Some(reset), Some("allowed"), None);
+        let cd = compute_429_cooldown_ms(Some(&info), None, true);
+        assert_eq!(cd, 5 * 60_000, "exhausted cooldown should cap at 5 min");
+    }
+
+    #[test]
+    fn is_exhausted_requires_status_and_future_reset() {
+        let future = future_secs();
+        let past = now_ms() / 1_000 - 3600;
+        assert!(is_exhausted_response(Some(&make_info(Some("exhausted"), Some(future), None, None))));
+        assert!(!is_exhausted_response(Some(&make_info(Some("exhausted"), Some(past), None, None))));
+        assert!(!is_exhausted_response(Some(&make_info(Some("allowed"), Some(future), None, None))));
+        assert!(!is_exhausted_response(None));
+    }
+
+    #[test]
+    fn parse_retry_after_ms_prefers_ms_header() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("retry-after-ms", "1500".parse().unwrap());
+        headers.insert("retry-after", "30".parse().unwrap());
+        assert_eq!(parse_retry_after_ms(&headers), Some(1500));
+    }
+
+    #[test]
+    fn parse_retry_after_ms_falls_back_to_seconds() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("retry-after", "5".parse().unwrap());
+        assert_eq!(parse_retry_after_ms(&headers), Some(5_000));
+    }
+}
