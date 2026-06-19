@@ -77,8 +77,8 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Import the current Claude Code session as an additional account
-    #[command(hide = true)]
+    /// Add an account to the pool — imports the current Claude Code session
+    #[command(visible_alias = "add")]
     AddAccount {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -89,7 +89,7 @@ enum Command {
         provider: Option<String>,
     },
     /// Remove an account from the pool
-    #[command(hide = true)]
+    #[command(visible_alias = "remove")]
     RemoveAccount {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -479,7 +479,7 @@ pub async fn cmd_setup(config_override: Option<PathBuf>) -> Result<()> {
 
     if config_p.exists() {
         println!("  {} Already configured.", green(CHECK));
-        println!("  {} Use {} to add more accounts.", dim("·"), cyan("shunt add-account"));
+        println!("  {} Use {} to add more accounts.", dim("·"), cyan("shunt add"));
         // Ensure settings.json is pointing at the local proxy even if setup ran
         // before this feature was added (e.g. after an update).
         let port = crate::config::load_config(config_override.as_deref())
@@ -610,7 +610,7 @@ async fn cmd_manage_account(config_override: Option<PathBuf>) -> Result<()> {
 
     let config = crate::config::load_config(config_override.as_deref())?;
     if config.accounts.is_empty() {
-        bail!("No accounts configured. Run `shunt config` → Add account.");
+        bail!("No accounts configured. Run `shunt add` to connect an account.");
     }
 
     // ── Step 1: pick account ─────────────────────────────────────────────────
@@ -926,6 +926,16 @@ async fn cmd_add_account(
             // Read key — use rpassword for masked input if available, otherwise plain readline
             let key = read_secret_line()?;
             if key.is_empty() { bail!("API key cannot be empty."); }
+            // Soft sanity check: Anthropic keys start with `sk-ant-`. A truncated or
+            // wrong-field paste is the most common setup mistake — warn early rather
+            // than letting it surface as a confusing 401 on first live request.
+            if matches!(provider, Provider::Anthropic) && !key.starts_with("sk-ant-") {
+                println!("  {} This doesn't look like an Anthropic API key (expected {} prefix).",
+                    yellow("!"), cyan("sk-ant-"));
+                if !term::confirm("Save it anyway?") {
+                    bail!("Cancelled — re-run and paste the full API key.");
+                }
+            }
             println!("  {} API key saved.", green(CHECK));
             Some(Credential::Apikey { key })
         }
@@ -1181,7 +1191,7 @@ async fn cmd_logout(config_override: Option<PathBuf>, name: Option<String>, all:
 
     println!();
     println!("  {} Logged out {}.", green(CHECK), label);
-    println!("  {} To re-authorize: {}", dim("·"), cyan("shunt add-account"));
+    println!("  {} To re-authorize: {}", dim("·"), cyan("shunt add"));
     println!();
     Ok(())
 }
@@ -2170,10 +2180,10 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
             }
         } else if acc.credential.is_none() && acc.provider.auth_kind() != crate::provider::AuthKind::None {
             println!("{}", card_row(&format!("{}  run {}",
-                dim("·"), cyan(&format!("shunt add-account {}", acc.name)))));
+                dim("·"), cyan(&format!("shunt add {}", acc.name)))));
         } else if status == "reauth_required" {
             println!("{}", card_row(&format!("{}  run {}",
-                dim("·"), cyan(&format!("shunt add-account {}", acc.name)))));
+                dim("·"), cyan(&format!("shunt add {}", acc.name)))));
         } else if live.is_some() && live_acc.is_some() {
             match &acc.provider {
                 crate::provider::Provider::Anthropic =>
@@ -2415,6 +2425,12 @@ async fn cmd_strategy(config_override: Option<PathBuf>, action: Option<StrategyA
             }
         }
         Some(StrategyAction::Set { strategy }) => {
+            // Validate client-side so a typo gets an actionable message instead of a
+            // raw proxy error (or a silent no-op).
+            const VALID: &[&str] = &["maximus", "reaper", "carousel", "cushion"];
+            if !VALID.contains(&strategy.as_str()) {
+                anyhow::bail!("Unknown strategy '{strategy}'. Valid: {}.", VALID.join(", "));
+            }
             let resp = client
                 .post(&strategy_url)
                 .json(&serde_json::json!({ "strategy": strategy }))
@@ -2591,6 +2607,10 @@ async fn cmd_effort(config_override: Option<PathBuf>, action: Option<EffortActio
             }
         }
         Some(EffortAction::Set { level }) => {
+            const VALID: &[&str] = &["low", "medium", "high", "max"];
+            if !VALID.contains(&level.as_str()) {
+                anyhow::bail!("Unknown effort '{level}'. Valid: {}.", VALID.join(", "));
+            }
             let resp = client.post(&url).json(&serde_json::json!({ "effort": level })).send().await;
             match resp {
                 Ok(r) if r.status().is_success() => {
@@ -2639,6 +2659,10 @@ async fn cmd_thinking(config_override: Option<PathBuf>, action: Option<ThinkingA
             }
         }
         Some(ThinkingAction::Set { mode }) => {
+            const VALID: &[&str] = &["adaptive", "disabled", "off"];
+            if !VALID.contains(&mode.as_str()) {
+                anyhow::bail!("Unknown thinking mode '{mode}'. Valid: adaptive, off.");
+            }
             let api_mode = if mode == "off" { "disabled" } else { &mode };
             let resp = client.post(&url).json(&serde_json::json!({ "thinking": api_mode })).send().await;
             match resp {
@@ -5167,9 +5191,14 @@ async fn cmd_uninstall() -> Result<()> {
 
     // Shell profile line to remove
     let shell_profile = detect_shell_profile();
-    let profile_has_export = shell_profile.as_ref().and_then(|p| {
-        std::fs::read_to_string(p).ok()
-    }).map(|s| s.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:")).unwrap_or(false);
+    let profile_contents = shell_profile.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+    let profile_has_export = profile_contents.as_ref()
+        .map(|s| s.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:")
+              || s.contains("ANTHROPIC_BASE_URL=http://localhost:"))
+        .unwrap_or(false);
+    let profile_has_tunnel = profile_contents.as_ref()
+        .map(|s| s.contains("SHUNT_TUNNEL_TOKEN"))
+        .unwrap_or(false);
 
     let uninstall_home = dirs::home_dir();
     let user_settings_has_shunt = uninstall_home.as_ref().map(|h| {
@@ -5227,6 +5256,9 @@ async fn cmd_uninstall() -> Result<()> {
         if profile_has_export {
             println!("  {}  {} ANTHROPIC_BASE_URL from {}", red("✕"), dim("remove"), cyan(&p.display().to_string()));
         }
+        if profile_has_tunnel {
+            println!("  {}  {} SHUNT_TUNNEL_TOKEN from {}", red("✕"), dim("remove"), cyan(&p.display().to_string()));
+        }
     }
     if user_settings_has_shunt {
         if let Some(ref h) = uninstall_home {
@@ -5269,6 +5301,11 @@ async fn cmd_uninstall() -> Result<()> {
 
     // ── Execute ───────────────────────────────────────────────────────────────
 
+    // 0. Stop the running daemon FIRST — its settings_guardian_loop re-injects
+    //    ANTHROPIC_BASE_URL every 5s, so we must kill it before cleaning settings.
+    cmd_stop_impl(true).await?;
+    println!("  {} Daemon stopped", green(CHECK));
+
     // 1. Stop + unregister service
     #[cfg(target_os = "macos")]
     if let Some(ref p) = service_plist {
@@ -5304,15 +5341,22 @@ async fn cmd_uninstall() -> Result<()> {
         println!("  {} Data removed    {}", green(CHECK), dim(&data_dir.display().to_string()));
     }
 
-    // 4. Shell profile — strip ANTHROPIC_BASE_URL lines
+    // 4. Shell profile — strip shunt-related lines
     if let Some(ref profile_path) = shell_profile {
-        if profile_has_export {
+        if profile_has_export || profile_has_tunnel {
             if let Ok(contents) = std::fs::read_to_string(profile_path) {
                 let cleaned: String = contents
                     .lines()
                     .filter(|l| {
-                        !l.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:")
+                        // ANTHROPIC_BASE_URL pointing at local proxy
+                        !(l.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:")
+                            || l.contains("ANTHROPIC_BASE_URL=http://localhost:"))
+                        // Tunnel token/subdomain from `shunt live` wizard
+                            && !l.contains("SHUNT_TUNNEL_TOKEN")
+                            && !l.contains("SHUNT_TUNNEL_SUBDOMAIN")
+                        // Comment markers
                             && *l != "# Added by shunt"
+                            && *l != "# Added by shunt live"
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -5354,6 +5398,15 @@ async fn cmd_uninstall() -> Result<()> {
     // Only hint if the variable is actually set in this shell session.
     if std::env::var("ANTHROPIC_BASE_URL").is_ok() {
         println!("  {} Run {} to clear the proxy from this shell session.", dim("·"), cyan("unset ANTHROPIC_BASE_URL"));
+    }
+    // If the user ever ran `shunt live`/`shunt share`, Cloudflare DNS records may
+    // remain — we can't delete them without their API token, so warn instead.
+    if profile_has_tunnel {
+        println!();
+        println!("  {} shunt live created Cloudflare DNS records that were {} removed.",
+            dim("·"), bold("not"));
+        println!("    {} Delete any leftover {} records in your Cloudflare dashboard.",
+            dim("·"), cyan("*.<your-domain>"));
     }
     println!();
 

@@ -99,7 +99,7 @@ const DIM:      Color = Color::Indexed(240);
 const YELLOW:   Color = Color::Indexed(220);
 const RED:      Color = Color::Indexed(196);
 const WHITE:    Color = Color::Indexed(253);
-const CYAN:     Color = Color::Indexed(154);
+const CYAN:     Color = Color::Indexed(51);
 
 const ACCOUNT_COLORS: &[Color] = &[
     Color::Indexed(154), // lime green (brand)
@@ -1067,6 +1067,25 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_
         spans.push(Span::styled("alerts muted", style_red()));
     }
 
+    // Surface the worst-case state prominently: every account unavailable means
+    // requests will queue until the soonest one resumes.
+    if let Some(s) = state.as_ref() {
+        let anthropic: Vec<&AccountStatus> = s.accounts.iter()
+            .filter(|a| a.provider == "anthropic" || a.provider.is_empty())
+            .collect();
+        if !anthropic.is_empty() && anthropic.iter().all(|a| !a.available) {
+            let now = now_ms();
+            let soonest = anthropic.iter()
+                .filter_map(|a| a.cooldown_until_ms.checked_sub(now).filter(|&d| d > 0))
+                .min();
+            spans.push(Span::styled("  ·  ", style_dim()));
+            spans.push(Span::styled("⚠ all accounts cooling", style_red().add_modifier(Modifier::BOLD)));
+            if let Some(d) = soonest {
+                spans.push(Span::styled(format!(" — next in {}", fmt_duration_ms(d)), style_red()));
+            }
+        }
+    }
+
     let block = Block::default().borders(Borders::BOTTOM).border_style(style_dkgreen());
     f.render_widget(Paragraph::new(Line::from(spans)).block(block).alignment(Alignment::Left), area);
 }
@@ -1182,7 +1201,15 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize, f
     f.render_widget(block, area);
 
     if s.accounts.is_empty() {
-        f.render_widget(Paragraph::new(Line::from(Span::styled("  no accounts configured", style_dim()))), inner);
+        f.render_widget(Paragraph::new(vec![
+            Line::from(Span::styled("  no accounts configured", style_dim())),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("  run ", style_dim()),
+                Span::styled("shunt add", style_green()),
+                Span::styled(" to connect an account", style_dim()),
+            ]),
+        ]), inner);
         return;
     }
 
@@ -1232,9 +1259,21 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize, f
         let now = now_ms();
         if acc.cooldown_until_ms > now {
             let rem = acc.cooldown_until_ms - now;
+            // Distinguish a real quota exhaustion (long cooldown) from a transient
+            // per-minute burst throttle (short) so the v0.1.145 behaviour is legible.
+            let now_secs = now / 1_000;
+            let exhausted = (acc.status_5h.as_deref() == Some("exhausted")
+                    && acc.reset_5h.map(|t| t > now_secs).unwrap_or(false))
+                || (acc.status_7d.as_deref() == Some("exhausted")
+                    && acc.reset_7d.map(|t| t > now_secs).unwrap_or(false));
+            let (label, style) = if exhausted {
+                ("   ⏸ quota exhausted  ", style_red())
+            } else {
+                ("   ⏸ burst limit  ", style_yellow())
+            };
             lines.push(Line::from(vec![
-                Span::styled("   ⏸ cooldown  ", style_yellow()),
-                Span::styled(format!("resumes in {}", fmt_duration_ms(rem)), style_yellow()),
+                Span::styled(label, style),
+                Span::styled(format!("resumes in {}", fmt_duration_ms(rem)), style),
             ]));
         }
 
@@ -1932,11 +1971,21 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         ("tab",      "cycle panel focus"),
         ("↑ / k",   "scroll up / prev time"),
         ("↓ / j",   "scroll down / next time"),
-        ("r",        "force refresh"),
-        ("s",        "open settings"),
         ("t / ]",   "next time window"),
         ("[",        "prev time window"),
+        ("r",        "force refresh"),
         ("?",        "close help"),
+        ("",         ""),
+        ("s",        "open settings:"),
+        ("  pin",      "force one account"),
+        ("  model",    "override model"),
+        ("  strategy", "routing strategy"),
+        ("  effort",   "reasoning effort"),
+        ("  thinking", "extended thinking"),
+        ("  fallback", "auto-downgrade model"),
+        ("  burst",    "per-min request limit"),
+        ("  speed",    "refresh interval"),
+        ("  alerts",   "mute notifications"),
     ];
 
     let h = (lines.len() + 4) as u16;
