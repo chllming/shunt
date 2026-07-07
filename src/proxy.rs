@@ -676,27 +676,8 @@ async fn proxy_handler(
             changed = true;
         }
         let resolved_model = val["model"].as_str().unwrap_or("").to_owned();
-        if is_simple_model(&resolved_model) {
-            if let Some(obj) = val.as_object_mut() {
-                // Strip features unsupported by simpler models (Haiku).
-                for key in &["thinking", "effort", "reasoning_effort"] {
-                    if obj.remove(*key).is_some() { changed = true; }
-                }
-                // Strip effort from output_config if present
-                if let Some(serde_json::Value::Object(oc)) = obj.get_mut("output_config") {
-                    if oc.remove("effort").is_some() { changed = true; }
-                    // Remove output_config entirely if empty
-                    if oc.is_empty() { obj.remove("output_config"); }
-                }
-                // Strip context_management (thinking-related edit rules)
-                if obj.remove("context_management").is_some() { changed = true; }
-                // Remove extended-thinking beta flag
-                if let Some(serde_json::Value::Array(betas)) = obj.get_mut("betas") {
-                    let before = betas.len();
-                    betas.retain(|b| b.as_str() != Some("interleaved-thinking-2025-05-14"));
-                    if betas.len() != before { changed = true; }
-                }
-            }
+        if is_simple_model(&resolved_model) && strip_unsupported_params_for_simple_model(&mut val) {
+            changed = true;
         }
         let model = val["model"].as_str().unwrap_or("").to_owned();
         let bytes = if changed {
@@ -709,21 +690,15 @@ async fn proxy_handler(
         (body_bytes, String::new())
     };
 
-    // Strip thinking/effort-related beta flags from the anthropic-beta header for simple models.
+    // Strip capability betas the outgoing model can't honor. Simple models (Haiku)
+    // support neither extended thinking/effort nor a 1M context window, so when the
+    // resolved model is simple — including the classifier pin to Haiku — drop those
+    // beta flags. The 1M beta in particular otherwise triggers
+    // `400 The long context beta is not yet available for this subscription`.
     let mut headers = headers;
     if is_simple_model(&model) {
-        if let Some(beta_val) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok().map(|s| s.to_owned())) {
-            let filtered: Vec<&str> = beta_val.split(',')
-                .map(|s| s.trim())
-                .filter(|b| !b.contains("thinking") && !b.contains("effort"))
-                .collect();
-            let new_beta = filtered.join(",");
-            if filtered.is_empty() {
-                headers.remove("anthropic-beta");
-            } else if let Ok(v) = axum::http::HeaderValue::from_str(&new_beta) {
-                headers.insert("anthropic-beta", v);
-            }
-        }
+        strip_beta_header_for_simple_model(&mut headers);
+        strip_long_context_beta(&mut headers);
     }
 
     let req_start_ms = now_ms();
@@ -737,6 +712,8 @@ async fn proxy_handler(
     let mut refreshed: HashSet<String> = HashSet::new();
     // Guard: only attempt model fallback once per request.
     let mut fell_back = false;
+    // Guard: only self-heal a long-context 400 once per request (strip 1M beta + retry).
+    let mut stripped_1m = false;
     // Cap wait to the configured request timeout — the client's TCP connection
     // won't survive 5 hours anyway; return 503 so the client can retry.
     let wait_deadline_ms = now_ms() + s.config.server.request_timeout_secs.saturating_mul(1_000);
@@ -792,6 +769,20 @@ async fn proxy_handler(
                             if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
                                 warn!(from = %model, to = %fb, "all accounts cooling — falling back to cheaper model");
                                 val["model"] = serde_json::Value::String(fb.clone());
+                                // The initial param strip keyed on the ORIGINAL model. Downgrading
+                                // to a simpler model (e.g. Haiku) means its unsupported params must
+                                // be dropped now too — otherwise the fallback request 400s with
+                                // "This model does not support the effort parameter" (and similar).
+                                if is_simple_model(fb.as_str()) {
+                                    strip_unsupported_params_for_simple_model(&mut val);
+                                    strip_beta_header_for_simple_model(&mut headers);
+                                }
+                                // shunt chose this fallback model; it cannot prove the target is
+                                // entitled to a 1M window (Haiku has none; Sonnet 1M needs credits
+                                // even on Max). Never advertise the 1M beta on a shunt-rewritten
+                                // model, or the upstream returns the long-context 400.
+                                normalize_model_suffix(&mut val);
+                                strip_long_context_beta(&mut headers);
                                 body_bytes = Bytes::from(serde_json::to_vec(&val).unwrap_or_else(|_| body_bytes.to_vec()));
                                 fell_back = true;
                                 tried.clear();
@@ -1138,6 +1129,39 @@ async fn proxy_handler(
                     s.state.set_cooldown(&account_name, 5 * 60_000);
                 }
                 tried.insert(account_name);
+            }
+            400 if !stripped_1m
+                && req_is_anthropic
+                && headers.get("anthropic-beta")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.contains(LONG_CONTEXT_BETA))
+                    .unwrap_or(false) =>
+            {
+                // Self-heal a long-context 400: the request still advertises the 1M
+                // beta but this account isn't entitled (e.g. a Pro account in the pool,
+                // or Sonnet 1M without credits). Confirm the error is the long-context
+                // rejection, then strip the 1M beta + [1m] suffix and retry once, rather
+                // than hard-failing the user's request. Buffer the body to inspect it.
+                let (parts, body) = response.into_parts();
+                let raw = axum::body::to_bytes(body, MAX_REQUEST_BODY).await.unwrap_or_default();
+                let text = String::from_utf8_lossy(&raw);
+                let is_long_ctx = text.contains("long context beta")
+                    || text.contains("not yet available for this subscription");
+                if is_long_ctx {
+                    warn!(account = %account_name, "400 long-context beta rejected — stripping 1M beta and retrying");
+                    strip_long_context_beta(&mut headers);
+                    if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                        if normalize_model_suffix(&mut val) {
+                            body_bytes = Bytes::from(serde_json::to_vec(&val).unwrap_or_else(|_| body_bytes.to_vec()));
+                        }
+                    }
+                    stripped_1m = true;
+                    // Retry the same account first (it may now succeed at 200K); do not
+                    // mark it tried, and do not clear tried for others.
+                    continue;
+                }
+                // Some other 400 — return the buffered response unchanged.
+                return Ok(Response::from_parts(parts, axum::body::Body::from(raw)));
             }
             _ => {
                 // 400, 404, 500, etc. — return as-is, no retry
@@ -2283,6 +2307,117 @@ fn is_simple_model(model: &str) -> bool {
     model.contains("haiku")
 }
 
+/// Remove request-body parameters that simpler models (e.g. Haiku) reject:
+/// top-level `thinking` / `effort` / `reasoning_effort` / `context_management`,
+/// `effort` nested inside `output_config`, and the interleaved-thinking beta in
+/// a `betas` array. Returns true if anything was removed.
+///
+/// Must be applied whenever the outgoing model becomes a simple model — both on
+/// the initial request and after a fallback downgrade — otherwise the upstream
+/// returns e.g. `400 This model does not support the effort parameter`.
+fn strip_unsupported_params_for_simple_model(val: &mut serde_json::Value) -> bool {
+    let Some(obj) = val.as_object_mut() else { return false };
+    let mut changed = false;
+    for key in &["thinking", "effort", "reasoning_effort", "context_management"] {
+        if obj.remove(*key).is_some() {
+            changed = true;
+        }
+    }
+    if let Some(serde_json::Value::Object(oc)) = obj.get_mut("output_config") {
+        if oc.remove("effort").is_some() {
+            changed = true;
+        }
+        if oc.is_empty() {
+            obj.remove("output_config");
+            changed = true;
+        }
+    }
+    if let Some(serde_json::Value::Array(betas)) = obj.get_mut("betas") {
+        let before = betas.len();
+        betas.retain(|b| b.as_str() != Some("interleaved-thinking-2025-05-14"));
+        if betas.len() != before {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Strip thinking/effort-related beta flags from the `anthropic-beta` header for
+/// simple models. Mirrors [`strip_unsupported_params_for_simple_model`] on the
+/// header side so a fallback downgrade doesn't leave an incompatible beta flag.
+fn strip_beta_header_for_simple_model(headers: &mut axum::http::HeaderMap) {
+    let Some(beta_val) = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
+    else {
+        return;
+    };
+    let filtered: Vec<&str> = beta_val
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|b| !b.contains("thinking") && !b.contains("effort"))
+        .collect();
+    if filtered.is_empty() {
+        headers.remove("anthropic-beta");
+    } else if let Ok(v) = axum::http::HeaderValue::from_str(&filtered.join(",")) {
+        headers.insert("anthropic-beta", v);
+    }
+}
+
+/// The 1M-context beta capability flag Claude Code sends in `anthropic-beta`
+/// when a `[1m]` model is selected. On the direct pass-through path it must be
+/// forwarded verbatim (entitled Max accounts need it), but when shunt REWRITES
+/// the model to something without a 1M window (Haiku, or a fallback target it
+/// can't prove is entitled), the flag must be dropped — otherwise Anthropic
+/// returns `400 The long context beta is not yet available for this subscription`.
+const LONG_CONTEXT_BETA: &str = "context-1m-2025-08-07";
+
+/// Remove the 1M-context beta flag from the `anthropic-beta` header. Preserves
+/// every other flag (oauth, tool streaming, etc.) and removes the header only
+/// when nothing remains. Returns true if the flag was present and removed.
+fn strip_long_context_beta(headers: &mut axum::http::HeaderMap) -> bool {
+    let Some(beta_val) = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
+    else {
+        return false;
+    };
+    if !beta_val.contains(LONG_CONTEXT_BETA) {
+        return false;
+    }
+    let filtered: Vec<&str> = beta_val
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|b| *b != LONG_CONTEXT_BETA && !b.is_empty())
+        .collect();
+    if filtered.is_empty() {
+        headers.remove("anthropic-beta");
+    } else if let Ok(v) = axum::http::HeaderValue::from_str(&filtered.join(",")) {
+        headers.insert("anthropic-beta", v);
+    }
+    true
+}
+
+/// Strip a literal `[1m]` (or `[1M]`) context suffix from a request's `model`
+/// field. Claude Code normally sends the 1M request as the `context-1m` beta
+/// header with a bare model name, but some paths carry the suffix inline; if it
+/// survives onto a model shunt rewrote, the upstream rejects it. Returns true if
+/// the model string changed.
+fn normalize_model_suffix(val: &mut serde_json::Value) -> bool {
+    let Some(model) = val.get("model").and_then(|m| m.as_str()) else {
+        return false;
+    };
+    let trimmed = model
+        .strip_suffix("[1m]")
+        .or_else(|| model.strip_suffix("[1M]"));
+    if let Some(base) = trimmed {
+        let base = base.to_owned();
+        val["model"] = serde_json::Value::String(base);
+        return true;
+    }
+    false
+}
+
 /// Detect Claude Code's auto-mode safety classifier request. The classifier's
 /// system prompt begins "You are a security monitor for autonomous AI coding
 /// agents." The `system` field may be a plain string or an array of content
@@ -2500,5 +2635,134 @@ mod tests {
         let mut v = json!({ "model": CLASSIFIER_MODEL, "system": "You are a security monitor for autonomous AI coding agents." });
         assert!(!pin_model_to_classifier(&mut v), "already on classifier model → no change");
         assert_eq!(v["model"], json!(CLASSIFIER_MODEL));
+    }
+
+    #[test]
+    fn strip_removes_effort_and_thinking_for_simple_model() {
+        // Simulates a fallback downgrade to Haiku of an opus request that carried
+        // high-effort + thinking params (the /compact 400 scenario).
+        let mut v = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "effort": "high",
+            "output_config": { "effort": "high", "max_output_tokens": 4096 },
+            "thinking": { "type": "enabled" },
+            "context_management": { "edits": [] },
+            "betas": ["interleaved-thinking-2025-05-14", "some-other-beta"],
+            "messages": [{"role": "user", "content": "summarize"}]
+        });
+        assert!(strip_unsupported_params_for_simple_model(&mut v));
+        assert!(v.get("effort").is_none(), "top-level effort dropped");
+        assert!(v.get("thinking").is_none(), "thinking dropped");
+        assert!(v.get("context_management").is_none(), "context_management dropped");
+        assert!(v["output_config"].get("effort").is_none(), "output_config.effort dropped");
+        // output_config kept because it still has a supported field.
+        assert_eq!(v["output_config"]["max_output_tokens"], json!(4096));
+        let betas = v["betas"].as_array().unwrap();
+        assert!(!betas.iter().any(|b| b == "interleaved-thinking-2025-05-14"), "thinking beta dropped");
+        assert!(betas.iter().any(|b| b == "some-other-beta"), "unrelated beta preserved");
+        // Non-param fields untouched.
+        assert_eq!(v["messages"][0]["content"], json!("summarize"));
+    }
+
+    #[test]
+    fn strip_drops_output_config_when_only_effort() {
+        let mut v = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "output_config": { "effort": "high" }
+        });
+        assert!(strip_unsupported_params_for_simple_model(&mut v));
+        assert!(v.get("output_config").is_none(), "empty output_config removed entirely");
+    }
+
+    #[test]
+    fn strip_is_noop_when_no_unsupported_params() {
+        let mut v = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert!(!strip_unsupported_params_for_simple_model(&mut v), "nothing to strip → no change");
+    }
+
+    #[test]
+    fn strip_beta_header_removes_thinking_effort_flags() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("anthropic-beta", "interleaved-thinking-2025-05-14,oauth-2025-04-20,effort-2025".parse().unwrap());
+        strip_beta_header_for_simple_model(&mut h);
+        let v = h.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(!v.contains("thinking"), "thinking beta removed");
+        assert!(!v.contains("effort"), "effort beta removed");
+        assert!(v.contains("oauth-2025-04-20"), "unrelated beta preserved");
+    }
+
+    #[test]
+    fn strip_beta_header_removes_header_when_all_flags_stripped() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("anthropic-beta", "interleaved-thinking-2025-05-14".parse().unwrap());
+        strip_beta_header_for_simple_model(&mut h);
+        assert!(h.get("anthropic-beta").is_none(), "header removed when nothing left");
+    }
+
+    #[test]
+    fn strip_long_context_beta_removes_flag_preserves_others() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("anthropic-beta", "context-1m-2025-08-07,oauth-2025-04-20,claude-code-20250219".parse().unwrap());
+        assert!(strip_long_context_beta(&mut h), "1M beta present → removed");
+        let v = h.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(!v.contains("context-1m-2025-08-07"), "1M beta removed");
+        assert!(v.contains("oauth-2025-04-20"), "oauth preserved");
+        assert!(v.contains("claude-code-20250219"), "claude-code beta preserved");
+    }
+
+    #[test]
+    fn strip_long_context_beta_removes_header_when_only_flag() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("anthropic-beta", "context-1m-2025-08-07".parse().unwrap());
+        assert!(strip_long_context_beta(&mut h));
+        assert!(h.get("anthropic-beta").is_none(), "header removed when 1M was the only flag");
+    }
+
+    #[test]
+    fn strip_long_context_beta_noop_when_absent() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("anthropic-beta", "oauth-2025-04-20".parse().unwrap());
+        assert!(!strip_long_context_beta(&mut h), "no 1M beta → no change");
+        assert_eq!(h.get("anthropic-beta").unwrap().to_str().unwrap(), "oauth-2025-04-20");
+    }
+
+    #[test]
+    fn normalize_model_suffix_strips_1m() {
+        let mut v = json!({ "model": "claude-opus-4-8[1m]" });
+        assert!(normalize_model_suffix(&mut v));
+        assert_eq!(v["model"], json!("claude-opus-4-8"));
+        // Uppercase variant too.
+        let mut v2 = json!({ "model": "claude-sonnet-4-6[1M]" });
+        assert!(normalize_model_suffix(&mut v2));
+        assert_eq!(v2["model"], json!("claude-sonnet-4-6"));
+        // No suffix → no change.
+        let mut v3 = json!({ "model": "claude-opus-4-8" });
+        assert!(!normalize_model_suffix(&mut v3));
+        assert_eq!(v3["model"], json!("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn simple_model_rewrite_drops_both_effort_and_1m_beta() {
+        // Simulates a classifier pin / fallback downgrade to Haiku of an opus[1m]
+        // request that carried effort + the 1M beta (the /compact + long-context 400 scenario).
+        let mut v = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "effort": "high",
+            "messages": [{"role": "user", "content": "summarize"}]
+        });
+        assert!(strip_unsupported_params_for_simple_model(&mut v));
+        assert!(v.get("effort").is_none(), "effort dropped for haiku");
+
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("anthropic-beta", "context-1m-2025-08-07,interleaved-thinking-2025-05-14,oauth-2025-04-20".parse().unwrap());
+        strip_beta_header_for_simple_model(&mut h);
+        strip_long_context_beta(&mut h);
+        let v = h.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(!v.contains("context-1m-2025-08-07"), "1M beta dropped");
+        assert!(!v.contains("thinking"), "thinking beta dropped");
+        assert!(v.contains("oauth-2025-04-20"), "oauth preserved for subscription recognition");
     }
 }
