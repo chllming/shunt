@@ -690,10 +690,15 @@ async fn proxy_handler(
         (body_bytes, String::new())
     };
 
-    // Strip thinking/effort-related beta flags from the anthropic-beta header for simple models.
+    // Strip capability betas the outgoing model can't honor. Simple models (Haiku)
+    // support neither extended thinking/effort nor a 1M context window, so when the
+    // resolved model is simple — including the classifier pin to Haiku — drop those
+    // beta flags. The 1M beta in particular otherwise triggers
+    // `400 The long context beta is not yet available for this subscription`.
     let mut headers = headers;
     if is_simple_model(&model) {
         strip_beta_header_for_simple_model(&mut headers);
+        strip_long_context_beta(&mut headers);
     }
 
     let req_start_ms = now_ms();
@@ -707,6 +712,8 @@ async fn proxy_handler(
     let mut refreshed: HashSet<String> = HashSet::new();
     // Guard: only attempt model fallback once per request.
     let mut fell_back = false;
+    // Guard: only self-heal a long-context 400 once per request (strip 1M beta + retry).
+    let mut stripped_1m = false;
     // Cap wait to the configured request timeout — the client's TCP connection
     // won't survive 5 hours anyway; return 503 so the client can retry.
     let wait_deadline_ms = now_ms() + s.config.server.request_timeout_secs.saturating_mul(1_000);
@@ -770,6 +777,12 @@ async fn proxy_handler(
                                     strip_unsupported_params_for_simple_model(&mut val);
                                     strip_beta_header_for_simple_model(&mut headers);
                                 }
+                                // shunt chose this fallback model; it cannot prove the target is
+                                // entitled to a 1M window (Haiku has none; Sonnet 1M needs credits
+                                // even on Max). Never advertise the 1M beta on a shunt-rewritten
+                                // model, or the upstream returns the long-context 400.
+                                normalize_model_suffix(&mut val);
+                                strip_long_context_beta(&mut headers);
                                 body_bytes = Bytes::from(serde_json::to_vec(&val).unwrap_or_else(|_| body_bytes.to_vec()));
                                 fell_back = true;
                                 tried.clear();
@@ -1116,6 +1129,39 @@ async fn proxy_handler(
                     s.state.set_cooldown(&account_name, 5 * 60_000);
                 }
                 tried.insert(account_name);
+            }
+            400 if !stripped_1m
+                && req_is_anthropic
+                && headers.get("anthropic-beta")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.contains(LONG_CONTEXT_BETA))
+                    .unwrap_or(false) =>
+            {
+                // Self-heal a long-context 400: the request still advertises the 1M
+                // beta but this account isn't entitled (e.g. a Pro account in the pool,
+                // or Sonnet 1M without credits). Confirm the error is the long-context
+                // rejection, then strip the 1M beta + [1m] suffix and retry once, rather
+                // than hard-failing the user's request. Buffer the body to inspect it.
+                let (parts, body) = response.into_parts();
+                let raw = axum::body::to_bytes(body, MAX_REQUEST_BODY).await.unwrap_or_default();
+                let text = String::from_utf8_lossy(&raw);
+                let is_long_ctx = text.contains("long context beta")
+                    || text.contains("not yet available for this subscription");
+                if is_long_ctx {
+                    warn!(account = %account_name, "400 long-context beta rejected — stripping 1M beta and retrying");
+                    strip_long_context_beta(&mut headers);
+                    if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                        if normalize_model_suffix(&mut val) {
+                            body_bytes = Bytes::from(serde_json::to_vec(&val).unwrap_or_else(|_| body_bytes.to_vec()));
+                        }
+                    }
+                    stripped_1m = true;
+                    // Retry the same account first (it may now succeed at 200K); do not
+                    // mark it tried, and do not clear tried for others.
+                    continue;
+                }
+                // Some other 400 — return the buffered response unchanged.
+                return Ok(Response::from_parts(parts, axum::body::Body::from(raw)));
             }
             _ => {
                 // 400, 404, 500, etc. — return as-is, no retry
@@ -2318,6 +2364,60 @@ fn strip_beta_header_for_simple_model(headers: &mut axum::http::HeaderMap) {
     }
 }
 
+/// The 1M-context beta capability flag Claude Code sends in `anthropic-beta`
+/// when a `[1m]` model is selected. On the direct pass-through path it must be
+/// forwarded verbatim (entitled Max accounts need it), but when shunt REWRITES
+/// the model to something without a 1M window (Haiku, or a fallback target it
+/// can't prove is entitled), the flag must be dropped — otherwise Anthropic
+/// returns `400 The long context beta is not yet available for this subscription`.
+const LONG_CONTEXT_BETA: &str = "context-1m-2025-08-07";
+
+/// Remove the 1M-context beta flag from the `anthropic-beta` header. Preserves
+/// every other flag (oauth, tool streaming, etc.) and removes the header only
+/// when nothing remains. Returns true if the flag was present and removed.
+fn strip_long_context_beta(headers: &mut axum::http::HeaderMap) -> bool {
+    let Some(beta_val) = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
+    else {
+        return false;
+    };
+    if !beta_val.contains(LONG_CONTEXT_BETA) {
+        return false;
+    }
+    let filtered: Vec<&str> = beta_val
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|b| *b != LONG_CONTEXT_BETA && !b.is_empty())
+        .collect();
+    if filtered.is_empty() {
+        headers.remove("anthropic-beta");
+    } else if let Ok(v) = axum::http::HeaderValue::from_str(&filtered.join(",")) {
+        headers.insert("anthropic-beta", v);
+    }
+    true
+}
+
+/// Strip a literal `[1m]` (or `[1M]`) context suffix from a request's `model`
+/// field. Claude Code normally sends the 1M request as the `context-1m` beta
+/// header with a bare model name, but some paths carry the suffix inline; if it
+/// survives onto a model shunt rewrote, the upstream rejects it. Returns true if
+/// the model string changed.
+fn normalize_model_suffix(val: &mut serde_json::Value) -> bool {
+    let Some(model) = val.get("model").and_then(|m| m.as_str()) else {
+        return false;
+    };
+    let trimmed = model
+        .strip_suffix("[1m]")
+        .or_else(|| model.strip_suffix("[1M]"));
+    if let Some(base) = trimmed {
+        let base = base.to_owned();
+        val["model"] = serde_json::Value::String(base);
+        return true;
+    }
+    false
+}
+
 /// Detect Claude Code's auto-mode safety classifier request. The classifier's
 /// system prompt begins "You are a security monitor for autonomous AI coding
 /// agents." The `system` field may be a plain string or an array of content
@@ -2600,5 +2700,69 @@ mod tests {
         h.insert("anthropic-beta", "interleaved-thinking-2025-05-14".parse().unwrap());
         strip_beta_header_for_simple_model(&mut h);
         assert!(h.get("anthropic-beta").is_none(), "header removed when nothing left");
+    }
+
+    #[test]
+    fn strip_long_context_beta_removes_flag_preserves_others() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("anthropic-beta", "context-1m-2025-08-07,oauth-2025-04-20,claude-code-20250219".parse().unwrap());
+        assert!(strip_long_context_beta(&mut h), "1M beta present → removed");
+        let v = h.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(!v.contains("context-1m-2025-08-07"), "1M beta removed");
+        assert!(v.contains("oauth-2025-04-20"), "oauth preserved");
+        assert!(v.contains("claude-code-20250219"), "claude-code beta preserved");
+    }
+
+    #[test]
+    fn strip_long_context_beta_removes_header_when_only_flag() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("anthropic-beta", "context-1m-2025-08-07".parse().unwrap());
+        assert!(strip_long_context_beta(&mut h));
+        assert!(h.get("anthropic-beta").is_none(), "header removed when 1M was the only flag");
+    }
+
+    #[test]
+    fn strip_long_context_beta_noop_when_absent() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("anthropic-beta", "oauth-2025-04-20".parse().unwrap());
+        assert!(!strip_long_context_beta(&mut h), "no 1M beta → no change");
+        assert_eq!(h.get("anthropic-beta").unwrap().to_str().unwrap(), "oauth-2025-04-20");
+    }
+
+    #[test]
+    fn normalize_model_suffix_strips_1m() {
+        let mut v = json!({ "model": "claude-opus-4-8[1m]" });
+        assert!(normalize_model_suffix(&mut v));
+        assert_eq!(v["model"], json!("claude-opus-4-8"));
+        // Uppercase variant too.
+        let mut v2 = json!({ "model": "claude-sonnet-4-6[1M]" });
+        assert!(normalize_model_suffix(&mut v2));
+        assert_eq!(v2["model"], json!("claude-sonnet-4-6"));
+        // No suffix → no change.
+        let mut v3 = json!({ "model": "claude-opus-4-8" });
+        assert!(!normalize_model_suffix(&mut v3));
+        assert_eq!(v3["model"], json!("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn simple_model_rewrite_drops_both_effort_and_1m_beta() {
+        // Simulates a classifier pin / fallback downgrade to Haiku of an opus[1m]
+        // request that carried effort + the 1M beta (the /compact + long-context 400 scenario).
+        let mut v = json!({
+            "model": "claude-haiku-4-5-20251001",
+            "effort": "high",
+            "messages": [{"role": "user", "content": "summarize"}]
+        });
+        assert!(strip_unsupported_params_for_simple_model(&mut v));
+        assert!(v.get("effort").is_none(), "effort dropped for haiku");
+
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("anthropic-beta", "context-1m-2025-08-07,interleaved-thinking-2025-05-14,oauth-2025-04-20".parse().unwrap());
+        strip_beta_header_for_simple_model(&mut h);
+        strip_long_context_beta(&mut h);
+        let v = h.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(!v.contains("context-1m-2025-08-07"), "1M beta dropped");
+        assert!(!v.contains("thinking"), "thinking beta dropped");
+        assert!(v.contains("oauth-2025-04-20"), "oauth preserved for subscription recognition");
     }
 }
