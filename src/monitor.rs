@@ -44,6 +44,9 @@ struct StatusResponse {
     #[serde(default)]
     #[allow(dead_code)]
     savings: Option<SavingsInfo>,
+    /// Name of the account reserved for the safety-classifier lane, if configured.
+    #[serde(default)]
+    classifier_account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -86,6 +89,8 @@ struct ReqLog {
     #[allow(dead_code)]
     output_tokens: u64,
     duration_ms: u64,
+    #[serde(default)]
+    classifier: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,6 +1230,12 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize, f
             Span::raw("")
         };
 
+        let classifier_tag = if s.classifier_account.as_deref() == Some(acc.name.as_str()) {
+            Span::styled("  classifier", style_cyan())
+        } else {
+            Span::raw("")
+        };
+
         let (status_sym, status_style) = if acc.disabled || acc.auth_failed {
             ("✗", style_red())
         } else if acc.health_check_failed {
@@ -1245,6 +1256,7 @@ fn draw_accounts(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize, f
             Span::styled(format!(" {status_sym} "), status_style),
             Span::styled(acc.name.clone(), Style::default().fg(GREEN).add_modifier(Modifier::BOLD)),
             routing_tag,
+            classifier_tag,
             provider_tag,
         ]));
 
@@ -1336,11 +1348,16 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
         .filter(|r| now.saturating_sub(r.ts_ms) < 60_000)
         .count();
     let rate_str = if req_per_min > 0 { format!("  {req_per_min}/min") } else { String::new() };
+    let clf_per_min = s.recent_requests.iter()
+        .filter(|r| r.classifier && now.saturating_sub(r.ts_ms) < 60_000)
+        .count();
+    let clf_str = if clf_per_min > 0 { format!("  {clf_per_min} clf/min") } else { String::new() };
 
     let block = Block::default()
         .title(Line::from(vec![
             Span::styled(" requests", panel_title_style(focused)),
             Span::styled(rate_str, style_dim()),
+            Span::styled(clf_str, style_cyan()),
         ]))
         .borders(Borders::BOTTOM)
         .border_style(panel_border_style(focused));
@@ -1367,10 +1384,18 @@ fn draw_request_log(f: &mut Frame, area: Rect, s: &StatusResponse, scroll: usize
         } else {
             format!("{} ago", fmt_duration_ms(age_ms))
         };
+        let model_cell = if r.classifier {
+            Line::from(vec![
+                Span::styled(shorten_model(&r.model), style_cyan()),
+                Span::styled(" clf", style_dim()),
+            ])
+        } else {
+            Line::from(Span::styled(shorten_model(&r.model), style_cyan()))
+        };
         Row::new(vec![
             Cell::from(Span::styled(time_str, style_dim())),
             Cell::from(Span::styled(&r.account, style_green())),
-            Cell::from(Span::styled(shorten_model(&r.model), style_cyan())),
+            Cell::from(model_cell),
             Cell::from(Span::styled(fmt_dur_short(r.duration_ms), style_dim())),
         ])
     }).collect();

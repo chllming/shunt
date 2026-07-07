@@ -5,8 +5,19 @@ fn main() -> anyhow::Result<()> {
     let is_start = args.iter().any(|a| a == "start");
     let is_foreground = args.iter().any(|a| a == "--foreground");
     let is_daemon = args.iter().any(|a| a == "--daemon");
+    let is_force = args.iter().any(|a| a == "--force");
 
     if is_start && !is_daemon {
+        // Idempotency guard: if a healthy daemon is already serving, do NOT kill
+        // and respawn it. A plain `shunt start` (e.g. from shell startup) must be
+        // a no-op when the proxy is up — otherwise every new shell tears down the
+        // listener for a moment and Claude Code sees ConnectionRefused mid-request.
+        // Use `--force` (or `shunt restart`) to deliberately replace a running daemon.
+        if !is_force && daemon_healthy() {
+            print_already_running();
+            return Ok(());
+        }
+
         // Kill any existing instance BEFORE doing anything else.
         // Must be synchronous — no runtime, no async, no hangs possible.
         preflight_kill();
@@ -40,6 +51,58 @@ fn preflight_kill() {
     unsafe { libc::kill(old_pid as i32, libc::SIGKILL) };
     // Give the OS 400ms to reclaim the port
     std::thread::sleep(std::time::Duration::from_millis(400));
+}
+
+/// Synchronous liveness probe for an already-running daemon. Speaks a minimal
+/// HTTP/1.0 request to the control port's `/health` endpoint using blocking std
+/// sockets with tight timeouts. Runs BEFORE the tokio runtime and before any
+/// kill, so it must not depend on async and must never hang.
+fn daemon_healthy() -> bool {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let control_port = shunt::config::load_config(None)
+        .map(|c| c.server.control_port)
+        .unwrap_or(19081);
+
+    let mut addrs = match format!("127.0.0.1:{control_port}").to_socket_addrs() {
+        Ok(it) => it,
+        Err(_) => return false,
+    };
+    let Some(addr) = addrs.next() else { return false };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
+        return false;
+    };
+    stream.set_read_timeout(Some(Duration::from_millis(800))).ok();
+    stream.set_write_timeout(Some(Duration::from_millis(500))).ok();
+    let req = "GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    let status_ok = text.lines().next().map(|l| l.contains(" 200")).unwrap_or(false);
+    // Body is {"status":"ok","version":"..."} — require both the 200 line and the ok status.
+    status_ok && text.contains("\"status\"") && text.contains("ok")
+}
+
+/// Status line printed when `shunt start` finds the daemon already healthy.
+fn print_already_running() {
+    let addrs = load_addrs();
+    println!();
+    println!("  {}  {}  {}",
+        brand_green("◆"),
+        bold_white("shunt"),
+        bold_white("already running"));
+    for (provider, addr) in &addrs {
+        let label = format!("{provider:<12}");
+        println!("  {}  {}  {}", dim("·"), dim(&label), cyan(addr));
+    }
+    println!("  {}  use {} to replace it",
+        dim("·"), cyan("shunt restart"));
+    println!();
 }
 
 /// Returns true if the given PID is a shunt process.

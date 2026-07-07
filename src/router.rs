@@ -192,10 +192,15 @@ pub fn pick_account<'a>(
     expiry_soon_secs: u64,
     strategy: RoutingStrategy,
     burst_rpm_limit: u32,
+    reserved: Option<&str>,
 ) -> Option<&'a AccountConfig> {
+    // Reserved account (e.g. the safety-classifier lane) is never selected for
+    // normal traffic, even when pinned or sticky.
+    let is_reserved = |name: &str| reserved == Some(name);
+
     // Pinned account overrides everything — user explicitly chose this one
     if let Some(pinned) = state.get_pinned() {
-        if !tried.contains(&pinned) {
+        if !tried.contains(&pinned) && !is_reserved(&pinned) {
             if let Some(acc) = accounts.iter().find(|a| a.name == pinned) {
                 let d = get_data(&acc.name, snap);
                 if d.available {
@@ -208,9 +213,11 @@ pub fn pick_account<'a>(
     // Try sticky account first
     if let Some(fp) = fp {
         if let Some(sticky_name) = state.get_sticky(fp) {
-            if let Some(acc) = accounts.iter().find(|a| a.name == sticky_name) {
-                if is_candidate(&acc.name, snap, tried, burst_rpm_limit) {
-                    return Some(acc);
+            if !is_reserved(&sticky_name) {
+                if let Some(acc) = accounts.iter().find(|a| a.name == sticky_name) {
+                    if is_candidate(&acc.name, snap, tried, burst_rpm_limit) {
+                        return Some(acc);
+                    }
                 }
             }
         }
@@ -219,7 +226,7 @@ pub fn pick_account<'a>(
     // Gather candidates: available, not exhausted, not health-check-failed, not tried.
     let candidates: Vec<&AccountConfig> = accounts
         .iter()
-        .filter(|a| is_candidate(&a.name, snap, tried, burst_rpm_limit))
+        .filter(|a| !is_reserved(&a.name) && is_candidate(&a.name, snap, tried, burst_rpm_limit))
         .collect();
 
     if candidates.is_empty() {
@@ -378,7 +385,7 @@ mod tests {
 
     fn pick(accounts: &[AccountConfig], state: &StateStore, strategy: RoutingStrategy) -> Option<String> {
         let snap = state.routing_snapshot();
-        pick_account(accounts, state, &snap, None, &HashSet::new(), 600_000, 1800, strategy, 0)
+        pick_account(accounts, state, &snap, None, &HashSet::new(), 600_000, 1800, strategy, 0, None)
             .map(|a| a.name.clone())
     }
 
@@ -572,7 +579,7 @@ mod tests {
         let snap = state.routing_snapshot();
         let result = pick_account(
             &accounts, &state, &snap, Some("fp1"), &HashSet::new(),
-            600_000, 1800, RoutingStrategy::Maximus, 0,
+            600_000, 1800, RoutingStrategy::Maximus, 0, None,
         );
         assert_eq!(result.map(|a| a.name.as_str()), Some("fallback"),
             "sticky account should be skipped when health-check-failed, fallback used instead");
@@ -600,10 +607,53 @@ mod tests {
         let snap = state.routing_snapshot();
         let result = pick_account(
             &accounts, &state, &snap, None, &HashSet::new(),
-            600_000, 1800, RoutingStrategy::Maximus, 10,
+            600_000, 1800, RoutingStrategy::Maximus, 10, None,
         );
         assert_eq!(result.map(|a| a.name.as_str()), Some("idle"),
             "busy account at burst limit should be skipped, idle account chosen");
+    }
+
+    #[test]
+    fn reserved_account_excluded_from_normal_rotation() {
+        // Only two accounts; one is the reserved classifier lane. Normal routing
+        // must never pick the reserved one, even though it is a valid candidate.
+        let accounts = vec![make_account("pool"), make_account("classifier")];
+        let state = StateStore::new_empty();
+        let snap = state.routing_snapshot();
+        let result = pick_account(
+            &accounts, &state, &snap, None, &HashSet::new(),
+            600_000, 1800, RoutingStrategy::Maximus, 0, Some("classifier"),
+        );
+        assert_eq!(result.map(|a| a.name.as_str()), Some("pool"),
+            "reserved classifier account must be excluded from normal rotation");
+    }
+
+    #[test]
+    fn reserved_account_not_picked_even_when_only_option() {
+        let accounts = vec![make_account("classifier")];
+        let state = StateStore::new_empty();
+        let snap = state.routing_snapshot();
+        let result = pick_account(
+            &accounts, &state, &snap, None, &HashSet::new(),
+            600_000, 1800, RoutingStrategy::Maximus, 0, Some("classifier"),
+        );
+        assert!(result.is_none(),
+            "reserved account must not be selected for normal traffic even as the only candidate");
+    }
+
+    #[test]
+    fn reserved_account_not_used_when_pinned() {
+        let accounts = vec![make_account("pool"), make_account("classifier")];
+        let state = StateStore::new_empty();
+        state.set_pinned(Some("classifier".to_owned()));
+        let snap = state.routing_snapshot();
+        let result = pick_account(
+            &accounts, &state, &snap, None, &HashSet::new(),
+            600_000, 1800, RoutingStrategy::Maximus, 0, Some("classifier"),
+        );
+        assert_eq!(result.map(|a| a.name.as_str()), Some("pool"),
+            "reserved account must not win even when pinned");
+        state.set_pinned(None);
     }
 
     #[test]
@@ -617,7 +667,7 @@ mod tests {
         let snap = state.routing_snapshot();
         let result = pick_account(
             &accounts, &state, &snap, None, &HashSet::new(),
-            600_000, 1800, RoutingStrategy::Maximus, 0,
+            600_000, 1800, RoutingStrategy::Maximus, 0, None,
         );
         assert_eq!(result.map(|a| a.name.as_str()), Some("busy"),
             "burst pacing should not filter when limit is 0");
