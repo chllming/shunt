@@ -355,6 +355,7 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
         "last_used_account": s.state.get_last_used(),
         "recent_requests": recent_requests,
         "savings": savings,
+        "classifier_account": s.config.server.classifier_account,
     }))
 }
 
@@ -634,11 +635,30 @@ async fn proxy_handler(
     // Apply model override: if set, patch the `model` field in the JSON body before forwarding.
     // Also strip unsupported params for models that don't support them (e.g. Haiku).
     // Parse once and reuse the value to extract the model name (avoids double-parse).
+    // Set when this request is Claude Code's auto-mode safety-classifier side-call.
+    // Threaded through routing (dedicated lane + fail-fast) and the request log.
+    let mut is_classifier = false;
     let (mut body_bytes, model) = if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
         let mut changed = false;
         if let Some(override_model) = s.state.get_model_override() {
             if val.get("model").is_some() {
                 val["model"] = serde_json::Value::String(override_model);
+                changed = true;
+            }
+        }
+        // Auto-mode safety classifier: Claude Code fires a separate classifier
+        // call (its system prompt begins "You are a security monitor for
+        // autonomous AI coding agents.") before gated Bash/Write/Edit tools. It
+        // inherits the active model (often opus) and fails closed if that model
+        // is unavailable — which, behind a pooling proxy, happens whenever the
+        // pooled accounts are cooling, hard-blocking every gated tool. Pin it to
+        // Haiku (always-available, cheap, still returns a valid verdict). Only
+        // the model is rewritten; the `system` array — including the
+        // `x-anthropic-billing-header:` block Anthropic uses to recognize Claude
+        // Code OAuth traffic — is preserved so first-party recognition survives.
+        if is_safety_classifier(&val) {
+            is_classifier = true;
+            if pin_model_to_classifier(&mut val) {
                 changed = true;
             }
         }
@@ -727,13 +747,36 @@ async fn proxy_handler(
         let snap = s.state.routing_snapshot();
         let effective_burst_rpm = s.state.get_burst_rpm_limit_override()
             .unwrap_or(s.config.server.burst_rpm_limit);
-        let account = match router::pick_account(
-            &s.config.accounts, &s.state, &snap, fp_ref, &tried,
-            s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
-            effective_strategy, effective_burst_rpm,
-        ) {
+
+        // Auto-mode safety-classifier side-calls take a dedicated lane when one is
+        // configured (`server.classifier_account`), bypassing the pooled OAuth
+        // accounts entirely. When no lane is configured they fall through to the
+        // normal pool but still fail fast below (never the cooldown wait), because
+        // Claude Code's classifier has a short client-side deadline and fails
+        // closed — a delayed answer is as good as no answer.
+        let classifier_lane = if is_classifier {
+            s.config.server.classifier_account.as_deref()
+        } else {
+            None
+        };
+        let selected = if let Some(lane) = classifier_lane {
+            s.config.accounts.iter().find(|a| a.name == lane && !tried.contains(&a.name))
+        } else {
+            router::pick_account(
+                &s.config.accounts, &s.state, &snap, fp_ref, &tried,
+                s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
+                effective_strategy, effective_burst_rpm,
+                s.config.server.classifier_account.as_deref(),
+            )
+        };
+        let account = match selected {
             Some(a) => a,
             None => {
+                // Classifier requests never block on cooldown — fail fast so the
+                // client's own retry budget governs instead of hanging the call.
+                if is_classifier {
+                    return Err(ProxyError::AllAccountsUnavailable);
+                }
                 // Model fallback: before waiting, try switching to a cheaper model.
                 // Rate limits are often per-model, so the fallback may succeed immediately.
                 // Override chain: runtime override → config → auto-detect from model name.
@@ -938,7 +981,7 @@ async fn proxy_handler(
                     // Got Anthropic response; client expects OpenAI.
                     translate_response_anthropic_to_openai(response).await
                 };
-                return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), s.supabase.as_ref(), &account_name, &account.provider.to_string(), &log_model, req_start_ms, &request_id, &path, tried.len()).await);
+                return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), s.supabase.as_ref(), &account_name, &account.provider.to_string(), &log_model, req_start_ms, &request_id, &path, tried.len(), is_classifier).await);
             }
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
@@ -1124,6 +1167,7 @@ async fn tap_usage(
     request_id: &str,
     path: &str,
     retries: usize,
+    is_classifier: bool,
 ) -> Response {
     use axum::body::Body;
     use crate::state::RequestLog;
@@ -1162,6 +1206,7 @@ async fn tap_usage(
                 input_tokens: input,
                 output_tokens: output,
                 duration_ms,
+                classifier: is_classifier,
             };
             state.record_usage(&account, input, output);
             state.record_global(&model, input, output);
@@ -1205,6 +1250,7 @@ async fn tap_usage(
         input_tokens: input,
         output_tokens: output,
         duration_ms,
+        classifier: is_classifier,
     };
     state.record_usage(account, input, output);
     state.record_global(model, input, output);
@@ -2237,6 +2283,38 @@ fn is_simple_model(model: &str) -> bool {
     model.contains("haiku")
 }
 
+/// Detect Claude Code's auto-mode safety classifier request. The classifier's
+/// system prompt begins "You are a security monitor for autonomous AI coding
+/// agents." The `system` field may be a plain string or an array of content
+/// blocks ({"type":"text","text":...}); check both shapes.
+fn is_safety_classifier(val: &serde_json::Value) -> bool {
+    const NEEDLE: &str = "security monitor for autonomous AI coding agents";
+    match val.get("system") {
+        Some(serde_json::Value::String(s)) => s.contains(NEEDLE),
+        Some(serde_json::Value::Array(blocks)) => blocks.iter().any(|b| {
+            b.get("text").and_then(|t| t.as_str()).map(|t| t.contains(NEEDLE)).unwrap_or(false)
+        }),
+        _ => false,
+    }
+}
+
+/// Model the classifier is pinned to: always-available, cheap, and returns a
+/// valid allow/block verdict. Claude Code ignores `CLAUDE_CODE_AUTO_MODE_MODEL`,
+/// so the proxy is the only place this redirect can happen.
+const CLASSIFIER_MODEL: &str = "claude-haiku-4-5-20251001";
+
+/// Rewrite a classifier request's `model` to [`CLASSIFIER_MODEL`], leaving every
+/// other field — crucially the `system` array with its `x-anthropic-billing-header`
+/// block — untouched. Returns true if the model changed.
+fn pin_model_to_classifier(val: &mut serde_json::Value) -> bool {
+    let cur = val.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    if cur == CLASSIFIER_MODEL {
+        return false;
+    }
+    val["model"] = serde_json::Value::String(CLASSIFIER_MODEL.to_owned());
+    true
+}
+
 /// Auto-detect a fallback model based on the current model name.
 /// opus → sonnet, sonnet → haiku, anything else → None.
 fn auto_fallback_model(model: &str) -> Option<&'static str> {
@@ -2354,5 +2432,73 @@ mod tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("retry-after", "5".parse().unwrap());
         assert_eq!(parse_retry_after_ms(&headers), Some(5_000));
+    }
+
+    #[test]
+    fn classifier_detected_when_system_is_string() {
+        let v = json!({
+            "model": "claude-fable-5",
+            "system": "You are a security monitor for autonomous AI coding agents.\n..."
+        });
+        assert!(is_safety_classifier(&v));
+    }
+
+    #[test]
+    fn classifier_detected_when_system_is_block_array() {
+        // Modern Claude Code sends `system` as an array of {type,text} blocks.
+        let v = json!({
+            "model": "claude-fable-5",
+            "system": [
+                {"type": "text", "text": "You are a security monitor for autonomous AI coding agents."},
+                {"type": "text", "text": "## Context ..."}
+            ]
+        });
+        assert!(is_safety_classifier(&v));
+    }
+
+    #[test]
+    fn classifier_not_detected_for_normal_request() {
+        let v = json!({
+            "model": "claude-fable-5",
+            "system": [{"type": "text", "text": "You are Claude Code, Anthropic's CLI."}],
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        assert!(!is_safety_classifier(&v));
+        // Missing system entirely must also be false (not a classifier call).
+        assert!(!is_safety_classifier(&json!({"model": "claude-fable-5"})));
+    }
+
+    #[test]
+    fn pin_model_rewrites_only_the_model_field() {
+        let mut v = json!({
+            "model": "claude-opus-4-8",
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.200; cc_entrypoint=cli; cch=abc123;"},
+                {"type": "text", "text": "You are a security monitor for autonomous AI coding agents."}
+            ],
+            "messages": [{"role": "user", "content": "Action: echo hi"}]
+        });
+        let changed = pin_model_to_classifier(&mut v);
+        assert!(changed, "opus should be rewritten to the classifier model");
+        assert_eq!(v["model"], json!(CLASSIFIER_MODEL));
+        // The billing-header block MUST survive: it is how Anthropic recognizes
+        // Claude Code OAuth traffic. Losing it triggers a misleading 429.
+        let system = v["system"].as_array().expect("system array preserved");
+        assert_eq!(system.len(), 2, "no system blocks dropped");
+        assert!(
+            system.iter().any(|b| b["text"].as_str()
+                .map(|t| t.starts_with("x-anthropic-billing-header:"))
+                .unwrap_or(false)),
+            "x-anthropic-billing-header block must be preserved",
+        );
+        // Messages untouched.
+        assert_eq!(v["messages"][0]["content"], json!("Action: echo hi"));
+    }
+
+    #[test]
+    fn pin_model_is_noop_when_already_classifier_model() {
+        let mut v = json!({ "model": CLASSIFIER_MODEL, "system": "You are a security monitor for autonomous AI coding agents." });
+        assert!(!pin_model_to_classifier(&mut v), "already on classifier model → no change");
+        assert_eq!(v["model"], json!(CLASSIFIER_MODEL));
     }
 }

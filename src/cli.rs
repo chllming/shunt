@@ -36,6 +36,9 @@ enum Command {
         /// Enable debug-level logging (shows routing decisions and token refresh details)
         #[arg(long)]
         verbose: bool,
+        /// Replace an already-running daemon instead of no-op when one is healthy
+        #[arg(long)]
+        force: bool,
         /// Internal: running as background daemon (do not use directly)
         #[arg(long, hide = true)]
         daemon: bool,
@@ -421,7 +424,7 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Setup { config } => cmd_setup(config).await,
-        Command::Start { config, host, port, foreground, verbose, daemon } => cmd_start(config, host, port, foreground, verbose, daemon).await,
+        Command::Start { config, host, port, foreground, verbose, force, daemon } => cmd_start(config, host, port, foreground, verbose, force, daemon).await,
         Command::Stop => cmd_stop().await,
         Command::Restart { config } => cmd_restart(config).await,
         Command::Status { config } => cmd_status(config).await,
@@ -1304,6 +1307,10 @@ async fn cmd_start(
     port_override: Option<u16>,
     foreground: bool,
     verbose: bool,
+    // Force-replace flag. The kill/no-op decision runs in `main.rs` before the
+    // runtime starts; this function only needs to accept the flag so that
+    // `shunt start --force` parses and clap does not reject it.
+    _force: bool,
     daemon: bool,
 ) -> Result<()> {
     let config_p = config_override.clone().unwrap_or_else(config_path);
@@ -1451,12 +1458,27 @@ async fn cmd_start(
        .spawn()
        .context("failed to start proxy in background")?;
 
-    // Wait until the control plane is accepting connections (up to 8 s)
+    // Wait until the control plane is accepting connections (up to 8 s), then
+    // confirm the data port is actually accepting connections too. Both must be
+    // up before we let Claude Code point at the proxy: control health alone can
+    // be green a beat before the data listener binds.
     let control_port = config.server.control_port;
-    let ready = wait_for_health(&host, control_port, 8).await;
+    let ready = wait_for_health(&host, control_port, 8).await
+        && wait_for_port(&host, port, 3).await;
 
-    // Auto-write ANTHROPIC_BASE_URL to shell profile (silent if already there)
-    auto_write_shell_export(port);
+    if ready {
+        // Auto-write ANTHROPIC_BASE_URL to shell profile (silent if already there)
+        auto_write_shell_export(port);
+    } else {
+        // Startup did not become ready. The daemon child may have written
+        // ANTHROPIC_BASE_URL into Claude Code settings before failing to bind;
+        // remove it so Claude Code falls back to the direct API instead of
+        // hammering a dead localhost socket with ConnectionRefused.
+        if let Some(home) = dirs::home_dir() {
+            remove_from_settings_file_quiet(&home.join(".claude").join("settings.json"));
+            remove_from_settings_file_quiet(&managed_claude_settings_path(&home));
+        }
+    }
 
     let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
     let status_line = if ready {
@@ -1561,7 +1583,9 @@ async fn cmd_restart(config_override: Option<PathBuf>) -> Result<()> {
     std::io::stdout().flush().ok();
     cmd_stop_quiet().await?;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    cmd_start(config_override, None, None, false, false, false).await
+    // force = true: restart has already stopped the old daemon, so the fresh
+    // start must proceed even if a stale health probe would briefly still answer.
+    cmd_start(config_override, None, None, false, false, true, false).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1728,6 +1752,24 @@ async fn cmd_setup_auto(config_override: Option<PathBuf>) -> Result<()> {
     tokio::spawn(crate::telemetry::track_cli_feature("setup"));
 
     Ok(())
+}
+
+/// Wait until a TCP listener is accepting connections on `host:port`.
+/// Used to confirm the data port is bound before routing Claude Code to it.
+async fn wait_for_port(host: &str, port: u16, timeout_secs: u64) -> bool {
+    let probe_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+    let addr = format!("{probe_host}:{port}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(&addr),
+        ).await {
+            Ok(Ok(_)) => return true,
+            _ => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+        }
+    }
+    false
 }
 
 async fn wait_for_health(host: &str, port: u16, timeout_secs: u64) -> bool {
@@ -2011,6 +2053,7 @@ async fn cmd_status(config_override: Option<PathBuf>) -> Result<()> {
         for acc in &config.accounts {
             let label = match &acc.provider {
                 crate::provider::Provider::Anthropic   => "Claude Code",
+                crate::provider::Provider::AnthropicApi => "Anthropic API",
                 crate::provider::Provider::OpenAI      => "Codex",
                 crate::provider::Provider::OpenAIApi   => "OpenAI",
                 crate::provider::Provider::OllamaCloud => "Ollama",

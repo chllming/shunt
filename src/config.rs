@@ -201,6 +201,10 @@ struct RawServer {
     /// Send anonymous usage telemetry to Supabase (default: true).
     /// Also disabled by SHUNT_NO_TELEMETRY=1 env var.
     telemetry: Option<bool>,
+    /// Name of the account reserved for auto-mode safety-classifier side-calls.
+    /// When set, classifier requests are routed only to this account (and it is
+    /// excluded from normal rotation). Intended for an `anthropic-api` account.
+    classifier_account: Option<String>,
 }
 
 impl Default for RawServer {
@@ -229,6 +233,7 @@ impl Default for RawServer {
             burst_rpm_limit: None,
             fallback_model: None,
             telemetry: None,
+            classifier_account: None,
         }
     }
 }
@@ -364,6 +369,8 @@ pub struct ServerConfig {
     pub fallback_model: Option<String>,
     /// Send anonymous usage telemetry to Supabase (default: true).
     pub telemetry: bool,
+    /// Account reserved for auto-mode safety-classifier side-calls (see RawServer).
+    pub classifier_account: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -392,6 +399,7 @@ impl Default for ServerConfig {
             burst_rpm_limit: 10,
             fallback_model: None,
             telemetry: true,
+            classifier_account: None,
         }
     }
 }
@@ -512,6 +520,8 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         fallback_model: raw.server.fallback_model,
         telemetry: raw.server.telemetry.unwrap_or(true)
             && std::env::var("SHUNT_NO_TELEMETRY").map(|v| v == "1").unwrap_or(false) == false,
+        classifier_account: raw.server.classifier_account
+            .or_else(|| std::env::var("SHUNT_CLASSIFIER_ACCOUNT").ok()),
     };
 
     if raw.accounts.is_empty() {

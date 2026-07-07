@@ -119,6 +119,9 @@ pub struct RequestLog {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub duration_ms: u64,
+    /// True when this was an auto-mode safety-classifier side-call.
+    #[serde(default)]
+    pub classifier: bool,
 }
 
 const MAX_RECENT: usize = 200;
@@ -1041,6 +1044,7 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
                 duration_ms: 1,
+                classifier: false,
             });
         }
         let snap = store.recent_requests_snapshot();

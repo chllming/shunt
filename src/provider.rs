@@ -46,6 +46,9 @@ pub enum Provider {
     /// Anthropic claude.ai — OAuth, Anthropic wire format.
     #[default]
     Anthropic,
+    /// Anthropic API (api.anthropic.com) — Console API key (x-api-key), Anthropic wire format.
+    #[serde(rename = "anthropic-api")]
+    AnthropicApi,
     /// OpenAI chatgpt.com — OAuth, OpenAI-compat wire format.
     OpenAI,
     /// OpenAI API (api.openai.com) — API key, OpenAI-compat wire format.
@@ -76,6 +79,7 @@ impl std::fmt::Display for Provider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Provider::Anthropic   => write!(f, "anthropic"),
+            Provider::AnthropicApi => write!(f, "anthropic-api"),
             Provider::OpenAI      => write!(f, "openai"),
             Provider::OpenAIApi   => write!(f, "openai-api"),
             Provider::OllamaCloud => write!(f, "ollama"),
@@ -94,6 +98,7 @@ impl std::fmt::Display for Provider {
 impl Provider {
     pub fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
+            "anthropic-api" | "anthropic_api" => Provider::AnthropicApi,
             "openai" | "codex"              => Provider::OpenAI,
             "openai-api" | "openai_api"     => Provider::OpenAIApi,
             "ollama" | "ollama-cloud" | "ollamacloud" => Provider::OllamaCloud,
@@ -121,7 +126,7 @@ impl Provider {
     /// Wire protocol used for requests/responses.
     pub fn wire_protocol(&self) -> WireProtocol {
         match self {
-            Provider::Anthropic => WireProtocol::Anthropic,
+            Provider::Anthropic | Provider::AnthropicApi => WireProtocol::Anthropic,
             _                   => WireProtocol::OpenAICompat,
         }
     }
@@ -134,6 +139,7 @@ impl Provider {
     pub fn default_model(&self) -> &'static str {
         match self {
             Provider::Anthropic   => "claude-sonnet-4-6",
+            Provider::AnthropicApi => "claude-haiku-4-5-20251001",
             Provider::OpenAI      => "gpt-4o",
             Provider::OpenAIApi   => "gpt-4o",
             Provider::OllamaCloud => "llama3.3",
@@ -151,13 +157,14 @@ impl Provider {
     /// True when this provider understands `claude-*` model names natively.
     /// When false, incoming `claude-*` model names are remapped before forwarding.
     pub fn accepts_claude_models(&self) -> bool {
-        matches!(self, Provider::Anthropic)
+        matches!(self, Provider::Anthropic | Provider::AnthropicApi)
     }
 
     /// Well-known environment variable that holds an API key for this provider.
     /// `None` for OAuth and Local providers.
     pub fn api_key_env_var(&self) -> Option<&'static str> {
         match self {
+            Provider::AnthropicApi => Some("ANTHROPIC_API_KEY"),
             Provider::OpenAIApi   => Some("OPENAI_API_KEY"),
             Provider::OllamaCloud => Some("OLLAMA_API_KEY"),
             Provider::Groq        => Some("GROQ_API_KEY"),
@@ -175,6 +182,7 @@ impl Provider {
     pub fn default_upstream_url(&self) -> &'static str {
         match self {
             Provider::Anthropic   => "https://api.anthropic.com",
+            Provider::AnthropicApi => "https://api.anthropic.com",
             Provider::OpenAI      => "https://chatgpt.com",
             Provider::OpenAIApi   => "https://api.openai.com",
             Provider::OllamaCloud => "https://api.ollama.com",
@@ -193,6 +201,7 @@ impl Provider {
     pub fn default_port(&self) -> u16 {
         match self {
             Provider::Anthropic   => 8082,
+            Provider::AnthropicApi => 8094,
             Provider::OpenAI      => 8083,
             Provider::OpenAIApi   => 8084,
             Provider::OllamaCloud => 8085,
@@ -220,6 +229,38 @@ impl Provider {
 
         // Local provider needs no auth.
         if self.auth_kind() == AuthKind::None {
+            return Ok(());
+        }
+
+        // Anthropic Console API key: authenticate with `x-api-key`, not Bearer.
+        // Scrub OAuth-only headers so the request is a clean Console-API call.
+        if matches!(self, Provider::AnthropicApi) {
+            headers.remove(HeaderName::from_static("authorization"));
+            headers.insert(
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_str(token).map_err(|_| anyhow::anyhow!("invalid api key"))?,
+            );
+            if !headers.contains_key("anthropic-version") {
+                headers.insert(
+                    HeaderName::from_static("anthropic-version"),
+                    HeaderValue::from_static("2023-06-01"),
+                );
+            }
+            headers.remove(HeaderName::from_static("anthropic-dangerous-direct-browser-access"));
+            // Remove the OAuth beta flag; keep any other beta flags the client sent.
+            let beta_key = HeaderName::from_static("anthropic-beta");
+            if let Some(existing) = headers.get(&beta_key).and_then(|v| v.to_str().ok()).map(|s| s.to_owned()) {
+                let kept: Vec<&str> = existing
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty() && *s != "oauth-2025-04-20")
+                    .collect();
+                if kept.is_empty() {
+                    headers.remove(&beta_key);
+                } else if let Ok(v) = HeaderValue::from_str(&kept.join(",")) {
+                    headers.insert(beta_key, v);
+                }
+            }
             return Ok(());
         }
 
@@ -274,7 +315,7 @@ impl Provider {
     /// Returns `(header-name, header-value)` pairs as static strings.
     pub fn prefetch_extra_headers(&self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Provider::Anthropic => &[("anthropic-version", "2023-06-01")],
+            Provider::Anthropic | Provider::AnthropicApi => &[("anthropic-version", "2023-06-01")],
             _ => &[],
         }
     }
@@ -284,7 +325,7 @@ impl Provider {
     /// Returns `None` if this provider doesn't support prefetching.
     pub fn prefetch_request(&self) -> Option<(&'static str, serde_json::Value)> {
         match self {
-            Provider::Anthropic => Some((
+            Provider::Anthropic | Provider::AnthropicApi => Some((
                 "/v1/messages",
                 serde_json::json!({
                     "model": "claude-haiku-4-5-20251001",
@@ -303,6 +344,7 @@ impl Provider {
     pub fn auth_probe_get_path(&self) -> Option<&'static str> {
         match self {
             Provider::Anthropic   => None, // prefetch_request() already verifies auth
+            Provider::AnthropicApi => None, // prefetch_request() already verifies auth
             Provider::OpenAI      => Some("/backend-api/me"),
             Provider::OpenAIApi   => Some("/v1/models"),
             Provider::OllamaCloud => Some("/v1/models"),
@@ -327,7 +369,7 @@ impl Provider {
             .as_millis() as u64;
 
         match self {
-            Provider::Anthropic => parse_anthropic_rate_limits(headers, now_ms),
+            Provider::Anthropic | Provider::AnthropicApi => parse_anthropic_rate_limits(headers, now_ms),
             // OpenAI-compat providers that return x-ratelimit-* headers.
             Provider::OpenAI
             | Provider::OpenAIApi
@@ -567,7 +609,47 @@ mod tests {
         assert_eq!(Provider::OpenAIApi.api_key_env_var(), Some("OPENAI_API_KEY"));
         assert_eq!(Provider::Gemini.api_key_env_var(), Some("GEMINI_API_KEY"));
         assert_eq!(Provider::Anthropic.api_key_env_var(), None);
+        assert_eq!(Provider::AnthropicApi.api_key_env_var(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(Provider::Local.api_key_env_var(), None);
+    }
+
+    #[test]
+    fn test_anthropic_api_from_str_and_kind() {
+        assert_eq!(Provider::from_str("anthropic-api"), Provider::AnthropicApi);
+        assert_eq!(Provider::from_str("anthropic_api"), Provider::AnthropicApi);
+        assert_eq!(Provider::AnthropicApi.auth_kind(), AuthKind::ApiKey);
+        assert_eq!(Provider::AnthropicApi.wire_protocol(), WireProtocol::Anthropic);
+        assert!(Provider::AnthropicApi.accepts_claude_models());
+        assert_eq!(Provider::AnthropicApi.default_upstream_url(), "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn test_anthropic_api_injects_x_api_key_not_bearer() {
+        use reqwest::header::HeaderName;
+        let mut headers = reqwest::header::HeaderMap::new();
+        // Simulate inbound OAuth-flavored headers that must be scrubbed for a Console key.
+        headers.insert(HeaderName::from_static("anthropic-beta"), "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14".parse().unwrap());
+        headers.insert(HeaderName::from_static("anthropic-dangerous-direct-browser-access"), "true".parse().unwrap());
+
+        Provider::AnthropicApi.inject_auth_headers(&mut headers, "sk-ant-test123").unwrap();
+
+        assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-test123");
+        assert!(headers.get("authorization").is_none(), "must not send Bearer for Console API key");
+        assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+        assert!(headers.get("anthropic-dangerous-direct-browser-access").is_none());
+        // oauth beta scrubbed, other beta flags preserved.
+        let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+        assert!(!beta.contains("oauth-2025-04-20"));
+        assert!(beta.contains("fine-grained-tool-streaming-2025-05-14"));
+    }
+
+    #[test]
+    fn test_anthropic_oauth_still_uses_bearer() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        Provider::Anthropic.inject_auth_headers(&mut headers, "oauth-token").unwrap();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer oauth-token");
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get("anthropic-beta").unwrap().to_str().unwrap().contains("oauth-2025-04-20"));
     }
 
     #[test]
