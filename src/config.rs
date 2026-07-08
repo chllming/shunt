@@ -205,6 +205,17 @@ struct RawServer {
     /// When set, classifier requests are routed only to this account (and it is
     /// excluded from normal rotation). Intended for an `anthropic-api` account.
     classifier_account: Option<String>,
+    /// Path to a custom system prompt that fully replaces Claude Code's built-in
+    /// auto-mode safety-classifier prompt. When set, the `system` field of a
+    /// detected classifier request is replaced with this file's contents. The
+    /// replacement must still instruct the model to emit the `<block>yes|no</block>`
+    /// verdict grammar Claude Code parses, or verdicts fail closed (block).
+    classifier_system_prompt_path: Option<String>,
+    /// Account to try once if the primary classifier lane errors before failing
+    /// the request. Lets a transient upstream blip fall back (e.g. to a pooled or
+    /// Console lane) instead of forcing Claude Code to block. When unset, the
+    /// classifier lane fails fast and Claude Code fails closed.
+    classifier_fallback_account: Option<String>,
 }
 
 impl Default for RawServer {
@@ -234,6 +245,8 @@ impl Default for RawServer {
             fallback_model: None,
             telemetry: None,
             classifier_account: None,
+            classifier_system_prompt_path: None,
+            classifier_fallback_account: None,
         }
     }
 }
@@ -371,6 +384,11 @@ pub struct ServerConfig {
     pub telemetry: bool,
     /// Account reserved for auto-mode safety-classifier side-calls (see RawServer).
     pub classifier_account: Option<String>,
+    /// Path to a custom system prompt that replaces Claude Code's built-in
+    /// auto-mode classifier prompt (see RawServer).
+    pub classifier_system_prompt_path: Option<String>,
+    /// Account to try once if the primary classifier lane errors (see RawServer).
+    pub classifier_fallback_account: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -400,6 +418,8 @@ impl Default for ServerConfig {
             fallback_model: None,
             telemetry: true,
             classifier_account: None,
+            classifier_system_prompt_path: None,
+            classifier_fallback_account: None,
         }
     }
 }
@@ -522,6 +542,10 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
             && std::env::var("SHUNT_NO_TELEMETRY").map(|v| v == "1").unwrap_or(false) == false,
         classifier_account: raw.server.classifier_account
             .or_else(|| std::env::var("SHUNT_CLASSIFIER_ACCOUNT").ok()),
+        classifier_system_prompt_path: raw.server.classifier_system_prompt_path
+            .or_else(|| std::env::var("SHUNT_CLASSIFIER_SYSTEM_PROMPT_PATH").ok()),
+        classifier_fallback_account: raw.server.classifier_fallback_account
+            .or_else(|| std::env::var("SHUNT_CLASSIFIER_FALLBACK_ACCOUNT").ok()),
     };
 
     if raw.accounts.is_empty() {
