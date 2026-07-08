@@ -957,7 +957,24 @@ async fn proxy_handler(
             200..=299 => {
                 s.state.set_last_used(&account_name);
                 if let Some(info) = account.provider.parse_rate_limits(response.headers()) {
-                    s.state.update_rate_limits(&account_name, info);
+                    // "Buy more tokens" avoidance: if this account has consumed its
+                    // included subscription quota on a window AND overage/extra-usage
+                    // is disabled, Anthropic can't overflow and Claude Code surfaces
+                    // the buy-more prompt. Cool the account so subsequent turns skip
+                    // it instead of repeatedly landing on it. The current response
+                    // already succeeded, so it is still returned to the client.
+                    if let Some(reset_secs) = overage_exhausted_reset(&info) {
+                        let cool_ms = reset_secs
+                            .saturating_mul(1_000)
+                            .saturating_sub(now_ms())
+                            .clamp(60_000, 10 * 60_000);
+                        warn!(account = %account_name, cool_ms,
+                            "included quota spent with overage disabled — cooling to avoid buy-more prompt");
+                        s.state.update_rate_limits(&account_name, info);
+                        s.state.set_cooldown(&account_name, cool_ms);
+                    } else {
+                        s.state.update_rate_limits(&account_name, info);
+                    }
                 }
                 // Translate response back to the client's expected protocol.
                 let response = if req_is_anthropic == acct_is_anthropic {
@@ -2262,6 +2279,32 @@ fn parse_retry_after_ms(headers: &axum::http::HeaderMap) -> Option<u64> {
 
 /// Mirrors `StateStore::is_exhausted`'s semantics: a window only counts as
 /// exhausted if Anthropic's status says so AND its reset is still in the future.
+/// Detect the "buy more tokens" condition from unified rate-limit info: a window
+/// is exhausted (utilization at/over its included allotment) while extra-usage
+/// (overage) is disabled/rejected, so Anthropic cannot overflow and Claude Code
+/// shows the buy-more prompt. Returns the binding window's reset (epoch seconds)
+/// so the caller can cool the account until it frees up. Returns None when the
+/// account can still serve normally (overage allowed, or not exhausted).
+fn overage_exhausted_reset(info: &RateLimitInfo) -> Option<u64> {
+    // Only relevant when overage is explicitly disabled/rejected. When the header
+    // is absent or "allowed", the account can overflow and won't show buy-more.
+    let overage_blocked = matches!(info.overage_status.as_deref(), Some("rejected") | Some("disabled"));
+    if !overage_blocked {
+        return None;
+    }
+    let now_secs = now_ms() / 1_000;
+    let ex_5h = info.status_5h.as_deref() == Some("exhausted")
+        && info.reset_5h.map(|t| t > now_secs).unwrap_or(false);
+    let ex_7d = info.status_7d.as_deref() == Some("exhausted")
+        && info.reset_7d.map(|t| t > now_secs).unwrap_or(false);
+    match (ex_5h, ex_7d) {
+        (true, true) => info.reset_5h.min(info.reset_7d), // soonest of the two
+        (true, false) => info.reset_5h,
+        (false, true) => info.reset_7d,
+        (false, false) => None,
+    }
+}
+
 fn is_exhausted_response(info: Option<&RateLimitInfo>) -> bool {
     let Some(info) = info else { return false };
     let now_secs = now_ms() / 1_000;
@@ -2692,6 +2735,60 @@ mod tests {
         assert!(!v.contains("thinking"), "thinking beta removed");
         assert!(!v.contains("effort"), "effort beta removed");
         assert!(v.contains("oauth-2025-04-20"), "unrelated beta preserved");
+    }
+
+    #[test]
+    fn overage_reset_none_when_overage_allowed() {
+        let now = now_ms() / 1_000;
+        let info = crate::state::RateLimitInfo {
+            status_5h: Some("exhausted".into()),
+            reset_5h: Some(now + 3600),
+            overage_status: Some("allowed".into()),
+            ..Default::default()
+        };
+        // Overage allowed → account can overflow → no buy-more, no cool.
+        assert_eq!(overage_exhausted_reset(&info), None);
+    }
+
+    #[test]
+    fn overage_reset_none_when_not_exhausted() {
+        let now = now_ms() / 1_000;
+        let info = crate::state::RateLimitInfo {
+            status_5h: Some("allowed".into()),
+            reset_5h: Some(now + 3600),
+            status_7d: Some("allowed".into()),
+            reset_7d: Some(now + 7200),
+            overage_status: Some("rejected".into()),
+            ..Default::default()
+        };
+        assert_eq!(overage_exhausted_reset(&info), None);
+    }
+
+    #[test]
+    fn overage_reset_returns_binding_reset_when_exhausted_and_rejected() {
+        let now = now_ms() / 1_000;
+        let info = crate::state::RateLimitInfo {
+            status_5h: Some("exhausted".into()),
+            reset_5h: Some(now + 1800),
+            status_7d: Some("exhausted".into()),
+            reset_7d: Some(now + 9999),
+            overage_status: Some("rejected".into()),
+            ..Default::default()
+        };
+        // Both exhausted → return the soonest reset (5h here).
+        assert_eq!(overage_exhausted_reset(&info), Some(now + 1800));
+    }
+
+    #[test]
+    fn overage_reset_ignores_past_reset() {
+        let now = now_ms() / 1_000;
+        let info = crate::state::RateLimitInfo {
+            status_5h: Some("exhausted".into()),
+            reset_5h: Some(now.saturating_sub(100)), // already reset
+            overage_status: Some("rejected".into()),
+            ..Default::default()
+        };
+        assert_eq!(overage_exhausted_reset(&info), None);
     }
 
     #[test]
