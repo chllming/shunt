@@ -658,7 +658,29 @@ async fn proxy_handler(
         // Code OAuth traffic — is preserved so first-party recognition survives.
         if is_safety_classifier(&val) {
             is_classifier = true;
-            if pin_model_to_classifier(&mut val) {
+            // When a custom classifier prompt is configured, fully replace the
+            // `system` field with our own harness rubric and let the dedicated
+            // classifier lane's account `model` pin choose the model. The
+            // replacement must still instruct the model to emit the
+            // `<block>yes|no</block>` grammar Claude Code parses. If the file
+            // cannot be read, leave Claude Code's original system prompt intact
+            // (still a valid, parseable contract) rather than shipping an empty
+            // prompt.
+            if let Some(path) = s.config.server.classifier_system_prompt_path.as_deref() {
+                match std::fs::read_to_string(path) {
+                    Ok(prompt) if !prompt.trim().is_empty() => {
+                        val["system"] = serde_json::Value::String(prompt);
+                        changed = true;
+                    }
+                    Ok(_) => {
+                        warn!(path, "classifier_system_prompt_path is empty — keeping Claude Code's prompt");
+                    }
+                    Err(e) => {
+                        warn!(path, error = %e, "failed to read classifier_system_prompt_path — keeping Claude Code's prompt");
+                    }
+                }
+            } else if pin_model_to_classifier(&mut val) {
+                // No custom prompt: preserve legacy behavior (pin to Haiku).
                 changed = true;
             }
         }
@@ -737,7 +759,18 @@ async fn proxy_handler(
             None
         };
         let selected = if let Some(lane) = classifier_lane {
-            s.config.accounts.iter().find(|a| a.name == lane && !tried.contains(&a.name))
+            // Prefer the dedicated classifier account; if it has already been
+            // tried this request (transient upstream error), fall back once to
+            // the configured `classifier_fallback_account` before giving up, so
+            // a single blip on the primary lane doesn't force Claude Code to
+            // block. Both are matched against `tried` so we never loop forever.
+            s.config.accounts.iter()
+                .find(|a| a.name == lane && !tried.contains(&a.name))
+                .or_else(|| {
+                    s.config.server.classifier_fallback_account.as_deref().and_then(|fb| {
+                        s.config.accounts.iter().find(|a| a.name == fb && !tried.contains(&a.name))
+                    })
+                })
         } else {
             router::pick_account(
                 &s.config.accounts, &s.state, &snap, fp_ref, &tried,
@@ -2678,6 +2711,73 @@ mod tests {
         let mut v = json!({ "model": CLASSIFIER_MODEL, "system": "You are a security monitor for autonomous AI coding agents." });
         assert!(!pin_model_to_classifier(&mut v), "already on classifier model → no change");
         assert_eq!(v["model"], json!(CLASSIFIER_MODEL));
+    }
+
+    /// Replicates Claude Code's auto-mode verdict parser `gKi`: it strips
+    /// <thinking>…</thinking>, then matches /<block>(yes|no)\b(<\/block>)?/i and
+    /// reads the first capture. Returns Some(true)=block, Some(false)=allow,
+    /// None=unparseable (which Claude Code treats as block / fail-closed).
+    /// This guards the contract our custom Hetzner classifier prompt must emit.
+    fn parse_claude_code_verdict(resp: &str) -> Option<bool> {
+        // Strip thinking blocks like Claude Code's AKi() does.
+        let mut cleaned = String::with_capacity(resp.len());
+        let mut rest = resp;
+        while let Some(start) = rest.find("<thinking>") {
+            cleaned.push_str(&rest[..start]);
+            match rest[start..].find("</thinking>") {
+                Some(end) => rest = &rest[start + end + "</thinking>".len()..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        cleaned.push_str(rest);
+        // First <block>yes|no marker (case-insensitive), word-boundary after.
+        let lower = cleaned.to_ascii_lowercase();
+        let idx = lower.find("<block>")?;
+        let after = &lower[idx + "<block>".len()..];
+        if let Some(v) = after.strip_prefix("yes") {
+            if v.is_empty() || !v.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                return Some(true);
+            }
+        }
+        if let Some(v) = after.strip_prefix("no") {
+            if v.is_empty() || !v.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                return Some(false);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn custom_classifier_outputs_parse_as_claude_code_verdicts() {
+        // The exact shapes our harness-classifier prompt instructs the Hetzner
+        // model to emit must parse under Claude Code's own grammar.
+        assert_eq!(parse_claude_code_verdict("<block>no</block>"), Some(false));
+        assert_eq!(
+            parse_claude_code_verdict(
+                "<block>yes</block><category>Protected Mainline Push</category>\
+                 <reason>[Protected Mainline Push] direct push to main</reason>"
+            ),
+            Some(true)
+        );
+        // Thinking prefix is stripped before the marker is read.
+        assert_eq!(
+            parse_claude_code_verdict("<thinking>looks safe</thinking><block>no</block>"),
+            Some(false)
+        );
+        // A reply with no <block> marker is a parse failure -> Claude Code blocks.
+        assert_eq!(parse_claude_code_verdict("I think this is fine."), None);
+    }
+
+    #[test]
+    fn custom_classifier_prompt_file_declares_the_verdict_contract() {
+        // Ship-time guard: the example prompt must still tell the model to
+        // emit the <block> grammar, or every verdict silently fails closed.
+        let prompt = include_str!("../examples/classifier-harness-prompt.txt");
+        assert!(prompt.contains("<block>no</block>"), "prompt must show the allow token");
+        assert!(prompt.contains("<block>yes</block>"), "prompt must show the block token");
     }
 
     #[test]
