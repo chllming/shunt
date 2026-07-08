@@ -1048,13 +1048,16 @@ async fn proxy_handler(
             }
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
-                // Add 30s to burst-limit retry-after to prevent immediate re-selection:
-                // after a burst 429, maximus would pick the same account again (its 5h/7d
-                // quota looks fine), immediately hitting the limit again. The 30s buffer
-                // gives other accounts time in the window before this one recovers.
-                let retry_after_ms = parse_retry_after_ms(response.headers())
-                    .map(|ms| ms.saturating_add(30_000));
                 let is_exhausted = is_exhausted_response(info.as_ref());
+                // Only stagger EXHAUSTED accounts: after a real quota-drain 429,
+                // re-selecting the same account immediately would just hit the
+                // wall again, so add 30s so other accounts get the window first.
+                // Burst (non-exhausted) 429s clear in seconds and the account
+                // still has quota, so honor Anthropic's retry-after as-is and let
+                // compute_429_cooldown_ms keep the bench short — over-parking a
+                // healthy lane is what drains the pool under many agents.
+                let retry_after_ms = parse_retry_after_ms(response.headers())
+                    .map(|ms| if is_exhausted { ms.saturating_add(30_000) } else { ms });
                 let cooldown_ms = compute_429_cooldown_ms(info.as_ref(), retry_after_ms, is_exhausted);
                 warn!(account = %account_name, cooldown_ms, exhausted = is_exhausted, "429 rate-limited — cooling");
                 if let Some(info) = info {
@@ -2419,7 +2422,14 @@ fn is_exhausted_response(info: Option<&RateLimitInfo>) -> bool {
 /// delay (seconds, occasionally given as `retry-after-ms`).
 fn compute_429_cooldown_ms(info: Option<&RateLimitInfo>, retry_after_ms: Option<u64>, is_exhausted: bool) -> u64 {
     const MAX_EXHAUSTED_COOLDOWN_MS: u64 = 5 * 60_000;
-    const MAX_BURST_COOLDOWN_MS: u64 = 2 * 60_000;
+    // A burst (non-exhausted) 429 means the account still has 5h/7d quota and
+    // only tripped Anthropic's short-term rate/concurrency limit, which clears
+    // in seconds. Parking it for minutes drains an otherwise-healthy pool under
+    // many concurrent agents, so keep the burst bench short: honor retry-after
+    // but cap it low. Exhaustion (real quota drain) still cools until reset.
+    const BURST_DEFAULT_MS: u64 = 5_000;
+    const BURST_MIN_MS: u64 = 2_000;
+    const MAX_BURST_COOLDOWN_MS: u64 = 15_000;
     if is_exhausted {
         info.and_then(|i| i.reset_5h.or(i.reset_7d))
             .map(|reset_secs| {
@@ -2430,7 +2440,9 @@ fn compute_429_cooldown_ms(info: Option<&RateLimitInfo>, retry_after_ms: Option<
             .unwrap_or(90_000)
             .min(MAX_EXHAUSTED_COOLDOWN_MS)
     } else {
-        retry_after_ms.unwrap_or(60_000).min(MAX_BURST_COOLDOWN_MS)
+        retry_after_ms
+            .unwrap_or(BURST_DEFAULT_MS)
+            .clamp(BURST_MIN_MS, MAX_BURST_COOLDOWN_MS)
     }
 }
 
@@ -2736,23 +2748,32 @@ mod tests {
     }
 
     #[test]
-    fn burst_429_uses_retry_after() {
+    fn burst_429_uses_retry_after_within_short_cap() {
         let info = make_info(Some("allowed"), Some(future_secs()), Some("allowed"), None);
-        let retry_ms = Some(45_000u64); // 45s (15s retry-after + 30s buffer)
-        let cd = compute_429_cooldown_ms(Some(&info), retry_ms, false);
-        assert_eq!(cd, 45_000, "burst 429 should use retry_after directly");
+        // A small retry-after is honored as-is (burst limits clear in seconds).
+        let cd = compute_429_cooldown_ms(Some(&info), Some(8_000), false);
+        assert_eq!(cd, 8_000, "burst 429 should honor a short retry_after");
     }
 
     #[test]
-    fn burst_429_caps_at_2_min() {
+    fn burst_429_caps_at_15s() {
+        // Burst cooldown must stay short so a healthy pool is not drained; even a
+        // large retry-after is clamped to the 15s burst cap.
         let cd = compute_429_cooldown_ms(None, Some(999_999), false);
-        assert_eq!(cd, 2 * 60_000, "burst cooldown should cap at 2 min");
+        assert_eq!(cd, 15_000, "burst cooldown should cap at 15s");
     }
 
     #[test]
     fn burst_429_default_when_no_retry_after() {
         let cd = compute_429_cooldown_ms(None, None, false);
-        assert_eq!(cd, 60_000, "burst cooldown should default to 60s");
+        assert_eq!(cd, 5_000, "burst cooldown should default to 5s");
+    }
+
+    #[test]
+    fn burst_429_floor_prevents_thrash() {
+        // A tiny/zero retry-after is floored so we don't hot-loop the account.
+        let cd = compute_429_cooldown_ms(None, Some(100), false);
+        assert_eq!(cd, 2_000, "burst cooldown should floor at 2s");
     }
 
     #[test]
