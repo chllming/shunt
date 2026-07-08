@@ -1017,6 +1017,16 @@ async fn proxy_handler(
                             "included quota spent with overage disabled — cooling to avoid buy-more prompt");
                         s.state.update_rate_limits(&account_name, info);
                         s.state.set_cooldown(&account_name, cool_ms);
+                    } else if near_cap_7d_warning(&info) {
+                        // Proactive buy-more avoidance: the 7d window is within
+                        // ~10% of the weekly cap. Cool briefly so routing prefers
+                        // fresher accounts and Claude Code doesn't tip this one
+                        // over its included quota. Still succeeds this turn.
+                        let util = info.utilization_7d.unwrap_or_default();
+                        warn!(account = %account_name, util, cool_ms = NEAR_CAP_COOL_MS,
+                            "7d window near weekly cap — cooling briefly to avoid buy-more prompt");
+                        s.state.update_rate_limits(&account_name, info);
+                        s.state.set_cooldown(&account_name, NEAR_CAP_COOL_MS);
                     } else {
                         s.state.update_rate_limits(&account_name, info);
                     }
@@ -2350,6 +2360,41 @@ fn overage_exhausted_reset(info: &RateLimitInfo) -> Option<u64> {
     }
 }
 
+/// Utilization at which a 7-day window in `allowed_warning` is treated as
+/// "about to tip into the weekly cap". Above this, we briefly cool the account
+/// so routing prefers fresher lanes — keeping Claude Code from landing on an
+/// account right as it crosses its included weekly quota (which surfaces the
+/// buy-more/upgrade prompt). Left generous (10% headroom) so accounts stay
+/// usable as a last resort when everything fresher is cooling.
+const NEAR_CAP_7D_UTILIZATION: f64 = 0.9;
+
+/// Soft-deprioritize cooldown for a near-cap 7d window. Short on purpose: it
+/// nudges routing toward fresher accounts without removing capacity for long,
+/// and re-applies each time the account is used while still near the cap.
+const NEAR_CAP_COOL_MS: u64 = 2 * 60_000;
+
+/// Detect a 7-day window that is at/over [`NEAR_CAP_7D_UTILIZATION`] while
+/// Anthropic still reports it usable (`allowed_warning`) or already `exhausted`.
+/// Complements [`overage_exhausted_reset`], which only fires when the
+/// `overage-status` header is present; most subscriptions don't send it, so
+/// this utilization-based check is what actually protects them. Returns true
+/// when the account should be briefly cooled.
+fn near_cap_7d_warning(info: &RateLimitInfo) -> bool {
+    let util_high = info.utilization_7d.map(|u| u >= NEAR_CAP_7D_UTILIZATION).unwrap_or(false);
+    if !util_high {
+        return false;
+    }
+    // Only when the reset is still in the future (otherwise the window is about
+    // to roll over and there is nothing to protect).
+    let now_secs = now_ms() / 1_000;
+    let reset_future = info.reset_7d.map(|r| r > now_secs).unwrap_or(false);
+    let warning_or_exhausted = matches!(
+        info.status_7d.as_deref(),
+        Some("allowed_warning") | Some("warning") | Some("exhausted")
+    );
+    reset_future && warning_or_exhausted
+}
+
 fn is_exhausted_response(info: Option<&RateLimitInfo>) -> bool {
     let Some(info) = info else { return false };
     let now_secs = now_ms() / 1_000;
@@ -2982,6 +3027,46 @@ mod tests {
         assert!(!v.contains("thinking"), "thinking beta removed");
         assert!(!v.contains("effort"), "effort beta removed");
         assert!(v.contains("oauth-2025-04-20"), "unrelated beta preserved");
+    }
+
+    #[test]
+    fn near_cap_7d_warning_fires_only_near_cap_and_future_reset() {
+        let now = now_ms() / 1_000;
+        // At/over threshold + allowed_warning + future reset -> cool.
+        assert!(near_cap_7d_warning(&crate::state::RateLimitInfo {
+            utilization_7d: Some(0.92),
+            reset_7d: Some(now + 3600),
+            status_7d: Some("allowed_warning".into()),
+            ..Default::default()
+        }));
+        // Exhausted also qualifies.
+        assert!(near_cap_7d_warning(&crate::state::RateLimitInfo {
+            utilization_7d: Some(0.99),
+            reset_7d: Some(now + 3600),
+            status_7d: Some("exhausted".into()),
+            ..Default::default()
+        }));
+        // Below threshold -> leave it alone (this is the common "fresh" case).
+        assert!(!near_cap_7d_warning(&crate::state::RateLimitInfo {
+            utilization_7d: Some(0.64),
+            reset_7d: Some(now + 3600),
+            status_7d: Some("allowed_warning".into()),
+            ..Default::default()
+        }));
+        // High util but plain "allowed" (no warning) -> not our signal.
+        assert!(!near_cap_7d_warning(&crate::state::RateLimitInfo {
+            utilization_7d: Some(0.95),
+            reset_7d: Some(now + 3600),
+            status_7d: Some("allowed".into()),
+            ..Default::default()
+        }));
+        // Reset already past -> nothing to protect.
+        assert!(!near_cap_7d_warning(&crate::state::RateLimitInfo {
+            utilization_7d: Some(0.95),
+            reset_7d: Some(now.saturating_sub(10)),
+            status_7d: Some("allowed_warning".into()),
+            ..Default::default()
+        }));
     }
 
     #[test]
