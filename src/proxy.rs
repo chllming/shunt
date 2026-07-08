@@ -671,6 +671,18 @@ async fn proxy_handler(
                     Ok(prompt) if !prompt.trim().is_empty() => {
                         val["system"] = serde_json::Value::String(prompt);
                         changed = true;
+                        // A self-hosted small model has a bounded context window
+                        // (e.g. 32K). Claude Code's classifier transcript can be
+                        // far larger; if the prompt overflows, the backend
+                        // truncates it, the model loses the `<block>` instruction
+                        // and answers in prose, and the unparseable verdict fails
+                        // closed — silently blocking everything. The action under
+                        // review is the LAST tool call at the end of the
+                        // transcript, so keep the tail of any oversized text and
+                        // drop the earlier history (context only).
+                        if bound_classifier_transcript(&mut val, CLASSIFIER_MAX_TRANSCRIPT_CHARS) {
+                            changed = true;
+                        }
                     }
                     Ok(_) => {
                         warn!(path, "classifier_system_prompt_path is empty — keeping Claude Code's prompt");
@@ -1005,6 +1017,16 @@ async fn proxy_handler(
                             "included quota spent with overage disabled — cooling to avoid buy-more prompt");
                         s.state.update_rate_limits(&account_name, info);
                         s.state.set_cooldown(&account_name, cool_ms);
+                    } else if near_cap_7d_warning(&info) {
+                        // Proactive buy-more avoidance: the 7d window is within
+                        // ~10% of the weekly cap. Cool briefly so routing prefers
+                        // fresher accounts and Claude Code doesn't tip this one
+                        // over its included quota. Still succeeds this turn.
+                        let util = info.utilization_7d.unwrap_or_default();
+                        warn!(account = %account_name, util, cool_ms = NEAR_CAP_COOL_MS,
+                            "7d window near weekly cap — cooling briefly to avoid buy-more prompt");
+                        s.state.update_rate_limits(&account_name, info);
+                        s.state.set_cooldown(&account_name, NEAR_CAP_COOL_MS);
                     } else {
                         s.state.update_rate_limits(&account_name, info);
                     }
@@ -2338,6 +2360,41 @@ fn overage_exhausted_reset(info: &RateLimitInfo) -> Option<u64> {
     }
 }
 
+/// Utilization at which a 7-day window in `allowed_warning` is treated as
+/// "about to tip into the weekly cap". Above this, we briefly cool the account
+/// so routing prefers fresher lanes — keeping Claude Code from landing on an
+/// account right as it crosses its included weekly quota (which surfaces the
+/// buy-more/upgrade prompt). Left generous (10% headroom) so accounts stay
+/// usable as a last resort when everything fresher is cooling.
+const NEAR_CAP_7D_UTILIZATION: f64 = 0.9;
+
+/// Soft-deprioritize cooldown for a near-cap 7d window. Short on purpose: it
+/// nudges routing toward fresher accounts without removing capacity for long,
+/// and re-applies each time the account is used while still near the cap.
+const NEAR_CAP_COOL_MS: u64 = 2 * 60_000;
+
+/// Detect a 7-day window that is at/over [`NEAR_CAP_7D_UTILIZATION`] while
+/// Anthropic still reports it usable (`allowed_warning`) or already `exhausted`.
+/// Complements [`overage_exhausted_reset`], which only fires when the
+/// `overage-status` header is present; most subscriptions don't send it, so
+/// this utilization-based check is what actually protects them. Returns true
+/// when the account should be briefly cooled.
+fn near_cap_7d_warning(info: &RateLimitInfo) -> bool {
+    let util_high = info.utilization_7d.map(|u| u >= NEAR_CAP_7D_UTILIZATION).unwrap_or(false);
+    if !util_high {
+        return false;
+    }
+    // Only when the reset is still in the future (otherwise the window is about
+    // to roll over and there is nothing to protect).
+    let now_secs = now_ms() / 1_000;
+    let reset_future = info.reset_7d.map(|r| r > now_secs).unwrap_or(false);
+    let warning_or_exhausted = matches!(
+        info.status_7d.as_deref(),
+        Some("allowed_warning") | Some("warning") | Some("exhausted")
+    );
+    reset_future && warning_or_exhausted
+}
+
 fn is_exhausted_response(info: Option<&RateLimitInfo>) -> bool {
     let Some(info) = info else { return false };
     let now_secs = now_ms() / 1_000;
@@ -2513,6 +2570,100 @@ fn is_safety_classifier(val: &serde_json::Value) -> bool {
 /// valid allow/block verdict. Claude Code ignores `CLAUDE_CODE_AUTO_MODE_MODEL`,
 /// so the proxy is the only place this redirect can happen.
 const CLASSIFIER_MODEL: &str = "claude-haiku-4-5-20251001";
+
+/// Character budget for the classifier transcript when a custom (self-hosted)
+/// prompt is used. A small model has a bounded context window (~32K tokens);
+/// this keeps the transcript tail well inside it (~20-25K tokens) with room for
+/// the system prompt and the verdict. Only applied on the custom-prompt path.
+const CLASSIFIER_MAX_TRANSCRIPT_CHARS: usize = 80_000;
+
+/// Bound the total size of a classifier request so it cannot overflow a small
+/// model's context window. Claude Code puts the action under review at the END
+/// (the last tool call, then the "<block> immediately" suffix), so when the
+/// text is too large we keep the TAIL and drop earlier history — which is
+/// context only. This is total-aware across the whole `messages` array and
+/// robust to either shape Claude Code uses: one big string, or many small
+/// `{type,text}` content blocks. We walk text from the FRONT, blanking whole
+/// blocks/messages until the remaining total fits, then partially trim the
+/// boundary block. The final text block (the action + verdict suffix) is always
+/// preserved. Returns true if anything was trimmed.
+fn bound_classifier_transcript(val: &mut serde_json::Value, max_chars: usize) -> bool {
+    const NOTICE: &str = "[earlier transcript truncated to fit classifier context]\n";
+    let Some(messages) = val.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return false;
+    };
+    if messages.is_empty() {
+        return false;
+    }
+    // Total text across every message/block. Note: each retained message also
+    // costs chat-template envelope tokens, so blanking text but keeping
+    // thousands of empty messages does NOT help. We therefore collapse to the
+    // FINAL message (which carries the <transcript>, the action under review as
+    // its last tool call, and the "<block> immediately" suffix) and drop all
+    // earlier conversation, which is context only for the classifier.
+    let text_len = |m: &serde_json::Value| -> usize {
+        match m.get("content") {
+            Some(serde_json::Value::String(s)) => s.chars().count(),
+            Some(serde_json::Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .map(|t| t.chars().count())
+                .sum(),
+            _ => 0,
+        }
+    };
+    let total: usize = messages.iter().map(|m| text_len(m)).sum();
+    let dropping_earlier = messages.len() > 1;
+    // Keep only the last message.
+    let mut last = messages.pop().expect("non-empty");
+    let last_len = text_len(&last);
+
+    // Within the last message, trim from the front if it alone still overflows.
+    let mut trimmed_last = false;
+    if last_len > max_chars {
+        match last.get_mut("content") {
+            Some(serde_json::Value::String(s)) => {
+                let n = s.chars().count();
+                let tail: String = s.chars().skip(n - max_chars).collect();
+                *s = format!("{NOTICE}{tail}");
+                trimmed_last = true;
+            }
+            Some(serde_json::Value::Array(blocks)) => {
+                // Keep whole blocks from the END until we hit the budget; always
+                // keep the final block (holds the action + verdict suffix).
+                let mut kept: std::collections::VecDeque<serde_json::Value> = Default::default();
+                let mut acc = 0usize;
+                for b in blocks.iter().rev() {
+                    let l = b.get("text").and_then(|t| t.as_str()).map(|t| t.chars().count()).unwrap_or(0);
+                    if kept.is_empty() || acc + l <= max_chars {
+                        acc += l;
+                        kept.push_front(b.clone());
+                    } else {
+                        break;
+                    }
+                }
+                // If the single kept block still overflows, trim its front.
+                if kept.len() == 1 {
+                    if let Some(t) = kept[0].get("text").and_then(|t| t.as_str()) {
+                        let n = t.chars().count();
+                        if n > max_chars {
+                            let tail: String = t.chars().skip(n - max_chars).collect();
+                            kept[0]["text"] = serde_json::Value::String(format!("{NOTICE}{tail}"));
+                        }
+                    }
+                }
+                *blocks = kept.into_iter().collect();
+                trimmed_last = true;
+            }
+            _ => {}
+        }
+    }
+    messages.clear();
+    messages.push(last);
+
+    // Only report a change when we actually altered the payload.
+    (dropping_earlier && total > max_chars) || trimmed_last
+}
 
 /// Rewrite a classifier request's `model` to [`CLASSIFIER_MODEL`], leaving every
 /// other field — crucially the `system` array with its `x-anthropic-billing-header`
@@ -2772,8 +2923,49 @@ mod tests {
     }
 
     #[test]
+    fn bound_classifier_transcript_keeps_tail_when_oversized() {
+        // The action under review is at the END; trimming must preserve it.
+        let head = "x".repeat(50);
+        let action = "\nAssistant tool call: run_command {\"command\":\"git status\"}</transcript>\nErr on the side of blocking. <block> immediately.";
+        let big = format!("<transcript>\n{head}{action}");
+        let mut v = json!({"messages":[{"role":"user","content": big}]});
+        assert!(bound_classifier_transcript(&mut v, 60));
+        let out = v["messages"][0]["content"].as_str().unwrap();
+        assert!(out.contains("truncated to fit"), "notice prepended");
+        assert!(out.contains("<block> immediately."), "tail (the action) preserved");
+        assert!(out.chars().count() <= 60 + 80, "trimmed near budget");
+        // Under-budget content is left untouched.
+        let mut small = json!({"messages":[{"role":"user","content":"short"}]});
+        assert!(!bound_classifier_transcript(&mut small, 60));
+        assert_eq!(small["messages"][0]["content"], json!("short"));
+    }
+
+    #[test]
+    fn bound_classifier_transcript_trims_across_many_messages() {
+        // Real Claude Code shape: bulk of tokens spread across many prior
+        // messages, action at the end. Total must be bounded and the last
+        // slot (the action) preserved.
+        let mut msgs = Vec::new();
+        for i in 0..500 {
+            msgs.push(json!({"role":"assistant","content": format!("step {i} ran a command with some padding text here")}));
+            msgs.push(json!({"role":"user","content":"ok continue"}));
+        }
+        msgs.push(json!({"role":"user","content":"ACTION git push origin main </transcript> <block> immediately."}));
+        let mut v = json!({"messages": msgs});
+        let before: usize = v["messages"].as_array().unwrap().iter()
+            .filter_map(|m| m["content"].as_str()).map(|s| s.chars().count()).sum();
+        assert!(bound_classifier_transcript(&mut v, 2000), "should trim; before={before}");
+        let after: usize = v["messages"].as_array().unwrap().iter()
+            .filter_map(|m| m["content"].as_str()).map(|s| s.chars().count()).sum();
+        assert!(after <= 2000 + 120, "bounded near budget, got {after}");
+        // The action (last slot) survives.
+        let last = v["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();
+        assert!(last.contains("git push origin main"), "action preserved: {last}");
+    }
+
+    #[test]
     fn custom_classifier_prompt_file_declares_the_verdict_contract() {
-        // Ship-time guard: the example prompt must still tell the model to
+        // Ship-time guard: the checked-in prompt must still tell the model to
         // emit the <block> grammar, or every verdict silently fails closed.
         let prompt = include_str!("../examples/classifier-harness-prompt.txt");
         assert!(prompt.contains("<block>no</block>"), "prompt must show the allow token");
@@ -2835,6 +3027,46 @@ mod tests {
         assert!(!v.contains("thinking"), "thinking beta removed");
         assert!(!v.contains("effort"), "effort beta removed");
         assert!(v.contains("oauth-2025-04-20"), "unrelated beta preserved");
+    }
+
+    #[test]
+    fn near_cap_7d_warning_fires_only_near_cap_and_future_reset() {
+        let now = now_ms() / 1_000;
+        // At/over threshold + allowed_warning + future reset -> cool.
+        assert!(near_cap_7d_warning(&crate::state::RateLimitInfo {
+            utilization_7d: Some(0.92),
+            reset_7d: Some(now + 3600),
+            status_7d: Some("allowed_warning".into()),
+            ..Default::default()
+        }));
+        // Exhausted also qualifies.
+        assert!(near_cap_7d_warning(&crate::state::RateLimitInfo {
+            utilization_7d: Some(0.99),
+            reset_7d: Some(now + 3600),
+            status_7d: Some("exhausted".into()),
+            ..Default::default()
+        }));
+        // Below threshold -> leave it alone (this is the common "fresh" case).
+        assert!(!near_cap_7d_warning(&crate::state::RateLimitInfo {
+            utilization_7d: Some(0.64),
+            reset_7d: Some(now + 3600),
+            status_7d: Some("allowed_warning".into()),
+            ..Default::default()
+        }));
+        // High util but plain "allowed" (no warning) -> not our signal.
+        assert!(!near_cap_7d_warning(&crate::state::RateLimitInfo {
+            utilization_7d: Some(0.95),
+            reset_7d: Some(now + 3600),
+            status_7d: Some("allowed".into()),
+            ..Default::default()
+        }));
+        // Reset already past -> nothing to protect.
+        assert!(!near_cap_7d_warning(&crate::state::RateLimitInfo {
+            utilization_7d: Some(0.95),
+            reset_7d: Some(now.saturating_sub(10)),
+            status_7d: Some("allowed_warning".into()),
+            ..Default::default()
+        }));
     }
 
     #[test]
