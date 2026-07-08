@@ -671,6 +671,18 @@ async fn proxy_handler(
                     Ok(prompt) if !prompt.trim().is_empty() => {
                         val["system"] = serde_json::Value::String(prompt);
                         changed = true;
+                        // A self-hosted small model has a bounded context window
+                        // (e.g. 32K). Claude Code's classifier transcript can be
+                        // far larger; if the prompt overflows, the backend
+                        // truncates it, the model loses the `<block>` instruction
+                        // and answers in prose, and the unparseable verdict fails
+                        // closed — silently blocking everything. The action under
+                        // review is the LAST tool call at the end of the
+                        // transcript, so keep the tail of any oversized text and
+                        // drop the earlier history (context only).
+                        if bound_classifier_transcript(&mut val, CLASSIFIER_MAX_TRANSCRIPT_CHARS) {
+                            changed = true;
+                        }
                     }
                     Ok(_) => {
                         warn!(path, "classifier_system_prompt_path is empty — keeping Claude Code's prompt");
@@ -2514,6 +2526,70 @@ fn is_safety_classifier(val: &serde_json::Value) -> bool {
 /// so the proxy is the only place this redirect can happen.
 const CLASSIFIER_MODEL: &str = "claude-haiku-4-5-20251001";
 
+/// Character budget for the classifier transcript when a custom (self-hosted)
+/// prompt is used. A small model has a bounded context window (~32K tokens);
+/// this keeps the transcript tail well inside it (~20-25K tokens) with room for
+/// the system prompt and the verdict. Only applied on the custom-prompt path.
+const CLASSIFIER_MAX_TRANSCRIPT_CHARS: usize = 80_000;
+
+/// Bound the size of the classifier transcript so it cannot overflow a small
+/// model's context window. Claude Code puts the action under review at the END
+/// of the transcript (the last tool call) and the "<block> immediately" suffix
+/// after it, so when the text is too large we keep the TAIL and drop earlier
+/// history (which is context only). Operates on the last message's `content`,
+/// which may be a plain string or an array of content blocks. Returns true if
+/// anything was trimmed.
+fn bound_classifier_transcript(val: &mut serde_json::Value, max_chars: usize) -> bool {
+    let Some(messages) = val.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return false;
+    };
+    let Some(last) = messages.last_mut() else { return false };
+    const NOTICE: &str = "[earlier transcript truncated to fit classifier context]\n";
+    match last.get_mut("content") {
+        Some(serde_json::Value::String(s)) => {
+            let n = s.chars().count();
+            if n <= max_chars {
+                return false;
+            }
+            let tail: String = s.chars().skip(n - max_chars).collect();
+            *s = format!("{NOTICE}{tail}");
+            true
+        }
+        Some(serde_json::Value::Array(blocks)) => {
+            let total: usize = blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .map(|t| t.chars().count())
+                .sum();
+            if total <= max_chars {
+                return false;
+            }
+            // Trim the single largest text block (the transcript) from its
+            // front, leaving smaller blocks (e.g. the stage suffix) intact.
+            let mut idx = None;
+            let mut best = 0usize;
+            for (i, b) in blocks.iter().enumerate() {
+                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                    let l = t.chars().count();
+                    if l > best {
+                        best = l;
+                        idx = Some(i);
+                    }
+                }
+            }
+            let Some(i) = idx else { return false };
+            let overflow = total - max_chars;
+            let text = blocks[i]["text"].as_str().unwrap_or("").to_owned();
+            let tn = text.chars().count();
+            let keep = tn.saturating_sub(overflow);
+            let tail: String = text.chars().skip(tn - keep).collect();
+            blocks[i]["text"] = serde_json::Value::String(format!("{NOTICE}{tail}"));
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Rewrite a classifier request's `model` to [`CLASSIFIER_MODEL`], leaving every
 /// other field — crucially the `system` array with its `x-anthropic-billing-header`
 /// block — untouched. Returns true if the model changed.
@@ -2772,8 +2848,26 @@ mod tests {
     }
 
     #[test]
+    fn bound_classifier_transcript_keeps_tail_when_oversized() {
+        // The action under review is at the END; trimming must preserve it.
+        let head = "x".repeat(50);
+        let action = "\nAssistant tool call: run_command {\"command\":\"git status\"}</transcript>\nErr on the side of blocking. <block> immediately.";
+        let big = format!("<transcript>\n{head}{action}");
+        let mut v = json!({"messages":[{"role":"user","content": big}]});
+        assert!(bound_classifier_transcript(&mut v, 60));
+        let out = v["messages"][0]["content"].as_str().unwrap();
+        assert!(out.contains("truncated to fit"), "notice prepended");
+        assert!(out.contains("<block> immediately."), "tail (the action) preserved");
+        assert!(out.chars().count() <= 60 + 80, "trimmed near budget");
+        // Under-budget content is left untouched.
+        let mut small = json!({"messages":[{"role":"user","content":"short"}]});
+        assert!(!bound_classifier_transcript(&mut small, 60));
+        assert_eq!(small["messages"][0]["content"], json!("short"));
+    }
+
+    #[test]
     fn custom_classifier_prompt_file_declares_the_verdict_contract() {
-        // Ship-time guard: the example prompt must still tell the model to
+        // Ship-time guard: the checked-in prompt must still tell the model to
         // emit the <block> grammar, or every verdict silently fails closed.
         let prompt = include_str!("../examples/classifier-harness-prompt.txt");
         assert!(prompt.contains("<block>no</block>"), "prompt must show the allow token");
