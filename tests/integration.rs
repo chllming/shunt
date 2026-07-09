@@ -518,8 +518,8 @@ async fn test_stickiness_same_conversation() {
 }
 
 #[tokio::test]
-async fn test_all_accounts_exhausted_returns_503() {
-    // All accounts return 429 → proxy returns 503
+async fn test_all_accounts_exhausted_returns_backpressure_429() {
+    // All accounts return 429 → proxy returns graceful 429 + Retry-After
     let caps = Captures::default();
     let upstream = TestServer::start(make_mock_upstream(caps.clone(), false, 429)).await;
 
@@ -559,6 +559,12 @@ async fn test_all_accounts_exhausted_returns_503() {
     // backpressure) instead of a hard 503, so clients back off and retry
     // rather than failing the run.
     assert_eq!(resp.status(), 429);
+    let retry_after: u64 = resp.headers()
+        .get("retry-after")
+        .expect("backpressure 429 must carry Retry-After")
+        .to_str().unwrap()
+        .parse().expect("Retry-After must be integer seconds");
+    assert!((1..=30).contains(&retry_after), "Retry-After clamped to 1-30s, got {retry_after}");
     // Both accounts were tried
     assert_eq!(caps.len(), 2);
 }
@@ -1037,6 +1043,168 @@ async fn test_interop_failover_anthropic_to_openai() {
     // Client got Anthropic-format response
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["type"], "message", "client must receive Anthropic-format response");
+}
+
+// ---------------------------------------------------------------------------
+// API overflow lane: warm-start graduation + saturation must not starve
+// ---------------------------------------------------------------------------
+
+/// Mock upstream that counts hits and optionally delays before answering 200.
+/// The delay lets concurrent requests accumulate in-flight so the AIMD
+/// admission limiter actually saturates during the test.
+fn make_counting_upstream(hits: Arc<std::sync::atomic::AtomicUsize>, delay_ms: u64) -> Router {
+    Router::new().route("/v1/messages", post(move |_req: Request| {
+        let hits = hits.clone();
+        async move {
+            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            axum::Json(json!({"id":"msg_ok","type":"message","content":[{"type":"text","text":"ok"}],
+                "usage":{"input_tokens":1,"output_tokens":1}}))
+        }
+    }))
+}
+
+fn api_overflow_account(upstream_url: String) -> AccountConfig {
+    AccountConfig {
+        name: "api-overflow".into(),
+        plan_type: "api".into(),
+        provider: Provider::AnthropicApi,
+        credential: Some(Credential::Apikey { key: "sk-ant-test-overflow".into() }),
+        upstream_url: Some(upstream_url),
+        model: None,
+    }
+}
+
+async fn setup_overflow(
+    warmup_requests: u64,
+    warmup_ms: u64,
+    sub_delay_ms: u64,
+    api_delay_ms: u64,
+) -> (TestServer, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>, Client) {
+    let sub_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let api_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sub_up = TestServer::start(make_counting_upstream(sub_hits.clone(), sub_delay_ms)).await;
+    let api_up = TestServer::start(make_counting_upstream(api_hits.clone(), api_delay_ms)).await;
+
+    let cfg = Config {
+        server: ServerConfig {
+            upstream_url: sub_up.url(),
+            host: "127.0.0.1".into(),
+            port: 0,
+            log_level: "error".into(),
+            request_timeout_secs: 8,
+            max_startup_wait_ms: 5_000,
+            ..ServerConfig::default()
+        },
+        accounts: vec![test_account(), api_overflow_account(api_up.url())],
+        config_file: std::path::PathBuf::from("/dev/null"),
+        model_mapping: Default::default(),
+        api_overflow: shunt::config::ApiOverflowConfig {
+            enabled: true,
+            account: Some("api-overflow".into()),
+            daily_budget_usd: 100.0,
+            warmup_requests,
+            warmup_ms,
+        },
+    };
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let proxy = TestServer::start(app).await;
+    // Keep the upstream TestServers alive for the whole test by leaking their
+    // shutdown handles into the proxy tuple's lifetime (they are moved into the
+    // closure-captured hit counters' scope otherwise). Simplest: forget them.
+    std::mem::forget(sub_up);
+    std::mem::forget(api_up);
+    (proxy, sub_hits, api_hits, Client::new())
+}
+
+/// Warm-start graduation: a traced session's first `warmup_requests` go to the
+/// API overflow lane, then requests switch to the subscription pool. Regression
+/// for the OR-of-count-and-age bug where a burst inside `warmup_ms` never
+/// graduated and every request stayed on the paid lane.
+#[tokio::test]
+async fn test_warm_start_graduates_to_subscriptions() {
+    let (proxy, sub_hits, api_hits, client) = setup_overflow(2, 60_000, 0, 0).await;
+
+    for i in 0..5 {
+        let resp = client
+            .post(format!("{}/v1/messages", proxy.url()))
+            .header("content-type", "application/json")
+            .header("x-shunt-trace", "trace-graduation")
+            .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#)
+            .send().await.unwrap();
+        assert_eq!(resp.status(), 200, "request {i} failed");
+    }
+
+    assert_eq!(
+        api_hits.load(std::sync::atomic::Ordering::SeqCst), 2,
+        "exactly warmup_requests=2 requests must use the API lane"
+    );
+    assert_eq!(
+        sub_hits.load(std::sync::atomic::Ordering::SeqCst), 3,
+        "requests after graduation must use the subscription pool"
+    );
+}
+
+/// Untraced requests never warm-start: with healthy subscriptions the API lane
+/// must stay untouched (it is a paid pressure-relief valve, not a peer).
+#[tokio::test]
+async fn test_untraced_requests_skip_api_lane() {
+    let (proxy, sub_hits, api_hits, client) = setup_overflow(3, 60_000, 0, 0).await;
+
+    for _ in 0..4 {
+        let resp = client
+            .post(format!("{}/v1/messages", proxy.url()))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#)
+            .send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    assert_eq!(api_hits.load(std::sync::atomic::Ordering::SeqCst), 0, "no trace → no warm-start");
+    assert_eq!(sub_hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+}
+
+/// Regression for the runtime-starvation freeze: a warm-start burst larger than
+/// the API lane's admission limit must overflow to the subscription pool (or
+/// wait on a yielding branch) — NOT spin select→admit-fail→continue forever.
+/// Before the fix, `api_lane_pick` ignored the `saturated` set, so every loop
+/// iteration re-picked the saturated lane with no await point; a 40-way burst
+/// starved every tokio worker and froze the daemon (even /health). This test
+/// hangs (fails) under that bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_warm_start_burst_beyond_admission_does_not_starve() {
+    // warmup high enough that ALL requests want warm-start; API lane slow (300ms)
+    // so its 4 admission slots (START_LIMIT) stay occupied while the rest arrive.
+    let (proxy, sub_hits, api_hits, client) = setup_overflow(100, 60_000, 0, 300).await;
+    let client = Arc::new(client);
+    let url = proxy.url();
+
+    let handles: Vec<_> = (0..12u32).map(|i| {
+        let c = client.clone();
+        let u = format!("{url}/v1/messages");
+        tokio::spawn(async move {
+            c.post(u)
+                .header("content-type", "application/json")
+                .header("x-shunt-trace", format!("trace-burst-{i}"))
+                .body(r#"{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"x"}]}"#)
+                .timeout(std::time::Duration::from_secs(15))
+                .send().await.map(|r| r.status().as_u16())
+        })
+    }).collect();
+
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        futures_util::future::join_all(handles),
+    ).await.expect("burst deadlocked the proxy — saturated API lane spun the select loop");
+
+    let statuses: Vec<u16> = results.into_iter().map(|r| r.unwrap().unwrap()).collect();
+    assert!(statuses.iter().all(|s| *s == 200), "all burst requests must succeed: {statuses:?}");
+    let api = api_hits.load(std::sync::atomic::Ordering::SeqCst);
+    let sub = sub_hits.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(api + sub, 12, "every request reached exactly one upstream");
+    assert!(sub > 0, "overflow beyond the lane's admission limit must spill to subscriptions");
 }
 
 // ---------------------------------------------------------------------------

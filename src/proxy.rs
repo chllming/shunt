@@ -65,7 +65,13 @@ fn warm_start_active(
     if map.len() > 4096 {
         map.retain(|_, (_, seen)| now.saturating_sub(*seen) < 3_600_000);
     }
-    served < warmup_requests || now.saturating_sub(first_seen) < warmup_ms
+    // Graduate at the EARLIER of the count or age bound (AND, not OR): warm-start
+    // is for a session's first few prompts to get going fast, then it switches to
+    // the free subscription pool. With OR, a burst of requests within warmup_ms
+    // would ALL stay on the paid lane (observed: 8 rapid requests never graduated)
+    // — that overspends and defeats "then switch". AND keeps it to the first
+    // warmup_requests, with warmup_ms as a safety cap for slow-trickle sessions.
+    served < warmup_requests && now.saturating_sub(first_seen) < warmup_ms
 }
 
 #[derive(Clone)]
@@ -940,9 +946,16 @@ async fn proxy_handler(
             None
         };
         // Resolve the API overflow account handle when the closure says it's usable.
-        let api_lane_pick = |tried: &HashSet<String>| -> Option<&crate::config::AccountConfig> {
-            if !api_lane_usable(tried) { return None; }
+        // MUST also respect `saturated`: if the lane's admission slots are full and
+        // we keep re-picking it, the select→admit→saturate→continue cycle has no
+        // await point and spins forever, starving the whole tokio runtime (observed
+        // as a total daemon freeze under a 40-way warm-start burst). Skipping a
+        // saturated lane lets selection fall through to subs or the bounded
+        // wait-for-slot branch, both of which yield.
+        let api_lane_pick = |tried: &HashSet<String>, saturated: &HashSet<String>| -> Option<&crate::config::AccountConfig> {
             let name = api_lane_name.as_deref()?;
+            if saturated.contains(name) { return None; }
+            if !api_lane_usable(tried) { return None; }
             s.config.accounts.iter().find(|a| a.name == name)
         };
         let selected = if let Some(lane) = classifier_lane {
@@ -973,11 +986,11 @@ async fn proxy_handler(
             );
             if want_warm_start {
                 // Warm-start: prefer the API lane for fast startup, fall back to subs.
-                api_lane_pick(&tried).or(pick_sub)
+                api_lane_pick(&tried, &saturated).or(pick_sub)
             } else {
                 // Steady state: subscriptions first; spill to the API lane only when
                 // no subscription is available (overflow / never-timeout guarantee).
-                pick_sub.or_else(|| api_lane_pick(&tried))
+                pick_sub.or_else(|| api_lane_pick(&tried, &saturated))
             }
         };
         let account = match selected {
@@ -3382,19 +3395,22 @@ mod tests {
     }
 
     #[test]
-    fn warm_start_active_by_request_count_then_graduates() {
+    fn warm_start_graduates_after_count_within_age_window() {
         let warm = ParkingMutex::new(HashMap::new());
-        // warmup_requests=2, warmup_ms=0 so only the count gate applies.
-        assert!(warm_start_active(&warm, Some("t1"), 2, 0), "1st request warms");
-        assert!(warm_start_active(&warm, Some("t1"), 2, 0), "2nd request warms");
-        assert!(!warm_start_active(&warm, Some("t1"), 2, 0), "3rd graduates to subs");
+        // Count bound with a large age window (60s) so age never gates here:
+        // first `warmup_requests` warm, then graduate — the "first few prompts" case.
+        assert!(warm_start_active(&warm, Some("t1"), 2, 60_000), "1st request warms");
+        assert!(warm_start_active(&warm, Some("t1"), 2, 60_000), "2nd request warms");
+        assert!(!warm_start_active(&warm, Some("t1"), 2, 60_000), "3rd graduates to subs");
     }
 
     #[test]
-    fn warm_start_active_by_age_window() {
+    fn warm_start_age_is_a_cap_not_an_extender() {
         let warm = ParkingMutex::new(HashMap::new());
-        // warmup_requests=0 so only the age gate applies; large window keeps it warm.
-        assert!(warm_start_active(&warm, Some("t2"), 0, 60_000), "within age window warms");
+        // AND semantics: a 0ms age window graduates immediately even though the
+        // count bound (100) is not reached — age is a cap, never an extender.
+        // (Under the old OR bug, the count bound alone would have kept it warm.)
+        assert!(!warm_start_active(&warm, Some("t2"), 100, 0), "expired age window → not warm");
     }
 
     #[test]
