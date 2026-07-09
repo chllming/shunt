@@ -3368,6 +3368,7 @@ async fn serve_all_providers(
             },
             config_file: config.config_file.clone(),
             model_mapping: config.model_mapping.clone(),
+            api_overflow: config.api_overflow.clone(),
         };
 
         let anthropic_url = if provider == Provider::OpenAI {
@@ -3405,6 +3406,7 @@ async fn serve_all_providers(
         },
         config_file: config.config_file.clone(),
         model_mapping: config.model_mapping.clone(),
+        api_overflow: config.api_overflow.clone(),
     };
     let control_app = crate::proxy::create_control_app(control_config.clone(), state.clone())?;
     let control_listener = tokio::net::TcpListener::bind(format!("{host}:{control_port}"))

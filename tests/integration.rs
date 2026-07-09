@@ -187,6 +187,7 @@ async fn setup(streaming: bool, upstream_status: u16) -> (TestServer, TestServer
         accounts: vec![test_account()],
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
+        api_overflow: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -286,7 +287,8 @@ async fn test_streaming_forward() {
 
 #[tokio::test]
 async fn test_upstream_error_returned_to_client() {
-    // Single account returning 429 → all accounts exhausted → proxy returns 503
+    // Single account returning 429 → all accounts exhausted → proxy returns a
+    // graceful 429 + Retry-After (backpressure), not a hard 503.
     let (proxy, _up, _caps, client) = setup(false, 429).await;
     let resp = client
         .post(format!("{}/v1/messages", proxy.url()))
@@ -295,7 +297,7 @@ async fn test_upstream_error_returned_to_client() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 503);
+    assert_eq!(resp.status(), 429);
     assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["type"], "error");
 }
 
@@ -433,6 +435,7 @@ async fn setup_multi() -> (TestServer, TestServer, Captures, Client) {
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
+        api_overflow: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -484,6 +487,7 @@ async fn test_stickiness_same_conversation() {
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
+        api_overflow: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -527,12 +531,17 @@ async fn test_all_accounts_exhausted_returns_503() {
             log_level: "error".into(),
             // Short timeout: don't wait for cooldowns to expire during the test.
             request_timeout_secs: 1,
+            // Fail fast without re-trying recovered accounts during the wait,
+            // so each account is tried exactly once (cooling-wait is now bounded
+            // by this knob, not request_timeout_secs).
+            max_startup_wait_ms: 0,
             routing_strategy: RoutingStrategy::Carousel,
             ..ServerConfig::default()
         },
         accounts: vec![test_account(), test_account2()],
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
+        api_overflow: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -546,7 +555,10 @@ async fn test_all_accounts_exhausted_returns_503() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 503);
+    // All accounts unavailable now returns 429 + Retry-After (graceful
+    // backpressure) instead of a hard 503, so clients back off and retry
+    // rather than failing the run.
+    assert_eq!(resp.status(), 429);
     // Both accounts were tried
     assert_eq!(caps.len(), 2);
 }
@@ -636,6 +648,7 @@ async fn test_remote_key_auth() {
         accounts: vec![test_account()],
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
+        api_overflow: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -814,6 +827,7 @@ async fn test_interop_anthropic_request_to_openai_account() {
         accounts: vec![openai_account(openai_up.url())],
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
+        api_overflow: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -872,6 +886,7 @@ async fn test_interop_anthropic_streaming_to_openai_account() {
         accounts: vec![openai_account(openai_up.url())],
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
+        api_overflow: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -926,6 +941,7 @@ async fn test_interop_openai_request_to_anthropic_account() {
         }],
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
+        api_overflow: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -994,6 +1010,7 @@ async fn test_interop_failover_anthropic_to_openai() {
         ],
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
+        api_overflow: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -1058,6 +1075,7 @@ async fn test_live_api() {
         accounts: vec![AccountConfig { name: "live".into(), plan_type: "pro".into(), provider: Provider::default(), credential: Some(credential), upstream_url: None, model: None }],
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
+        api_overflow: Default::default(),
     };
 
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();

@@ -136,7 +136,13 @@ fn maximus_score(d: &AccountRoutingData, now_secs: u64, burst_rpm_limit: u32) ->
         1.0
     };
 
-    health_5h * health_7d * burst_penalty * pacing_penalty
+    // AIMD burst signal: an account that has been 429ing recently is close to
+    // its burst ceiling even if its quota windows look healthy and it isn't
+    // currently cooling. Fold it in so routing prefers genuinely calm lanes,
+    // not just "not cooling" ones (the effective-vs-apparent free-capacity gap).
+    let burst_429_penalty = (1.0 - d.recent_429).clamp(0.0, 1.0);
+
+    health_5h * health_7d * burst_penalty * pacing_penalty * burst_429_penalty
 }
 
 /// Helper: check if an account is a viable candidate from the snapshot.
@@ -163,6 +169,7 @@ fn get_data(name: &str, snap: &RoutingSnapshot) -> AccountRoutingData {
         reset_5h_secs: None,
         reset_7d_secs: None,
         burst_request_count: 0,
+        recent_429: 0.0,
     })
 }
 

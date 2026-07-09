@@ -37,6 +37,37 @@ fn shared_admission() -> crate::limiter::AdmissionLimiter {
     ADMISSION.get_or_init(crate::limiter::AdmissionLimiter::new).clone()
 }
 
+/// Process-wide warm-start map, shared across provider apps (same rationale as
+/// the admission limiter — one view of per-session request counts).
+static WARM_START: std::sync::OnceLock<Arc<ParkingMutex<HashMap<String, (u64, u64)>>>> = std::sync::OnceLock::new();
+
+fn shared_warm_start() -> Arc<ParkingMutex<HashMap<String, (u64, u64)>>> {
+    WARM_START.get_or_init(|| Arc::new(ParkingMutex::new(HashMap::new()))).clone()
+}
+
+/// Decide whether this request should warm-start on the API overflow lane:
+/// true while the session (identified by `trace`) is within its first
+/// `warmup_requests` OR younger than `warmup_ms`. Increments the per-trace
+/// counter as a side effect. Requests without a trace never warm-start.
+fn warm_start_active(
+    warm: &ParkingMutex<HashMap<String, (u64, u64)>>,
+    trace: Option<&str>,
+    warmup_requests: u64,
+    warmup_ms: u64,
+) -> bool {
+    let Some(trace) = trace else { return false };
+    let now = now_ms();
+    let mut map = warm.lock();
+    let entry = map.entry(trace.to_owned()).or_insert((0, now));
+    let (served, first_seen) = *entry;
+    entry.0 = served.saturating_add(1);
+    // Opportunistic prune to bound memory (sessions are short-lived).
+    if map.len() > 4096 {
+        map.retain(|_, (_, seen)| now.saturating_sub(*seen) < 3_600_000);
+    }
+    served < warmup_requests || now.saturating_sub(first_seen) < warmup_ms
+}
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
@@ -66,6 +97,10 @@ struct AppState {
     /// Adaptive per-account admission control (AIMD). Paces requests under each
     /// account's burst ceiling so the pool doesn't synchronise into a 429 storm.
     admission: crate::limiter::AdmissionLimiter,
+    /// Warm-start bookkeeping keyed by `x-shunt-trace`: (requests_served,
+    /// first_seen_ms). Lets a session's first prompts route to the API overflow
+    /// lane for fast startup, then graduate to the subscription pool.
+    warm_start: Arc<ParkingMutex<HashMap<String, (u64, u64)>>>,
 }
 
 /// Simple token-bucket for per-IP rate limiting.
@@ -133,6 +168,22 @@ fn build_app_state(
     anthropic_base_url: Option<String>,
     supabase: Option<Arc<SupabaseTelemetry>>,
 ) -> anyhow::Result<(AppState, LiveCredentials)> {
+    // Production sharing: proxy app and control app are built by separate calls
+    // and must share one AIMD/warm-start view, hence the process-wide statics.
+    build_app_state_with(config, state, anthropic_base_url, supabase, shared_admission(), shared_warm_start())
+}
+
+/// Like `build_app_state` but with an explicit admission limiter + warm-start
+/// map, so the combined single-process app (tests, single-port mode) can use a
+/// FRESH pair per app for isolation instead of the process-wide statics.
+fn build_app_state_with(
+    config: Config,
+    state: StateStore,
+    anthropic_base_url: Option<String>,
+    supabase: Option<Arc<SupabaseTelemetry>>,
+    admission: crate::limiter::AdmissionLimiter,
+    warm_start: Arc<ParkingMutex<HashMap<String, (u64, u64)>>>,
+) -> anyhow::Result<(AppState, LiveCredentials)> {
     let forwarder = Forwarder::new(config.server.request_timeout_secs)?;
 
     for a in &config.accounts {
@@ -171,7 +222,8 @@ fn build_app_state(
         telemetry,
         supabase,
         rate_limiter,
-        admission: shared_admission(),
+        admission,
+        warm_start,
     };
 
     Ok((app_state, credentials))
@@ -228,7 +280,13 @@ pub fn create_app_with_state(
     state: StateStore,
     anthropic_base_url: Option<String>,
 ) -> anyhow::Result<(Router, LiveCredentials, Option<TelemetryClient>)> {
-    let (app_state, credentials) = build_app_state(config, state, anthropic_base_url, None)?;
+    // Combined single-process app: use a FRESH admission limiter + warm-start map
+    // (not the process-wide statics) so in-process tests are isolated from each other.
+    let (app_state, credentials) = build_app_state_with(
+        config, state, anthropic_base_url, None,
+        crate::limiter::AdmissionLimiter::new(),
+        Arc::new(ParkingMutex::new(HashMap::new())),
+    )?;
     let telemetry = app_state.telemetry.clone();
 
     let app = Router::new()
@@ -391,6 +449,23 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
     let recent_requests = s.state.recent_requests_snapshot();
     let savings = s.state.savings_snapshot();
 
+    // Effective free capacity: the "not cooling" green count overstates usable
+    // capacity because a just-recovered lane re-trips instantly. Count only
+    // subscription accounts that are available AND have a free AIMD slot AND a
+    // low recent-429 signal — the lanes that will actually serve without a storm.
+    const EFFECTIVE_FREE_MAX_RECENT_429: f64 = 0.5;
+    let reserved = [s.config.server.classifier_account.as_deref(),
+                    s.config.server.classifier_fallback_account.as_deref()];
+    let apparent_free = s.config.accounts.iter()
+        .filter(|a| s.state.is_available(&a.name))
+        .count();
+    let effective_free = s.config.accounts.iter()
+        .filter(|a| !reserved.iter().flatten().any(|r| *r == a.name.as_str()))
+        .filter(|a| s.state.is_available(&a.name)
+            && s.admission.has_free_slot(&a.name)
+            && s.admission.recent_429(&a.name) < EFFECTIVE_FREE_MAX_RECENT_429)
+        .count();
+
     axum::Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "started_ms": s.started_ms,
@@ -400,6 +475,8 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
         "recent_requests": recent_requests,
         "savings": savings,
         "classifier_account": s.config.server.classifier_account,
+        "apparent_free": apparent_free,
+        "effective_free": effective_free,
     }))
 }
 
@@ -671,6 +748,12 @@ async fn proxy_handler(
     let method = req.method().as_str().to_owned();
     let path = req.uri().path().to_owned();
     let headers = req.headers().clone();
+    // Correlation key: the eval-claude wrapper stamps each Claude Code request
+    // with x-shunt-trace=<host>/<worktree>/<session>[/<agent>]. Recorded on the
+    // request log for session<->shunt correlation, and used to gate warm-start.
+    let trace_id = headers.get("x-shunt-trace")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
 
     let body_bytes: Bytes = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY)
         .await
@@ -797,14 +880,51 @@ async fn proxy_handler(
     let mut fell_back = false;
     // Guard: only self-heal a long-context 400 once per request (strip 1M beta + retry).
     let mut stripped_1m = false;
-    // Cap wait to the configured request timeout — the client's TCP connection
-    // won't survive 5 hours anyway; return 503 so the client can retry.
-    let wait_deadline_ms = now_ms() + s.config.server.request_timeout_secs.saturating_mul(1_000);
+
+    // --- API overflow lane (budget-capped anthropic-api) --------------------
+    // Resolve the configured overflow account name if the lane is enabled and the
+    // account actually exists in the pool. It is reserved from normal routing
+    // (added to `excluded`) and only reachable via warm-start or overflow spill.
+    let ov = &s.config.api_overflow;
+    let api_lane_name: Option<String> = if ov.enabled && !is_classifier {
+        ov.account.clone()
+            .filter(|n| s.config.accounts.iter().any(|a| &a.name == n))
+    } else {
+        None
+    };
+    // Warm-start decision (computed once — it increments the per-trace counter):
+    // a session's first prompts prefer the API lane for fast time-to-first-token.
+    let want_warm_start = api_lane_name.is_some()
+        && warm_start_active(&s.warm_start, trace_id.as_deref(), ov.warmup_requests, ov.warmup_ms);
+    // Closure: the API lane account IF currently usable (exists, not tried, not
+    // disabled/auth-failed, and under today's USD budget). Availability by
+    // cooldown is not required — API keys have high RPM ceilings.
+    let api_lane_usable = |tried: &HashSet<String>| -> bool {
+        let Some(name) = api_lane_name.as_deref() else { return false };
+        if tried.contains(name) { return false; }
+        if s.state.account_spend_today_usd(name) >= ov.daily_budget_usd { return false; }
+        s.config.accounts.iter().any(|a| a.name == name && a.credential.is_some())
+            && s.state.is_available(name)
+    };
+
+    // Bound the time a request may spend in the all-cooling wait loop. Previously
+    // this was the full request timeout (600s), which is why prompts stalled for
+    // tens of seconds then errored. Cap it to max_startup_wait_ms so we spill to
+    // the API overflow lane or return fast 429+Retry-After instead of open-ended
+    // waiting. The actual upstream forward still uses the full request timeout.
+    let req_started_ms = now_ms();
+    let wait_deadline_ms = req_started_ms + s.config.server.max_startup_wait_ms;
 
     loop {
         let effective_strategy = s.state.get_routing_strategy()
             .unwrap_or(s.config.server.routing_strategy);
-        let snap = s.state.routing_snapshot();
+        let mut snap = s.state.routing_snapshot();
+        // Enrich the snapshot with the AIMD burst-429 signal so Maximus routing
+        // deprioritizes lanes that are near their burst ceiling (the state store
+        // doesn't own the limiter, so we fold it in here at the routing boundary).
+        for (name, data) in snap.accounts.iter_mut() {
+            data.recent_429 = s.admission.recent_429(name);
+        }
         let effective_burst_rpm = s.state.get_burst_rpm_limit_override()
             .unwrap_or(s.config.server.burst_rpm_limit);
 
@@ -818,6 +938,12 @@ async fn proxy_handler(
             s.config.server.classifier_account.as_deref()
         } else {
             None
+        };
+        // Resolve the API overflow account handle when the closure says it's usable.
+        let api_lane_pick = |tried: &HashSet<String>| -> Option<&crate::config::AccountConfig> {
+            if !api_lane_usable(tried) { return None; }
+            let name = api_lane_name.as_deref()?;
+            s.config.accounts.iter().find(|a| a.name == name)
         };
         let selected = if let Some(lane) = classifier_lane {
             // Prefer the dedicated classifier account; if it has already been
@@ -833,15 +959,26 @@ async fn proxy_handler(
                     })
                 })
         } else {
-            // Exclude both failed (`tried`) and admission-saturated accounts so
-            // routing naturally prefers lanes with a free AIMD slot.
-            let excluded: HashSet<String> = tried.union(&saturated).cloned().collect();
-            router::pick_account(
+            // Exclude failed (`tried`), admission-saturated, AND the reserved API
+            // overflow account so it never enters normal rotation (it would score
+            // ~1.0 and monopolize routing, blowing budget). It is reachable only
+            // via the warm-start / overflow gates below.
+            let mut excluded: HashSet<String> = tried.union(&saturated).cloned().collect();
+            if let Some(name) = api_lane_name.as_deref() { excluded.insert(name.to_owned()); }
+            let pick_sub = router::pick_account(
                 &s.config.accounts, &s.state, &snap, fp_ref, &excluded,
                 s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
                 effective_strategy, effective_burst_rpm,
                 s.config.server.classifier_account.as_deref(),
-            )
+            );
+            if want_warm_start {
+                // Warm-start: prefer the API lane for fast startup, fall back to subs.
+                api_lane_pick(&tried).or(pick_sub)
+            } else {
+                // Steady state: subscriptions first; spill to the API lane only when
+                // no subscription is available (overflow / never-timeout guarantee).
+                pick_sub.or_else(|| api_lane_pick(&tried))
+            }
         };
         let account = match selected {
             Some(a) => a,
@@ -1141,7 +1278,7 @@ async fn proxy_handler(
                     // Got Anthropic response; client expects OpenAI.
                     translate_response_anthropic_to_openai(response).await
                 };
-                return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), s.supabase.as_ref(), &account_name, &account.provider.to_string(), &log_model, req_start_ms, &request_id, &path, tried.len(), is_classifier).await);
+                return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), s.supabase.as_ref(), &account_name, &account.provider.to_string(), &log_model, req_start_ms, &request_id, &path, tried.len(), is_classifier, trace_id.as_deref().unwrap_or("")).await);
             }
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
@@ -1370,6 +1507,7 @@ async fn tap_usage(
     path: &str,
     retries: usize,
     is_classifier: bool,
+    trace: &str,
 ) -> Response {
     use axum::body::Body;
     use crate::state::RequestLog;
@@ -1385,6 +1523,7 @@ async fn tap_usage(
         let model      = model.to_owned();
         let request_id = request_id.to_owned();
         let path       = path.to_owned();
+        let trace      = trace.to_owned();
         let on_complete = Arc::new(move |input: u64, output: u64| {
             let duration_ms = now_ms().saturating_sub(req_start_ms);
             info!(
@@ -1398,6 +1537,7 @@ async fn tap_usage(
                 input_tokens  = input,
                 output_tokens = output,
                 retries    = retries,
+                trace      = %trace,
                 "request complete"
             );
             let log = RequestLog {
@@ -1409,9 +1549,11 @@ async fn tap_usage(
                 output_tokens: output,
                 duration_ms,
                 classifier: is_classifier,
+                trace: trace.clone(),
             };
             state.record_usage(&account, input, output);
             state.record_global(&model, input, output);
+            state.record_account_cost(&account, &model, input, output);
             if let Some(ref t) = telem { t.push_event(&log); }
             if let Some(ref sb) = sb {
                 sb.emit_request_complete(&model, &provider, duration_ms, input, output);
@@ -1442,6 +1584,7 @@ async fn tap_usage(
         input_tokens  = input,
         output_tokens = output,
         retries       = retries,
+        trace         = %trace,
         "request complete"
     );
     let log = RequestLog {
@@ -1453,9 +1596,11 @@ async fn tap_usage(
         output_tokens: output,
         duration_ms,
         classifier: is_classifier,
+        trace: trace.to_owned(),
     };
     state.record_usage(account, input, output);
     state.record_global(model, input, output);
+    state.record_account_cost(account, model, input, output);
     if let Some(t) = telemetry { t.push_event(&log); }
     if let Some(sb) = supabase {
         sb.emit_request_complete(model, provider, duration_ms, input, output);
@@ -3234,6 +3379,28 @@ mod tests {
             status_7d: Some("allowed_warning".into()),
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn warm_start_active_by_request_count_then_graduates() {
+        let warm = ParkingMutex::new(HashMap::new());
+        // warmup_requests=2, warmup_ms=0 so only the count gate applies.
+        assert!(warm_start_active(&warm, Some("t1"), 2, 0), "1st request warms");
+        assert!(warm_start_active(&warm, Some("t1"), 2, 0), "2nd request warms");
+        assert!(!warm_start_active(&warm, Some("t1"), 2, 0), "3rd graduates to subs");
+    }
+
+    #[test]
+    fn warm_start_active_by_age_window() {
+        let warm = ParkingMutex::new(HashMap::new());
+        // warmup_requests=0 so only the age gate applies; large window keeps it warm.
+        assert!(warm_start_active(&warm, Some("t2"), 0, 60_000), "within age window warms");
+    }
+
+    #[test]
+    fn warm_start_never_for_untraced_requests() {
+        let warm = ParkingMutex::new(HashMap::new());
+        assert!(!warm_start_active(&warm, None, 5, 60_000), "no trace → never warm-start");
     }
 
     #[test]

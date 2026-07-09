@@ -41,6 +41,10 @@ pub struct AccountRoutingData {
     pub reset_5h_secs: Option<u64>,
     pub reset_7d_secs: Option<u64>,
     pub burst_request_count: usize,
+    /// Decaying 0..1 AIMD burst-429 signal for this account. Populated by the
+    /// proxy from the admission limiter after the snapshot is taken (the state
+    /// store itself doesn't own the limiter). 0.0 = calm / unknown.
+    pub recent_429: f64,
 }
 
 /// Snapshot of all routing-relevant state, taken with a single lock.
@@ -122,6 +126,10 @@ pub struct RequestLog {
     /// True when this was an auto-mode safety-classifier side-call.
     #[serde(default)]
     pub classifier: bool,
+    /// x-shunt-trace correlation key (<host>/<worktree>/<session>[/<agent>]),
+    /// empty when the caller didn't set it. Joins shunt requests to Claude sessions.
+    #[serde(default)]
+    pub trace: String,
 }
 
 const MAX_RECENT: usize = 200;
@@ -215,6 +223,10 @@ struct StateData {
     /// Daily token + cost buckets keyed by "YYYY-MM-DD" (all accounts combined).
     #[serde(default)]
     global_daily: HashMap<String, DailyBucket>,
+    /// Per-account daily cost buckets: account -> "YYYY-MM-DD" -> bucket. Used to
+    /// enforce the API overflow lane's daily USD budget.
+    #[serde(default)]
+    per_account_daily: HashMap<String, HashMap<String, DailyBucket>>,
     /// All-time totals.
     #[serde(default)]
     all_time_input: u64,
@@ -411,6 +423,7 @@ impl StateStore {
                 reset_5h_secs: reset_5h,
                 reset_7d_secs: reset_7d,
                 burst_request_count,
+                recent_429: 0.0,
             })
         }).collect();
 
@@ -929,6 +942,40 @@ impl StateStore {
         self.persist();
     }
 
+    /// Record real API spend for one account (used to enforce the API overflow
+    /// lane's daily USD budget). Cost is the *actual* pay-per-token API cost.
+    pub fn record_account_cost(&self, account: &str, model: &str, input_tokens: u64, output_tokens: u64) {
+        let cost = crate::pricing::api_cost_usd(model, input_tokens, output_tokens);
+        if cost <= 0.0 { return; }
+        let key = today_key();
+        {
+            let mut data = self.inner.lock();
+            let per = data.per_account_daily.entry(account.to_owned()).or_default();
+            let bucket = per.entry(key).or_default();
+            bucket.input_tokens  = bucket.input_tokens.saturating_add(input_tokens);
+            bucket.output_tokens = bucket.output_tokens.saturating_add(output_tokens);
+            bucket.api_cost_usd  += cost;
+            if per.len() > 100 {
+                let cutoff = epoch_to_ymd(
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+                        .saturating_sub(90 * 86400)
+                );
+                per.retain(|k, _| k.as_str() >= cutoff.as_str());
+            }
+        }
+        self.persist();
+    }
+
+    /// Today's actual API spend (USD) for one account. Used for budget gating.
+    pub fn account_spend_today_usd(&self, account: &str) -> f64 {
+        let today = today_key();
+        self.inner.lock()
+            .per_account_daily.get(account)
+            .and_then(|m| m.get(&today))
+            .map(|b| b.api_cost_usd)
+            .unwrap_or(0.0)
+    }
+
     /// Snapshot of daily and all-time savings for the status endpoint and CLI.
     pub fn savings_snapshot(&self) -> SavingsSnapshot {
         let now_secs = SystemTime::now()
@@ -1045,6 +1092,7 @@ mod tests {
                 output_tokens: 1,
                 duration_ms: 1,
                 classifier: false,
+                trace: String::new(),
             });
         }
         let snap = store.recent_requests_snapshot();
