@@ -3,6 +3,7 @@ pub mod config;
 pub mod credential;
 pub mod pricing;
 pub mod forwarder;
+pub mod limiter;
 pub mod live_relay;
 pub mod logging;
 pub mod monitor;

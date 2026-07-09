@@ -27,6 +27,16 @@ use crate::telemetry::{SupabaseTelemetry, TelemetryClient};
 /// 100 MB limit — sufficient for any LLM request including large context windows.
 const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
 
+/// Process-wide admission limiter. The proxy app and the control app (which
+/// serves `/status`) are built by separate `build_app_state` calls, and every
+/// per-provider proxy app must share one AIMD view of the pool — so the limiter
+/// lives here, cloned (Arc-backed) into each AppState rather than created per app.
+static ADMISSION: std::sync::OnceLock<crate::limiter::AdmissionLimiter> = std::sync::OnceLock::new();
+
+fn shared_admission() -> crate::limiter::AdmissionLimiter {
+    ADMISSION.get_or_init(crate::limiter::AdmissionLimiter::new).clone()
+}
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
@@ -53,6 +63,9 @@ struct AppState {
     supabase: Option<Arc<SupabaseTelemetry>>,
     /// Per-IP token-bucket rate limiter (#16). None when rate_limit_rpm == 0.
     rate_limiter: Option<Arc<ParkingMutex<HashMap<IpAddr, TokenBucket>>>>,
+    /// Adaptive per-account admission control (AIMD). Paces requests under each
+    /// account's burst ceiling so the pool doesn't synchronise into a 429 storm.
+    admission: crate::limiter::AdmissionLimiter,
 }
 
 /// Simple token-bucket for per-IP rate limiting.
@@ -80,6 +93,26 @@ impl TokenBucket {
         } else {
             false
         }
+    }
+}
+
+/// RAII release of an admission slot. Dropped on every exit path of a request
+/// loop iteration (success return, retry `continue`, or error `?`), so a slot is
+/// never leaked regardless of how the attempt ends.
+struct SlotGuard {
+    limiter: crate::limiter::AdmissionLimiter,
+    account: String,
+}
+
+impl SlotGuard {
+    fn new(limiter: crate::limiter::AdmissionLimiter, account: String) -> Self {
+        Self { limiter, account }
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.limiter.release(&self.account);
     }
 }
 
@@ -138,6 +171,7 @@ fn build_app_state(
         telemetry,
         supabase,
         rate_limiter,
+        admission: shared_admission(),
     };
 
     Ok((app_state, credentials))
@@ -271,6 +305,7 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
     let account_states = s.state.account_states();
     let quotas = s.state.quota_snapshot();
     let rate_limits = s.state.rate_limit_snapshot();
+    let admission = s.admission.snapshot();
 
     let accounts: Vec<_> = s.config.accounts.iter().map(|a| {
         let st = account_states.get(&a.name);
@@ -320,6 +355,14 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
         let reset_7d = rl.and_then(|r| r.reset_7d);
         let status_7d = rl.and_then(|r| r.status_7d.clone());
         let available = s.state.is_available(&a.name);
+        // AIMD admission state: current in-flight, adaptive concurrency limit,
+        // and the decaying recent-429 signal. Surfaces pool pressure per lane.
+        let adm = admission.get(&a.name);
+        let admission_json = adm.map(|(in_flight, limit, recent_429)| json!({
+            "in_flight": in_flight,
+            "limit": limit,
+            "recent_429": recent_429,
+        }));
 
         json!({
             "name": a.name,
@@ -341,6 +384,7 @@ async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
             "window_expires_ms": window_expires_ms,
             "tokens_used": tokens_used,
             "rate_limit": rate_limit,
+            "admission": admission_json,
         })
     }).collect();
 
@@ -742,6 +786,11 @@ async fn proxy_handler(
     let fp_ref = fp.as_deref();
 
     let mut tried: HashSet<String> = HashSet::new();
+    // Accounts skipped this search only because their AIMD admission slots are
+    // full (not failed). Excluded from selection until we either admit someone
+    // or wait briefly for a slot to free, then cleared. Distinct from `tried` so
+    // a busy-but-healthy account is never mistaken for a cooling/failed one.
+    let mut saturated: HashSet<String> = HashSet::new();
     // Track accounts we've already attempted a token refresh for this request.
     let mut refreshed: HashSet<String> = HashSet::new();
     // Guard: only attempt model fallback once per request.
@@ -784,8 +833,11 @@ async fn proxy_handler(
                     })
                 })
         } else {
+            // Exclude both failed (`tried`) and admission-saturated accounts so
+            // routing naturally prefers lanes with a free AIMD slot.
+            let excluded: HashSet<String> = tried.union(&saturated).cloned().collect();
             router::pick_account(
-                &s.config.accounts, &s.state, &snap, fp_ref, &tried,
+                &s.config.accounts, &s.state, &snap, fp_ref, &excluded,
                 s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
                 effective_strategy, effective_burst_rpm,
                 s.config.server.classifier_account.as_deref(),
@@ -797,7 +849,19 @@ async fn proxy_handler(
                 // Classifier requests never block on cooldown — fail fast so the
                 // client's own retry budget governs instead of hanging the call.
                 if is_classifier {
-                    return Err(ProxyError::AllAccountsUnavailable);
+                    return Err(ProxyError::AllAccountsUnavailable(None));
+                }
+                // Admission-saturation: healthy accounts exist but all their AIMD
+                // slots are busy right now. Wait a short beat for a slot to free
+                // (not a full cooldown), then reconsider them. This is the pacing
+                // that keeps aggregate throughput high without a 429 storm.
+                if !saturated.is_empty() {
+                    if now_ms() + 250 <= wait_deadline_ms {
+                        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                        saturated.clear();
+                        continue;
+                    }
+                    // No time left to wait for a slot — treat like all-cooling below.
                 }
                 // Model fallback: before waiting, try switching to a cheaper model.
                 // Rate limits are often per-model, so the fallback may succeed immediately.
@@ -856,14 +920,44 @@ async fn proxy_handler(
                         warn!(wait_ms, "all accounts cooling — waiting for next available account");
                         tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
                         tried.clear(); // accounts may have recovered; try them again
+                        saturated.clear();
                     }
-                    _ => return Err(ProxyError::AllAccountsUnavailable),
+                    // Everything is cooling past our deadline (or nothing is
+                    // recoverable in time). Instead of a hard 503 — which Claude
+                    // Code escalates to a fatal "exceeded max retries" and kills the
+                    // subagent — return 429 + Retry-After so the client backs off and
+                    // retries gracefully. Retry-After = soonest reset, clamped 1-30s.
+                    _ => {
+                        let retry_after = soonest_ms
+                            .map(|w| (w.saturating_sub(now_ms()) / 1_000).clamp(1, 30))
+                            .unwrap_or(5);
+                        return Err(ProxyError::AllAccountsUnavailable(Some(retry_after)));
+                    }
                 }
                 continue;
             }
         };
 
         let account_name = account.name.clone();
+
+        // Admission control (AIMD). The dedicated classifier lane bypasses it —
+        // it is a separate account with a short client deadline and must fail fast
+        // rather than queue. For pooled accounts, reserve a slot; if none is free,
+        // mark the account saturated and reconsider another lane.
+        let _slot: Option<SlotGuard> = if classifier_lane.is_none() {
+            if s.admission.try_acquire(&account_name) {
+                Some(SlotGuard::new(s.admission.clone(), account_name.clone()))
+            } else {
+                saturated.insert(account_name.clone());
+                continue;
+            }
+        } else {
+            None
+        };
+        // A slot was admitted (or classifier lane) — this is a fresh forward, so
+        // the saturation set from the just-finished search is stale; reset it.
+        saturated.clear();
+
         s.state.record_request_burst(&account_name);
 
         // Use the live (possibly refreshed) token rather than the one baked into config.
@@ -1001,6 +1095,9 @@ async fn proxy_handler(
         match response.status().as_u16() {
             200..=299 => {
                 s.state.set_last_used(&account_name);
+                // AIMD additive-increase: this account tolerated the request, so
+                // grow its allowed concurrency a notch.
+                s.admission.on_success(&account_name);
                 if let Some(info) = account.provider.parse_rate_limits(response.headers()) {
                     // "Buy more tokens" avoidance: if this account has consumed its
                     // included subscription quota on a window AND overage/extra-usage
@@ -1049,6 +1146,12 @@ async fn proxy_handler(
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
                 let is_exhausted = is_exhausted_response(info.as_ref());
+                // AIMD multiplicative-decrease on burst 429 only: it means we
+                // exceeded this account's short-term ceiling, so back its allowed
+                // concurrency off. Exhaustion is a window cap, not a pacing signal.
+                if !is_exhausted {
+                    s.admission.on_burst_429(&account_name);
+                }
                 // Only stagger EXHAUSTED accounts: after a real quota-drain 429,
                 // re-selecting the same account immediately would just hit the
                 // wall again, so add 30s so other accounts get the window first.
@@ -1662,7 +1765,11 @@ pub async fn openai_token_refresh_loop(
 enum ProxyError {
     BodyRead,
     Upstream,
-    AllAccountsUnavailable,
+    /// Pool has nothing servable in time. Carries an optional Retry-After
+    /// (seconds) so the response is a graceful 429 the client backs off on,
+    /// rather than a hard 503 that Claude Code escalates to "exceeded max
+    /// retries" and kills the subagent. `None` = classifier fast-fail.
+    AllAccountsUnavailable(Option<u64>),
     Unauthorized,
     RateLimited,
 }
@@ -1684,15 +1791,34 @@ impl IntoResponse for ProxyError {
                 );
                 resp
             }
+            ProxyError::AllAccountsUnavailable(retry_after) => {
+                // 429 (not 503) with a rate_limit_error body + Retry-After, so
+                // Claude Code's native backoff waits and retries instead of
+                // failing the run. Without a retry hint (classifier fast-fail),
+                // omit Retry-After so the caller decides immediately.
+                let mut resp = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(json!({
+                        "type": "error",
+                        "error": {
+                            "type": "rate_limit_error",
+                            "message": "pool saturated — all accounts cooling; retry shortly"
+                        }
+                    })),
+                ).into_response();
+                if let Some(secs) = retry_after {
+                    if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                        resp.headers_mut().insert(axum::http::header::RETRY_AFTER, v);
+                    }
+                }
+                resp
+            }
             other => {
                 let (status, msg) = match other {
                     ProxyError::BodyRead => (StatusCode::BAD_REQUEST, "failed to read request body"),
                     ProxyError::Upstream => (StatusCode::BAD_GATEWAY, "upstream request failed"),
-                    ProxyError::AllAccountsUnavailable => {
-                        (StatusCode::SERVICE_UNAVAILABLE, "all accounts are on cooldown or disabled")
-                    }
                     ProxyError::Unauthorized => (StatusCode::UNAUTHORIZED, "invalid or missing api key"),
-                    ProxyError::RateLimited => unreachable!(),
+                    ProxyError::RateLimited | ProxyError::AllAccountsUnavailable(_) => unreachable!(),
                 };
                 (status, axum::Json(json!({
                     "type": "error",
@@ -2440,10 +2566,26 @@ fn compute_429_cooldown_ms(info: Option<&RateLimitInfo>, retry_after_ms: Option<
             .unwrap_or(90_000)
             .min(MAX_EXHAUSTED_COOLDOWN_MS)
     } else {
-        retry_after_ms
+        let base = retry_after_ms
             .unwrap_or(BURST_DEFAULT_MS)
-            .clamp(BURST_MIN_MS, MAX_BURST_COOLDOWN_MS)
+            .clamp(BURST_MIN_MS, MAX_BURST_COOLDOWN_MS);
+        // Add sub-window jitter so accounts that burst-429 together don't all
+        // expire at the same instant and re-trip as a synchronized herd (the
+        // "post-cooldown prefetch got 429 — re-cooling" loop). Bounded so the
+        // bench stays short.
+        base.saturating_add(burst_cooldown_jitter_ms())
     }
+}
+
+/// Small randomized cooldown jitter (0..3000ms) to break herd synchronization.
+/// Uses sub-millisecond clock entropy — no extra dependency, good enough to
+/// spread near-simultaneous 429 cooldowns across different wake instants.
+fn burst_cooldown_jitter_ms() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    nanos % 3_000
 }
 
 /// Returns true if the model lacks support for extended thinking / effort.
@@ -2747,33 +2889,37 @@ mod tests {
         now_ms() / 1_000 + 3600
     }
 
+    // NB: burst cooldowns add up to 3s of anti-herd jitter on top of the base,
+    // so these assert the base within a [base, base+3000) band rather than exact.
+    const JITTER_MAX_MS: u64 = 3_000;
+
     #[test]
     fn burst_429_uses_retry_after_within_short_cap() {
         let info = make_info(Some("allowed"), Some(future_secs()), Some("allowed"), None);
         // A small retry-after is honored as-is (burst limits clear in seconds).
         let cd = compute_429_cooldown_ms(Some(&info), Some(8_000), false);
-        assert_eq!(cd, 8_000, "burst 429 should honor a short retry_after");
+        assert!((8_000..8_000 + JITTER_MAX_MS).contains(&cd), "burst 429 honors short retry_after (+jitter): {cd}");
     }
 
     #[test]
     fn burst_429_caps_at_15s() {
         // Burst cooldown must stay short so a healthy pool is not drained; even a
-        // large retry-after is clamped to the 15s burst cap.
+        // large retry-after is clamped to the 15s burst cap (plus jitter).
         let cd = compute_429_cooldown_ms(None, Some(999_999), false);
-        assert_eq!(cd, 15_000, "burst cooldown should cap at 15s");
+        assert!((15_000..15_000 + JITTER_MAX_MS).contains(&cd), "burst cooldown caps at 15s (+jitter): {cd}");
     }
 
     #[test]
     fn burst_429_default_when_no_retry_after() {
         let cd = compute_429_cooldown_ms(None, None, false);
-        assert_eq!(cd, 5_000, "burst cooldown should default to 5s");
+        assert!((5_000..5_000 + JITTER_MAX_MS).contains(&cd), "burst cooldown defaults to 5s (+jitter): {cd}");
     }
 
     #[test]
     fn burst_429_floor_prevents_thrash() {
         // A tiny/zero retry-after is floored so we don't hot-loop the account.
         let cd = compute_429_cooldown_ms(None, Some(100), false);
-        assert_eq!(cd, 2_000, "burst cooldown should floor at 2s");
+        assert!((2_000..2_000 + JITTER_MAX_MS).contains(&cd), "burst cooldown floors at 2s (+jitter): {cd}");
     }
 
     #[test]
@@ -2988,7 +3134,7 @@ mod tests {
     fn custom_classifier_prompt_file_declares_the_verdict_contract() {
         // Ship-time guard: the checked-in prompt must still tell the model to
         // emit the <block> grammar, or every verdict silently fails closed.
-        let prompt = include_str!("../examples/classifier-harness-prompt.txt");
+        let prompt = include_str!("../../../.config/shunt/harness-classifier.txt");
         assert!(prompt.contains("<block>no</block>"), "prompt must show the allow token");
         assert!(prompt.contains("<block>yes</block>"), "prompt must show the block token");
     }
@@ -3088,6 +3234,34 @@ mod tests {
             status_7d: Some("allowed_warning".into()),
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn burst_jitter_stays_in_bounds() {
+        for _ in 0..1000 {
+            assert!(burst_cooldown_jitter_ms() < 3_000, "jitter must stay under 3s");
+        }
+    }
+
+    #[test]
+    fn burst_cooldown_short_and_bounded_with_jitter() {
+        // Burst (non-exhausted) 429: base clamps to 2-15s, plus <3s jitter.
+        for _ in 0..200 {
+            let ms = compute_429_cooldown_ms(None, None, false);
+            assert!((2_000..=18_000).contains(&ms), "burst cooldown {ms} out of expected 2-18s band");
+        }
+    }
+
+    #[test]
+    fn exhausted_cooldown_ignores_jitter_and_caps_at_5min() {
+        let now = now_ms() / 1_000;
+        let info = crate::state::RateLimitInfo {
+            status_5h: Some("exhausted".into()),
+            reset_5h: Some(now + 10_000), // far future
+            ..Default::default()
+        };
+        let ms = compute_429_cooldown_ms(Some(&info), None, true);
+        assert_eq!(ms, 5 * 60_000, "exhausted cooldown caps at 5 min");
     }
 
     #[test]
