@@ -47,6 +47,13 @@ struct StatusResponse {
     /// Name of the account reserved for the safety-classifier lane, if configured.
     #[serde(default)]
     classifier_account: Option<String>,
+    /// Accounts not currently cooling (apparent capacity).
+    #[serde(default)]
+    apparent_free: u64,
+    /// Accounts that will actually serve without re-tripping: available + free
+    /// AIMD slot + low recent-429. The number that predicts whether prompts stall.
+    #[serde(default)]
+    effective_free: u64,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -1069,6 +1076,16 @@ fn draw_header(f: &mut Frame, area: Rect, state: &Option<StatusResponse>, model_
     if alerts_muted {
         spans.push(Span::styled("  ·  ", style_dim()));
         spans.push(Span::styled("alerts muted", style_red()));
+    }
+    // Effective free capacity — the lanes that will actually serve without
+    // re-tripping (available + free AIMD slot + low recent-429), vs the apparent
+    // "not cooling" count. Low effective-free predicts prompt stalls.
+    if let Some(s) = state.as_ref() {
+        spans.push(Span::styled("  ·  ", style_dim()));
+        let style = if s.effective_free == 0 { style_red().add_modifier(Modifier::BOLD) }
+            else if s.effective_free <= 2 { style_yellow() } else { style_green() };
+        spans.push(Span::styled(format!("{} free", s.effective_free), style));
+        spans.push(Span::styled(format!("/{} idle", s.apparent_free), style_dim()));
     }
 
     // Surface the worst-case state prominently: every account unavailable means

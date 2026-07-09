@@ -148,6 +148,8 @@ struct RawConfig {
     /// Applied when routing Anthropic-format requests to non-Anthropic providers.
     #[serde(default)]
     model_mapping: HashMap<String, String>,
+    #[serde(default)]
+    api_overflow: Option<RawApiOverflow>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +218,10 @@ struct RawServer {
     /// Console lane) instead of forcing Claude Code to block. When unset, the
     /// classifier lane fails fast and Claude Code fails closed.
     classifier_fallback_account: Option<String>,
+    /// Max time (ms) a request may spend waiting in the all-cooling loop before
+    /// shunt spills to the API overflow lane or returns 429+Retry-After. Bounds
+    /// the "long startup then error" stall. Default 8000.
+    max_startup_wait_ms: Option<u64>,
 }
 
 impl Default for RawServer {
@@ -247,7 +253,45 @@ impl Default for RawServer {
             classifier_account: None,
             classifier_system_prompt_path: None,
             classifier_fallback_account: None,
+            max_startup_wait_ms: None,
         }
+    }
+}
+
+/// `[api_overflow]` config section: a budget-capped pay-per-token Anthropic API
+/// lane used for warm-start (fast first prompts) and overflow (when the
+/// subscription pool is saturated), never as the steady-state default.
+#[derive(Debug, Deserialize, Default)]
+struct RawApiOverflow {
+    /// Master enable. Default false (opt-in).
+    #[serde(default)]
+    enabled: Option<bool>,
+    /// Name of the anthropic-api account acting as the overflow lane.
+    #[serde(default)]
+    account: Option<String>,
+    /// Daily USD budget cap for the lane. Default 500.
+    #[serde(default)]
+    daily_budget_usd: Option<f64>,
+    /// Warm-start: serve a session's first N requests on the API lane. Default 3.
+    #[serde(default)]
+    warmup_requests: Option<u64>,
+    /// Warm-start also applies while a session is younger than this (ms). Default 20000.
+    #[serde(default)]
+    warmup_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiOverflowConfig {
+    pub enabled: bool,
+    pub account: Option<String>,
+    pub daily_budget_usd: f64,
+    pub warmup_requests: u64,
+    pub warmup_ms: u64,
+}
+
+impl Default for ApiOverflowConfig {
+    fn default() -> Self {
+        Self { enabled: false, account: None, daily_budget_usd: 500.0, warmup_requests: 3, warmup_ms: 20_000 }
     }
 }
 
@@ -389,6 +433,8 @@ pub struct ServerConfig {
     pub classifier_system_prompt_path: Option<String>,
     /// Account to try once if the primary classifier lane errors (see RawServer).
     pub classifier_fallback_account: Option<String>,
+    /// Max ms a request waits in the all-cooling loop before spill/backpressure.
+    pub max_startup_wait_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -420,6 +466,7 @@ impl Default for ServerConfig {
             classifier_account: None,
             classifier_system_prompt_path: None,
             classifier_fallback_account: None,
+            max_startup_wait_ms: 8_000,
         }
     }
 }
@@ -451,6 +498,8 @@ pub struct Config {
     /// Global model-name overrides: claude model → provider model.
     /// e.g. `"claude-sonnet-4-6" → "llama-3.3-70b-versatile"`
     pub model_mapping: HashMap<String, String>,
+    /// Budget-capped API overflow lane config.
+    pub api_overflow: ApiOverflowConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +595,19 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
             .or_else(|| std::env::var("SHUNT_CLASSIFIER_SYSTEM_PROMPT_PATH").ok()),
         classifier_fallback_account: raw.server.classifier_fallback_account
             .or_else(|| std::env::var("SHUNT_CLASSIFIER_FALLBACK_ACCOUNT").ok()),
+        max_startup_wait_ms: raw.server.max_startup_wait_ms.unwrap_or(8_000),
+    };
+
+    let raw_overflow = raw.api_overflow.unwrap_or_default();
+    let api_overflow = ApiOverflowConfig {
+        enabled: raw_overflow.enabled.unwrap_or(false),
+        account: raw_overflow.account
+            .or_else(|| std::env::var("SHUNT_API_OVERFLOW_ACCOUNT").ok()),
+        daily_budget_usd: raw_overflow.daily_budget_usd
+            .or_else(|| std::env::var("SHUNT_API_OVERFLOW_DAILY_BUDGET_USD").ok().and_then(|v| v.parse().ok()))
+            .unwrap_or(500.0),
+        warmup_requests: raw_overflow.warmup_requests.unwrap_or(3),
+        warmup_ms: raw_overflow.warmup_ms.unwrap_or(20_000),
     };
 
     if raw.accounts.is_empty() {
@@ -615,7 +677,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         });
     }
 
-    Ok(Config { server, accounts, config_file: p, model_mapping: raw.model_mapping })
+    Ok(Config { server, accounts, config_file: p, model_mapping: raw.model_mapping, api_overflow })
 }
 
 // ---------------------------------------------------------------------------
