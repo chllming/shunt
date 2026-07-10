@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod bridge;
 pub mod config;
 pub mod credential;
 pub mod pricing;

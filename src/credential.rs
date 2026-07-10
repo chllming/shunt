@@ -36,14 +36,14 @@ impl Drop for Credential {
 impl Credential {
     /// The bearer token to send in `Authorization: Bearer <token>`.
     ///
-    /// For OAuth accounts: prefers `id_token` over `access_token` when
-    /// present (required by chatgpt.com / Codex). Falls back to
-    /// `access_token` for standard Anthropic OAuth.
+    /// OAuth bearer authentication always uses the access token. ID tokens
+    /// describe the signed-in identity; sending one as an API bearer token
+    /// breaks the native Codex Responses backend.
     ///
     /// For API-key accounts: returns the raw key directly.
     pub fn bearer_token(&self) -> &str {
         match self {
-            Credential::Oauth(c) => c.id_token.as_deref().unwrap_or(&c.access_token),
+            Credential::Oauth(c) => &c.access_token,
             Credential::Apikey { key } => key,
         }
     }

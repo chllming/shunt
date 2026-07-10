@@ -4,7 +4,7 @@
 
 # shunt
 
-**Pool your Claude rate limits. Never get throttled mid-session again.**
+**Native Claude and Codex subscription pools behind one local daemon.**
 
 [![crates.io](https://img.shields.io/crates/v/shunt-proxy.svg)](https://crates.io/crates/shunt-proxy)
 [![downloads](https://img.shields.io/crates/d/shunt-proxy)](https://crates.io/crates/shunt-proxy)
@@ -17,7 +17,7 @@
 
 ---
 
-Shunt is a local proxy that combines your Claude Code accounts into one endpoint. It auto-routes every request to the account with the most headroom, fails over silently when one hits a limit, and holds your connection open until capacity frees up — your agent session never sees a 429.
+Shunt is a local proxy that combines subscription accounts into two isolated native endpoints: Anthropic Messages for Claude Code on port 8082 and OpenAI Responses for stock Codex on port 8083. It routes within each provider pool, preserves native streaming/tool semantics, and can delegate explicit cross-provider work through an isolated MCP bridge.
 
 <div align="center">
 <img src="https://raw.githubusercontent.com/ramc10/shunt/main/diagram.svg" width="600">
@@ -31,7 +31,15 @@ Shunt is a local proxy that combines your Claude Code accounts into one endpoint
 
 ## Install
 
-**macOS / Linux — one command:**
+**macOS / Linux — interactive installer:**
+
+```bash
+npx vibe-shunt
+```
+
+Choose the release, install directory, client integration, and login service interactively. For an unattended install with recommended defaults, run `npx vibe-shunt --yes`. See all automation options with `npx vibe-shunt --help`.
+
+**shell installer:**
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/ramc10/shunt/main/install.sh | sh
@@ -48,11 +56,13 @@ cargo install shunt-proxy
 ## Quick start
 
 ```bash
-shunt setup      # import your Claude Code session + configure your shell
+shunt setup --install-clients  # import Claude + install managed client entries
 shunt start      # start the proxy
 ```
 
 That's it. Claude Code and your other tools route through shunt automatically.
+
+Existing flat configs migrate automatically on start. Preview the backup-first migration with `shunt migrate --dry-run`. See [Native pools and bridge operations](docs/native-pools-and-bridge.md) for schema-v2 configuration, API-overflow budgets, stock Codex setup, and bridge security.
 
 Add more accounts to grow your pool:
 
@@ -112,23 +122,29 @@ shunt share <code>       # on another machine — configures everything
 ## Commands
 
 ```bash
-shunt setup              # first-time setup
+shunt setup --install-clients # first-time setup + stock client/MCP entries
+shunt migrate --dry-run  # preview schema-v2 migration
+shunt migrate --apply    # back up and migrate now
 shunt start              # start the proxy
 shunt stop               # stop the proxy
 shunt restart
 shunt status             # account utilization
+shunt status --pool codex
 shunt monitor            # live fullscreen dashboard
 shunt logs               # recent logs
 shunt logs -f            # follow logs
 shunt config             # manage accounts interactively
 shunt add-account <name> # add an account or provider
+shunt add-account work --provider openai --pool codex
 shunt remove-account <name>
 shunt logout [name]      # log out of an account
 shunt use [account]      # pin routing to a specific account
+shunt use --pool codex [account]
 shunt use auto           # restore automatic routing
 shunt model set <name>   # force all requests through a model
 shunt model clear        # restore client-supplied model
 shunt strategy set <name># change routing strategy at runtime
+shunt bridge mcp --caller codex # MCP adapter (normally installed by setup)
 shunt share              # share on LAN
 shunt share --tunnel     # share via Cloudflare tunnel
 shunt share <code>       # connect to a shared proxy
@@ -136,6 +152,8 @@ shunt disconnect         # revert to localhost-only
 shunt live               # persistent tunnel via relay
 shunt update             # update to latest
 ```
+
+Allowlisted bridge jobs validate and record normalized hostname/IP patterns; Claude enforces them in its sandbox, while Codex bridge workers intentionally run with full local permissions and no bubblewrap. See the operations guide for policy syntax and the authenticated release smoke gate.
 
 ---
 

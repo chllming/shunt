@@ -71,6 +71,7 @@ impl Captures {
 struct CapturedRequest {
     pub headers: reqwest::header::HeaderMap,
     pub body: Bytes,
+    pub uri: String,
 }
 
 fn make_mock_upstream(captures: Captures, streaming: bool, status: u16) -> Router {
@@ -91,6 +92,7 @@ async fn handle_request(req: Request, caps: Captures, streaming: bool, status: u
     caps.push(CapturedRequest {
         headers: to_reqwest_headers(&parts.headers),
         body: body_bytes,
+        uri: parts.uri.to_string(),
     });
 
     if status != 200 {
@@ -129,7 +131,10 @@ async fn handle_request(req: Request, caps: Captures, streaming: bool, status: u
 async fn handle_count_tokens(req: Request, caps: Captures) -> impl IntoResponse {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-    caps.push(CapturedRequest { headers: to_reqwest_headers(&parts.headers), body: body_bytes });
+    caps.push(CapturedRequest {
+        headers: to_reqwest_headers(&parts.headers), body: body_bytes,
+        uri: parts.uri.to_string(),
+    });
     axum::Json(json!({"input_tokens": 99}))
 }
 
@@ -159,6 +164,8 @@ fn test_credential() -> Credential {
         refresh_token: "test-refresh-token".into(),
         expires_at: u64::MAX / 2,
         id_token: None,
+        chatgpt_account_id: None,
+        chatgpt_account_is_fedramp: false,
     })
 }
 
@@ -188,6 +195,11 @@ async fn setup(streaming: bool, upstream_status: u16) -> (TestServer, TestServer
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
         api_overflow: Default::default(),
+        schema_version: 1,
+        pools: Default::default(),
+        secrets: Default::default(),
+        classifier: Default::default(),
+        bridge: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -384,6 +396,8 @@ fn test_account2() -> AccountConfig {
             refresh_token: "test-refresh-2".into(),
             expires_at: u64::MAX / 2,
             id_token: None,
+            chatgpt_account_id: None,
+            chatgpt_account_is_fedramp: false,
         })),
         upstream_url: None, model: None,
     }
@@ -401,7 +415,10 @@ fn make_token_aware_upstream(captures: Captures) -> Router {
                 .to_owned();
             let (parts, body) = req.into_parts();
             let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-            caps.push(CapturedRequest { headers: to_reqwest_headers(&parts.headers), body: body_bytes });
+            caps.push(CapturedRequest {
+                headers: to_reqwest_headers(&parts.headers), body: body_bytes,
+                uri: parts.uri.to_string(),
+            });
 
             if auth == format!("Bearer {TEST_TOKEN}") {
                 // First account → rate limited
@@ -436,6 +453,11 @@ async fn setup_multi() -> (TestServer, TestServer, Captures, Client) {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
         api_overflow: Default::default(),
+        schema_version: 1,
+        pools: Default::default(),
+        secrets: Default::default(),
+        classifier: Default::default(),
+        bridge: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -488,6 +510,11 @@ async fn test_stickiness_same_conversation() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
         api_overflow: Default::default(),
+        schema_version: 1,
+        pools: Default::default(),
+        secrets: Default::default(),
+        classifier: Default::default(),
+        bridge: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -542,6 +569,11 @@ async fn test_all_accounts_exhausted_returns_503() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
         api_overflow: Default::default(),
+        schema_version: 1,
+        pools: Default::default(),
+        secrets: Default::default(),
+        classifier: Default::default(),
+        bridge: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -649,6 +681,11 @@ async fn test_remote_key_auth() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
         api_overflow: Default::default(),
+        schema_version: 1,
+        pools: Default::default(),
+        secrets: Default::default(),
+        classifier: Default::default(),
+        bridge: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -769,7 +806,10 @@ fn make_openai_upstream(captures: Captures, streaming: bool) -> Router {
         move |req: Request| async move {
             let (parts, body) = req.into_parts();
             let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-            caps.push(CapturedRequest { headers: to_reqwest_headers(&parts.headers), body: body_bytes });
+            caps.push(CapturedRequest {
+                headers: to_reqwest_headers(&parts.headers), body: body_bytes,
+                uri: parts.uri.to_string(),
+            });
 
             if streaming {
                 let sse = b"data: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n\
@@ -804,9 +844,195 @@ fn openai_account(upstream_url: String) -> AccountConfig {
             refresh_token: "openai-refresh".into(),
             expires_at: u64::MAX / 2,
             id_token: None,
+            chatgpt_account_id: None,
+            chatgpt_account_is_fedramp: false,
         })),
         upstream_url: Some(upstream_url), model: None,
     }
+}
+
+fn make_codex_responses_upstream(captures: Captures) -> Router {
+    Router::new().route("/backend-api/codex/responses", post({
+        let caps = captures.clone();
+        move |req: Request| async move {
+            let (parts, body) = req.into_parts();
+            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            caps.push(CapturedRequest {
+                headers: to_reqwest_headers(&parts.headers), body,
+                uri: parts.uri.to_string(),
+            });
+            let sse = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_native\"}}\n\n\
+event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_native\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\n\
+event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_native\",\"usage\":{\"input_tokens\":4,\"output_tokens\":1,\"total_tokens\":5}}}\n\n";
+            Response::builder().status(200)
+                .header("content-type", "text/event-stream")
+                .header("x-codex-turn-state", "server-turn-state")
+                .header("x-codex-primary-used-percent", "25")
+                .body(Body::from(sse)).unwrap()
+        }
+    }))
+}
+
+#[tokio::test]
+async fn test_native_codex_responses_is_byte_transparent_and_injects_identity() {
+    let caps = Captures::default();
+    let upstream = TestServer::start(make_codex_responses_upstream(caps.clone())).await;
+    let credential = Credential::Oauth(OAuthCredential {
+        email: Some("codex@example.test".into()),
+        access_token: "codex-access-token".into(),
+        refresh_token: "codex-refresh-token".into(),
+        expires_at: u64::MAX / 2,
+        id_token: Some("identity-token-must-not-be-bearer".into()),
+        chatgpt_account_id: Some("workspace-123".into()),
+        chatgpt_account_is_fedramp: true,
+    });
+    let cfg = Config {
+        server: ServerConfig {
+            host: "127.0.0.1".into(), port: 0, log_level: "error".into(),
+            remote_key: Some("codex-client-secret".into()),
+            ..ServerConfig::default()
+        },
+        accounts: vec![AccountConfig {
+            name: "codex/native".into(), plan_type: "plus".into(), provider: Provider::OpenAI,
+            credential: Some(credential), upstream_url: Some(upstream.url()), model: None,
+        }],
+        config_file: "/dev/null".into(), model_mapping: Default::default(), api_overflow: Default::default(),
+        schema_version: 2, pools: Default::default(), secrets: Default::default(),
+        classifier: Default::default(), bridge: Default::default(),
+    };
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let proxy = TestServer::start(app).await;
+    let body = br#"{"model":"gpt-5.4","stream":true,"input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#;
+    let rejected = Client::new().post(format!("{}/backend-api/codex/responses", proxy.url()))
+        .header("authorization", "Bearer wrong-client-token")
+        .body(body.as_slice()).send().await.unwrap();
+    assert_eq!(rejected.status(), 401);
+    assert_eq!(caps.len(), 0);
+    let response = Client::new().post(format!("{}/backend-api/codex/responses?store=false", proxy.url()))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer codex-client-secret")
+        .header("chatgpt-account-id", "hostile-workspace")
+        .header("x-openai-fedramp", "false")
+        .header("session-id", "session-123")
+        .header("x-client-request-id", "request-123")
+        .body(body.as_slice()).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers().get("x-codex-turn-state").unwrap(), "server-turn-state");
+    let returned = response.bytes().await.unwrap();
+    assert!(String::from_utf8_lossy(&returned).contains("response.output_item.done"));
+    let captured = caps.get(0);
+    assert_eq!(captured.body.as_ref(), body);
+    assert_eq!(captured.uri, "/backend-api/codex/responses?store=false");
+    assert_eq!(captured.headers.get("authorization").unwrap(), "Bearer codex-access-token");
+    assert_eq!(captured.headers.get("chatgpt-account-id").unwrap(), "workspace-123");
+    assert_eq!(captured.headers.get("x-openai-fedramp").unwrap(), "true");
+    assert_eq!(captured.headers.get("session-id").unwrap(), "session-123");
+    assert_eq!(captured.headers.get("x-client-request-id").unwrap(), "request-123");
+}
+
+#[tokio::test]
+async fn test_codex_soft_affinity_fails_over_but_turn_state_is_strict() {
+    let caps = Captures::default();
+    let first_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upstream = TestServer::start(Router::new().route("/backend-api/codex/responses", post({
+        let caps = caps.clone();
+        let first_calls = first_calls.clone();
+        move |req: Request| {
+            let caps = caps.clone();
+            let first_calls = first_calls.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let auth = parts.headers.get("authorization").and_then(|v| v.to_str().ok())
+                    .unwrap_or("").to_owned();
+                let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                caps.push(CapturedRequest {
+                    headers: to_reqwest_headers(&parts.headers), body,
+                    uri: parts.uri.to_string(),
+                });
+                if auth == "Bearer codex-one" && first_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    return Response::builder().status(500).body(Body::from("retryable")).unwrap();
+                }
+                let turn = if auth == "Bearer codex-one" { "turn-one" } else { "turn-two" };
+                let sse = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+                Response::builder().status(200).header("content-type", "text/event-stream")
+                    .header("x-codex-turn-state", turn).body(Body::from(sse)).unwrap()
+            }
+        }
+    }))).await;
+    let account = |name: &str, token: &str| AccountConfig {
+        name: name.into(), plan_type: "plus".into(), provider: Provider::OpenAI,
+        credential: Some(Credential::Oauth(OAuthCredential {
+            email: None, access_token: token.into(), refresh_token: "refresh".into(),
+            expires_at: u64::MAX / 2, id_token: None, chatgpt_account_id: None,
+            chatgpt_account_is_fedramp: false,
+        })),
+        upstream_url: Some(upstream.url()), model: None,
+    };
+    let cfg = Config {
+        server: ServerConfig { host: "127.0.0.1".into(), port: 0, log_level: "error".into(), ..ServerConfig::default() },
+        accounts: vec![account("codex/one", "codex-one"), account("codex/two", "codex-two")],
+        config_file: "/dev/null".into(), model_mapping: Default::default(), api_overflow: Default::default(),
+        schema_version: 2, pools: Default::default(), secrets: Default::default(),
+        classifier: Default::default(), bridge: Default::default(),
+    };
+    let state = StateStore::new_empty().scoped("codex");
+    state.set_pinned(Some("codex/one".into()));
+    let (app, _, _) = create_app_with_state(cfg, state.clone(), None).unwrap();
+    let proxy = TestServer::start(app).await;
+    let body = json!({"model":"gpt-5.4","stream":true,"input":"hello"});
+
+    let first = Client::new().post(format!("{}/backend-api/codex/responses", proxy.url()))
+        .header("session-id", "soft-session").json(&body).send().await.unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(first.headers().get("x-codex-turn-state").unwrap(), "turn-one");
+    let _ = first.bytes().await.unwrap();
+    state.set_pinned(None);
+
+    let soft = Client::new().post(format!("{}/backend-api/codex/responses", proxy.url()))
+        .header("session-id", "soft-session").json(&body).send().await.unwrap();
+    assert_eq!(soft.status(), 200, "soft affinity should fail over after a pre-stream 500");
+    assert_eq!(soft.headers().get("x-codex-turn-state").unwrap(), "turn-two");
+    let _ = soft.bytes().await.unwrap();
+
+    let strict = Client::new().post(format!("{}/backend-api/codex/responses", proxy.url()))
+        .header("x-codex-turn-state", "turn-one").json(&body).send().await.unwrap();
+    assert_eq!(strict.status(), 500, "known turn state must not cross accounts");
+    assert_eq!(caps.len(), 4);
+    assert_eq!(caps.get(0).headers["authorization"], "Bearer codex-one");
+    assert_eq!(caps.get(1).headers["authorization"], "Bearer codex-one");
+    assert_eq!(caps.get(2).headers["authorization"], "Bearer codex-two");
+    assert_eq!(caps.get(3).headers["authorization"], "Bearer codex-one");
+}
+
+#[tokio::test]
+async fn test_codex_api_overflow_reserves_budget_before_dispatch() {
+    let caps = Captures::default();
+    let upstream = TestServer::start(Router::new().route("/v1/responses", post({
+        let caps = caps.clone();
+        move |req: Request| handle_request(req, caps.clone(), false, 200)
+    }))).await;
+    let account_name = "codex/api-overflow".to_owned();
+    let mut overflow = shunt::config::ApiOverflowConfig::default();
+    overflow.enabled = true;
+    overflow.account = Some(account_name.clone());
+    overflow.daily_budget_usd = 0.01;
+    let mut pools = shunt::config::PoolsConfig::default();
+    pools.codex.overflow = overflow.clone();
+    let cfg = Config {
+        server: ServerConfig { host: "127.0.0.1".into(), port: 0, log_level: "error".into(), ..ServerConfig::default() },
+        accounts: vec![AccountConfig {
+            name: account_name, plan_type: "api-overflow".into(), provider: Provider::OpenAIApi,
+            credential: Some(Credential::Apikey { key: "sk-test".into() }), upstream_url: Some(upstream.url()), model: None,
+        }],
+        config_file: "/dev/null".into(), model_mapping: Default::default(), api_overflow: overflow,
+        schema_version: 2, pools, secrets: Default::default(), classifier: Default::default(), bridge: Default::default(),
+    };
+    let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
+    let proxy = TestServer::start(app).await;
+    let response = Client::new().post(format!("{}/backend-api/codex/responses", proxy.url()))
+        .json(&json!({"model":"gpt-5.4","input":"hello","stream":true})).send().await.unwrap();
+    assert_eq!(response.status(), 429);
+    assert_eq!(caps.len(), 0, "over-budget request must be rejected before upstream dispatch");
 }
 
 /// Anthropic request routed to an OpenAI account — shunt translates A→O,
@@ -828,6 +1054,11 @@ async fn test_interop_anthropic_request_to_openai_account() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
         api_overflow: Default::default(),
+        schema_version: 1,
+        pools: Default::default(),
+        secrets: Default::default(),
+        classifier: Default::default(),
+        bridge: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -887,6 +1118,11 @@ async fn test_interop_anthropic_streaming_to_openai_account() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
         api_overflow: Default::default(),
+        schema_version: 1,
+        pools: Default::default(),
+        secrets: Default::default(),
+        classifier: Default::default(),
+        bridge: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -942,6 +1178,11 @@ async fn test_interop_openai_request_to_anthropic_account() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
         api_overflow: Default::default(),
+        schema_version: 1,
+        pools: Default::default(),
+        secrets: Default::default(),
+        classifier: Default::default(),
+        bridge: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -1011,6 +1252,11 @@ async fn test_interop_failover_anthropic_to_openai() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
         api_overflow: Default::default(),
+        schema_version: 1,
+        pools: Default::default(),
+        secrets: Default::default(),
+        classifier: Default::default(),
+        bridge: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -1062,6 +1308,8 @@ async fn test_live_api() {
         refresh_token: String::new(),
         expires_at: u64::MAX / 2,
         id_token: None,
+        chatgpt_account_id: None,
+        chatgpt_account_is_fedramp: false,
     });
 
     let cfg = Config {
@@ -1076,6 +1324,11 @@ async fn test_live_api() {
         config_file: std::path::PathBuf::from("/dev/null"),
         model_mapping: Default::default(),
         api_overflow: Default::default(),
+        schema_version: 1,
+        pools: Default::default(),
+        secrets: Default::default(),
+        classifier: Default::default(),
+        bridge: Default::default(),
     };
 
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();

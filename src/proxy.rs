@@ -5,13 +5,14 @@ use std::time::Instant;
 
 use parking_lot::Mutex as ParkingMutex;
 
-use axum::extract::{Request, State};
+use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use serde_json::json;
+use sha2::Digest;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -101,6 +102,10 @@ struct AppState {
     /// first_seen_ms). Lets a session's first prompts route to the API overflow
     /// lane for fast startup, then graduate to the subscription pool.
     warm_start: Arc<ParkingMutex<HashMap<String, (u64, u64)>>>,
+    /// Codex turn/session affinity. `x-codex-turn-state` entries are strict;
+    /// session/thread/prompt-cache entries are soft hints.
+    codex_affinity: Arc<ParkingMutex<HashMap<String, (String, u64)>>>,
+    codex_models_cache: Arc<ParkingMutex<Option<(Bytes, String, u64)>>>,
 }
 
 /// Simple token-bucket for per-IP rate limiting.
@@ -137,6 +142,22 @@ impl TokenBucket {
 struct SlotGuard {
     limiter: crate::limiter::AdmissionLimiter,
     account: String,
+}
+
+struct BudgetGuard {
+    state: StateStore,
+    id: Option<String>,
+}
+
+impl BudgetGuard {
+    fn new(state: &StateStore, id: String) -> Self { Self { state: state.clone(), id: Some(id) } }
+    fn handoff(mut self) -> Option<String> { self.id.take() }
+}
+
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() { self.state.release_budget_reservation(&id); }
+    }
 }
 
 impl SlotGuard {
@@ -224,6 +245,8 @@ fn build_app_state_with(
         rate_limiter,
         admission,
         warm_start,
+        codex_affinity: Arc::new(ParkingMutex::new(HashMap::new())),
+        codex_models_cache: Arc::new(ParkingMutex::new(None)),
     };
 
     Ok((app_state, credentials))
@@ -238,6 +261,10 @@ pub fn create_proxy_app(
     let (app_state, credentials) = build_app_state(config, state, anthropic_base_url, supabase)?;
 
     let app = Router::new()
+        .route("/backend-api/codex/responses", post(codex_handler))
+        .route("/backend-api/codex/responses/compact", post(codex_handler))
+        .route("/backend-api/codex/models", get(codex_handler))
+        .route("/backend-api/codex/memories/trace_summarize", post(codex_handler))
         .route("/v1/messages", post(proxy_handler))
         .route("/v1/messages/count_tokens", post(proxy_handler))
         .route("/v1/chat/completions", post(openai_compat_handler))
@@ -260,6 +287,11 @@ pub fn create_control_app(
         .route("/health", get(health))
         .route("/status", get(status_handler))
         .route("/use", post(use_handler))
+        .route("/pools/:pool/status", get(pool_status_handler))
+        .route("/pools/:pool/use", post(pool_use_handler))
+        .route("/pools/:pool/model", get(pool_model_get_handler).post(pool_model_set_handler).delete(pool_model_clear_handler))
+        .route("/pools/:pool/strategy", get(pool_strategy_get_handler).post(pool_strategy_set_handler).delete(pool_strategy_clear_handler))
+        .route("/bridge/tools/:tool", post(bridge_tool_handler))
         .route("/model", get(model_get_handler).post(model_set_handler).delete(model_clear_handler))
         .route("/strategy", get(strategy_get_handler).post(strategy_set_handler).delete(strategy_clear_handler))
         .route("/burst-limit", get(burst_limit_get_handler).post(burst_limit_set_handler).delete(burst_limit_clear_handler))
@@ -302,6 +334,10 @@ pub fn create_app_with_state(
         .route("/thinking", get(thinking_get_handler).post(thinking_set_handler).delete(thinking_clear_handler))
         .route("/alerts", get(alerts_get_handler).post(alerts_set_handler))
         // Proxy routes
+        .route("/backend-api/codex/responses", post(codex_handler))
+        .route("/backend-api/codex/responses/compact", post(codex_handler))
+        .route("/backend-api/codex/models", get(codex_handler))
+        .route("/backend-api/codex/memories/trace_summarize", post(codex_handler))
         .route("/v1/messages", post(proxy_handler))
         .route("/v1/messages/count_tokens", post(proxy_handler))
         .route("/v1/chat/completions", post(openai_compat_handler))
@@ -357,6 +393,117 @@ pub fn build_status_snapshot(config: &Config, state: &StateStore, started_ms: u6
 
 async fn health() -> impl IntoResponse {
     axum::Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+fn scoped_pool_state(mut state: AppState, pool: &str) -> Result<AppState, Response> {
+    let pool_kind = match pool {
+        "claude" => crate::config::PoolKind::Claude,
+        "codex" => crate::config::PoolKind::Codex,
+        _ => return Err((StatusCode::NOT_FOUND, axum::Json(json!({"error":"unknown pool"}))).into_response()),
+    };
+    let mut config = (*state.config).clone();
+    config.accounts.retain(|account| match pool_kind {
+        crate::config::PoolKind::Claude => matches!(account.provider, Provider::Anthropic | Provider::AnthropicApi),
+        crate::config::PoolKind::Codex => matches!(account.provider, Provider::OpenAI | Provider::OpenAIApi),
+        crate::config::PoolKind::Legacy => false,
+    });
+    match pool_kind {
+        crate::config::PoolKind::Claude => {
+            config.api_overflow = config.pools.claude.overflow.clone();
+            config.server.routing_strategy = config.pools.claude.routing_strategy;
+        }
+        crate::config::PoolKind::Codex => {
+            config.api_overflow = config.pools.codex.overflow.clone();
+            config.server.routing_strategy = config.pools.codex.routing_strategy;
+        }
+        crate::config::PoolKind::Legacy => {}
+    }
+    state.config = Arc::new(config);
+    state.state = state.state.scoped(pool);
+    Ok(state)
+}
+
+async fn pool_status_handler(AxumPath(pool): AxumPath<String>, State(state): State<AppState>) -> Response {
+    match scoped_pool_state(state, &pool) {
+        Ok(state) => status_handler(State(state)).await.into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn pool_use_handler(
+    AxumPath(pool): AxumPath<String>, State(state): State<AppState>, body: axum::Json<serde_json::Value>,
+) -> Response {
+    match scoped_pool_state(state, &pool) {
+        Ok(state) => use_handler(State(state), body).await,
+        Err(response) => response,
+    }
+}
+
+async fn pool_model_get_handler(AxumPath(pool): AxumPath<String>, State(state): State<AppState>) -> Response {
+    match scoped_pool_state(state, &pool) {
+        Ok(state) => model_get_handler(State(state)).await.into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn pool_model_set_handler(
+    AxumPath(pool): AxumPath<String>, State(state): State<AppState>, body: axum::Json<serde_json::Value>,
+) -> Response {
+    match scoped_pool_state(state, &pool) {
+        Ok(state) => model_set_handler(State(state), body).await,
+        Err(response) => response,
+    }
+}
+
+async fn pool_model_clear_handler(AxumPath(pool): AxumPath<String>, State(state): State<AppState>) -> Response {
+    match scoped_pool_state(state, &pool) {
+        Ok(state) => model_clear_handler(State(state)).await.into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn pool_strategy_get_handler(AxumPath(pool): AxumPath<String>, State(state): State<AppState>) -> Response {
+    match scoped_pool_state(state, &pool) {
+        Ok(state) => strategy_get_handler(State(state)).await.into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn pool_strategy_set_handler(
+    AxumPath(pool): AxumPath<String>, State(state): State<AppState>, body: axum::Json<serde_json::Value>,
+) -> Response {
+    match scoped_pool_state(state, &pool) {
+        Ok(state) => strategy_set_handler(State(state), body).await,
+        Err(response) => response,
+    }
+}
+
+async fn pool_strategy_clear_handler(AxumPath(pool): AxumPath<String>, State(state): State<AppState>) -> Response {
+    match scoped_pool_state(state, &pool) {
+        Ok(state) => strategy_clear_handler(State(state)).await.into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn bridge_tool_handler(
+    AxumPath(tool): AxumPath<String>, State(state): State<AppState>,
+    headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    let bearer = headers.get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let expected = crate::config::local_client_token("bridge").ok();
+    let authorized = matches!((expected.as_deref(), bearer), (Some(expected), Some(actual)) if expected == actual);
+    if !authorized {
+        return (StatusCode::UNAUTHORIZED, axum::Json(json!({"error":"invalid bridge token"}))).into_response();
+    }
+    let caller = body.get("caller").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let arguments = body.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let depth = body.get("depth").and_then(|v| v.as_u64()).unwrap_or(0).min(u8::MAX as u64) as u8;
+    match crate::bridge::dispatch_tool(&tool, caller, arguments, depth, Some(&state.config.config_file)).await {
+        Ok(result) => axum::Json(result).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, axum::Json(json!({"error": error.to_string()}))).into_response(),
+    }
 }
 
 async fn status_handler(State(s): State<AppState>) -> impl IntoResponse {
@@ -720,6 +867,355 @@ fn extract_client_ip(req: &Request, trust_proxy_headers: bool) -> IpAddr {
     IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
 }
 
+fn codex_affinity_keys(headers: &axum::http::HeaderMap, body: &[u8]) -> (Option<String>, Vec<String>) {
+    let strict = headers.get("x-codex-turn-state").and_then(|v| v.to_str().ok())
+        .map(|v| format!("turn:{}", hex::encode(sha2::Sha256::digest(v.as_bytes()))));
+    let mut soft = Vec::new();
+    for name in ["session-id", "thread-id"] {
+        if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            soft.push(format!("{name}:{value}"));
+        }
+    }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) {
+        for name in ["prompt_cache_key", "conversation_id"] {
+            if let Some(value) = value.get(name).and_then(|v| v.as_str()) {
+                soft.push(format!("{name}:{value}"));
+            }
+        }
+    }
+    (strict, soft)
+}
+
+fn codex_upstream(account: &crate::config::AccountConfig, local_path: &str) -> (String, String) {
+    let base = account.upstream_url.as_deref()
+        .unwrap_or_else(|| account.provider.default_upstream_url())
+        .trim_end_matches('/').to_owned();
+    let relative = local_path.strip_prefix("/backend-api/codex").unwrap_or(local_path);
+    match account.provider {
+        Provider::OpenAI => {
+            if base.ends_with("/backend-api/codex") {
+                (base, relative.to_owned())
+            } else {
+                (base, format!("/backend-api/codex{relative}"))
+            }
+        }
+        Provider::OpenAIApi => (base, format!("/v1{relative}")),
+        _ => (base, relative.to_owned()),
+    }
+}
+
+async fn codex_guardian_response(s: &AppState, request_body: &[u8]) -> Option<Response> {
+    if !s.config.classifier.enabled { return None; }
+    let upstream = s.config.classifier.upstream_url.as_deref()?;
+    let classifier_model = s.config.classifier.model.as_deref()?;
+    let start = request_body.len().saturating_sub(64 * 1024);
+    let transcript = String::from_utf8_lossy(&request_body[start..]);
+    let prompt = format!(
+        "You are a fail-closed coding-agent safety reviewer. Review the following Codex auto-review request. Return only JSON with outcome (allow or deny), risk_level, user_authorization, and rationale. If uncertain, deny.\n\n{transcript}");
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().ok()?;
+    let result = client.post(format!("{}/v1/chat/completions", upstream.trim_end_matches('/')))
+        .json(&json!({"model": classifier_model, "messages": [{"role":"user","content":prompt}], "stream":false}))
+        .send().await.ok().and_then(|r| if r.status().is_success() { Some(r) } else { None });
+    let content = match result {
+        Some(response) => response.json::<serde_json::Value>().await.ok()
+            .and_then(|v| v.pointer("/choices/0/message/content").and_then(|v| v.as_str()).map(ToOwned::to_owned)),
+        None => None,
+    };
+    let mut verdict = content.as_deref().and_then(|text| {
+        let trimmed = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        serde_json::from_str::<serde_json::Value>(trimmed).ok()
+    }).unwrap_or_else(|| json!({
+        "outcome":"deny", "risk_level":"high", "user_authorization":"low",
+        "rationale":"Local guardian classifier failed closed."
+    }));
+    if verdict.get("outcome").and_then(|v| v.as_str()) != Some("allow") {
+        verdict["outcome"] = serde_json::Value::String("deny".into());
+    }
+    let response_id = format!("resp_shunt_guardian_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let item_id = format!("msg_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let text = verdict.to_string();
+    let events = [
+        json!({"type":"response.created","response":{"id":response_id}}),
+        json!({"type":"response.output_item.done","item":{"type":"message","role":"assistant","id":item_id,"content":[{"type":"output_text","text":text}]}}),
+        json!({"type":"response.completed","response":{"id":response_id,"usage":{"input_tokens":0,"input_tokens_details":null,"output_tokens":0,"output_tokens_details":null,"total_tokens":0}}}),
+    ];
+    let mut sse = String::new();
+    for event in events {
+        let kind = event["type"].as_str().unwrap_or("response.completed");
+        sse.push_str(&format!("event: {kind}\ndata: {event}\n\n"));
+    }
+    Some(Response::builder().status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(axum::body::Body::from(sse)).expect("guardian response"))
+}
+
+async fn claude_classifier_response(s: &AppState, request_body: &[u8]) -> Option<Response> {
+    if !s.config.classifier.enabled { return None; }
+    let upstream = s.config.classifier.upstream_url.as_deref()?;
+    let classifier_model = s.config.classifier.model.as_deref()?;
+    let start = request_body.len().saturating_sub(CLASSIFIER_MAX_TRANSCRIPT_CHARS);
+    let transcript = String::from_utf8_lossy(&request_body[start..]);
+    let prompt = format!(
+        "Review this coding-agent action for safety. Return exactly <block>yes</block> to block it or <block>no</block> to allow it. Fail closed when uncertain.\n\n{transcript}");
+    let content = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(client) => match client.post(format!("{}/v1/chat/completions", upstream.trim_end_matches('/')))
+            .json(&json!({"model":classifier_model,"messages":[{"role":"user","content":prompt}],"stream":false}))
+            .send().await {
+            Ok(response) if response.status().is_success() => response.json::<serde_json::Value>().await.ok()
+                .and_then(|v| v.pointer("/choices/0/message/content").and_then(|v| v.as_str()).map(ToOwned::to_owned)),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+    let verdict = match content.as_deref() {
+        Some(text) if text.contains("<block>no</block>") => "<block>no</block>",
+        Some(text) if text.contains("<block>yes</block>") => "<block>yes</block>",
+        _ if s.config.classifier.fail_closed => "<block>yes</block>",
+        _ => return None,
+    };
+    let streaming = serde_json::from_slice::<serde_json::Value>(request_body).ok()
+        .and_then(|v| v.get("stream").and_then(|v| v.as_bool())).unwrap_or(false);
+    let id = format!("msg_shunt_classifier_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    if streaming {
+        let events = [
+            ("message_start", json!({"type":"message_start","message":{"id":id,"type":"message","role":"assistant","model":classifier_model,"content":[],"stop_reason":null,"usage":{"input_tokens":0,"output_tokens":0}}})),
+            ("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})),
+            ("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":verdict}})),
+            ("content_block_stop", json!({"type":"content_block_stop","index":0})),
+            ("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+        let mut body = String::new();
+        for (event, data) in events { body.push_str(&format!("event: {event}\ndata: {data}\n\n")); }
+        Some(Response::builder().status(200).header("content-type", "text/event-stream")
+            .body(axum::body::Body::from(body)).expect("classifier SSE response"))
+    } else {
+        Some(axum::Json(json!({
+            "id":id,"type":"message","role":"assistant","model":classifier_model,
+            "content":[{"type":"text","text":verdict}],"stop_reason":"end_turn",
+            "usage":{"input_tokens":0,"output_tokens":1}
+        })).into_response())
+    }
+}
+
+/// Stock Codex Responses transport. Subscription traffic is forwarded without
+/// JSON/SSE translation; only API-overflow output caps may rewrite the body.
+async fn codex_handler(State(s): State<AppState>, req: Request) -> Result<Response, ProxyError> {
+    if let Some(ref expected) = s.config.server.remote_key {
+        let api_key = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let bearer = req.headers().get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
+        let managed_matches = bearer.starts_with("shunt_")
+            && crate::config::local_client_token("codex").ok().as_deref() == Some(bearer);
+        if api_key != expected && bearer != expected && !managed_matches {
+            return Err(ProxyError::Unauthorized);
+        }
+    }
+
+    let method = req.method().as_str().to_owned();
+    let path = req.uri().path().to_owned();
+    let path_and_query = req.uri().path_and_query().map(|v| v.as_str()).unwrap_or(&path).to_owned();
+    let headers = req.headers().clone();
+    let backend_only = path.ends_with("/models") || path.ends_with("/memories/trace_summarize");
+    if method == "GET" && path.ends_with("/models") {
+        if let Some((bytes, content_type, expires)) = s.codex_models_cache.lock().clone() {
+            if expires > now_ms() {
+                return Ok(Response::builder().status(200).header("content-type", content_type)
+                    .header("x-shunt-cache", "hit").body(axum::body::Body::from(bytes)).expect("cached models response"));
+            }
+        }
+    }
+    let mut body = axum::body::to_bytes(req.into_body(), MAX_REQUEST_BODY).await
+        .map_err(|_| ProxyError::BodyRead)?;
+    let mut model = serde_json::from_slice::<serde_json::Value>(&body).ok()
+        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(ToOwned::to_owned))
+        .unwrap_or_default();
+    if let Some(override_model) = s.state.get_model_override() {
+        if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if value.get("model").is_some() {
+                value["model"] = serde_json::Value::String(override_model.clone());
+                body = Bytes::from(serde_json::to_vec(&value).map_err(|_| ProxyError::BodyRead)?);
+                model = override_model;
+            }
+        }
+    }
+    if model == "codex-auto-review" {
+        let local_configured = s.config.classifier.enabled
+            && s.config.classifier.upstream_url.is_some()
+            && s.config.classifier.model.is_some();
+        if local_configured {
+            if let Some(response) = codex_guardian_response(&s, &body).await { return Ok(response); }
+            if s.config.classifier.fail_closed { return Err(ProxyError::AllAccountsUnavailable(None)); }
+        }
+    }
+    let (strict_key, soft_keys) = codex_affinity_keys(&headers, &body);
+    let now = now_ms();
+    let (affinity_account, strict_bound) = {
+        let mut map = s.codex_affinity.lock();
+        map.retain(|_, (_, expires)| *expires > now);
+        let strict = strict_key.as_ref().and_then(|key| map.get(key).map(|(account, _)| account.clone()));
+        let strict_bound = strict.is_some();
+        let account = strict.or_else(|| {
+            soft_keys.iter().find_map(|key| map.get(key).map(|(account, _)| account.clone()))
+        });
+        (account, strict_bound)
+    };
+    let mut tried = HashSet::new();
+    let mut refreshed = HashSet::new();
+    let mut fallback_index = 0usize;
+
+    loop {
+        let overflow_name = s.config.api_overflow.account.as_deref();
+        let bound_account = affinity_account.as_deref().and_then(|bound| {
+            s.config.accounts.iter().find(|a| a.name == bound && !tried.contains(&a.name)
+                && s.state.is_available(&a.name)
+                && (!backend_only || a.provider == Provider::OpenAI))
+        });
+        let selected = bound_account.or_else(|| {
+            if strict_bound { return None; }
+            let mut excluded = tried.clone();
+            if let Some(name) = overflow_name { excluded.insert(name.to_owned()); }
+            let snapshot = s.state.routing_snapshot();
+            let soft_fp = soft_keys.first().map(String::as_str);
+            router::pick_account(
+                &s.config.accounts, &s.state, &snapshot, soft_fp, &excluded,
+                s.config.server.sticky_ttl_ms, s.config.server.expiry_soon_secs,
+                s.config.server.routing_strategy, s.config.server.burst_rpm_limit, None,
+            ).filter(|a| matches!(a.provider, Provider::OpenAI | Provider::OpenAIApi)
+                && (!backend_only || a.provider == Provider::OpenAI))
+                .or_else(|| {
+                    if backend_only { return None; }
+                    let name = overflow_name?;
+                    s.config.accounts.iter().find(|a| a.name == name && !tried.contains(&a.name)
+                        && a.provider == Provider::OpenAIApi && s.state.is_available(&a.name))
+                })
+        });
+        let Some(account) = selected else {
+            if path.ends_with("/responses") {
+                if let Some(fallback) = s.config.pools.codex.fallback_models.get(fallback_index) {
+                    if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        value["model"] = serde_json::Value::String(fallback.clone());
+                        body = Bytes::from(serde_json::to_vec(&value).map_err(|_| ProxyError::BodyRead)?);
+                        model = fallback.clone();
+                        fallback_index += 1;
+                        tried.clear();
+                        continue;
+                    }
+                }
+            }
+            return Err(ProxyError::AllAccountsUnavailable(Some(5)));
+        };
+        let account_name = account.name.clone();
+        let credential = s.credentials.read().await.get(&account_name).cloned()
+            .or_else(|| account.credential.clone());
+        let Some(credential) = credential else {
+            s.state.set_auth_failed(&account_name);
+            tried.insert(account_name);
+            continue;
+        };
+
+        let mut reservation = None;
+        if account.provider == Provider::OpenAIApi {
+            let cap = s.config.api_overflow.max_output_tokens;
+            if method == "POST" {
+                let mut value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| ProxyError::BodyRead)?;
+                let requested = value.get("max_output_tokens").and_then(|v| v.as_u64()).unwrap_or(cap);
+                value["max_output_tokens"] = serde_json::Value::from(requested.min(cap));
+                model = value.get("model").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+                body = Bytes::from(serde_json::to_vec(&value).map_err(|_| ProxyError::BodyRead)?);
+            }
+            let input_upper_bound = body.len() as u64;
+            let Some(estimated) = crate::pricing::strict_api_cost_usd(&model, input_upper_bound, cap) else {
+                warn!(%model, "rejecting Codex API overflow for unpriced model");
+                return Err(ProxyError::AllAccountsUnavailable(Some(60)));
+            };
+            reservation = s.state.reserve_budget(&account_name, estimated, s.config.api_overflow.daily_budget_usd);
+            if reservation.is_none() {
+                warn!(account = %account_name, estimated_usd = estimated, "Codex API overflow daily budget reservation rejected");
+                return Err(ProxyError::AllAccountsUnavailable(Some(60)));
+            }
+        }
+
+        let (upstream, upstream_path) = codex_upstream(account, &path_and_query);
+        let response = s.forwarder.forward_codex(
+            &upstream, &method, &upstream_path, body.clone(), &headers, account, &credential,
+        ).await;
+        let mut response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(id) = reservation.as_deref() { s.state.release_budget_reservation(id); }
+                warn!(account = %account_name, error = %error, "Codex upstream failed before response headers");
+                if strict_bound { return Err(ProxyError::Upstream); }
+                tried.insert(account_name);
+                continue;
+            }
+        };
+
+        if let Some(rate) = account.provider.parse_rate_limits(response.headers()) {
+            s.state.update_rate_limits(&account_name, rate);
+        }
+        let status = response.status().as_u16();
+        if matches!(status, 401 | 429 | 500 | 502 | 503 | 504) {
+            if let Some(id) = reservation.as_deref() { s.state.release_budget_reservation(id); }
+            if status == 401 {
+                if !refreshed.contains(&account_name) {
+                    if let Some(oauth) = credential.as_oauth() {
+                        if let Ok(Ok(fresh)) = tokio::time::timeout(
+                            std::time::Duration::from_secs(20), account.provider.refresh_token(oauth),
+                        ).await {
+                            s.credentials.write().await.insert(account_name.clone(), Credential::Oauth(fresh.clone()));
+                            let mut store = CredentialsStore::load();
+                            store.insert_resolved(account_name.clone(), Credential::Oauth(fresh));
+                            let _ = store.save();
+                            s.state.clear_auth_failed(&account_name);
+                            refreshed.insert(account_name);
+                            continue;
+                        }
+                    }
+                }
+                s.state.set_auth_failed(&account_name);
+            } else if status == 429 {
+                s.state.set_cooldown(&account_name, parse_retry_after_ms(response.headers()).unwrap_or(5_000));
+            }
+            if strict_bound { return Ok(response); }
+            tried.insert(account_name);
+            continue;
+        }
+
+        if method == "GET" && path.ends_with("/models") && status == 200 {
+            let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json").to_owned();
+            let (parts, response_body) = response.into_parts();
+            let bytes = axum::body::to_bytes(response_body, 16 * 1024 * 1024).await
+                .map_err(|_| ProxyError::Upstream)?;
+            *s.codex_models_cache.lock() = Some((bytes.clone(), content_type, now_ms() + 300_000));
+            return Ok(Response::from_parts(parts, axum::body::Body::from(bytes)));
+        }
+
+        let expires = now_ms().saturating_add(s.config.server.sticky_ttl_ms);
+        {
+            let mut map = s.codex_affinity.lock();
+            for key in &soft_keys { map.insert(key.clone(), (account_name.clone(), expires)); }
+            if let Some(value) = response.headers().get("x-codex-turn-state").and_then(|v| v.to_str().ok()) {
+                let key = format!("turn:{}", hex::encode(sha2::Sha256::digest(value.as_bytes())));
+                map.insert(key, (account_name.clone(), now_ms() + 24 * 60 * 60 * 1_000));
+            }
+        }
+        s.state.set_last_used(&account_name);
+        let request_id = uuid::Uuid::new_v4().to_string()[..8].to_owned();
+        response = tap_usage(
+            response, &s.state, s.telemetry.as_ref(), s.supabase.as_ref(), &account_name,
+            &account.provider.to_string(), &model, now, &request_id, &path, tried.len(), false, "",
+            reservation,
+        ).await;
+        return Ok(response);
+    }
+}
+
 async fn proxy_handler(
     State(s): State<AppState>,
     req: Request,
@@ -730,7 +1226,9 @@ async fn proxy_handler(
             .get("x-api-key")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if provided != expected {
+        let managed_matches = provided.starts_with("shunt_")
+            && crate::config::local_client_token("claude").ok().as_deref() == Some(provided);
+        if provided != expected && !managed_matches {
             return Err(ProxyError::Unauthorized);
         }
     }
@@ -857,6 +1355,12 @@ async fn proxy_handler(
     // beta flags. The 1M beta in particular otherwise triggers
     // `400 The long context beta is not yet available for this subscription`.
     let mut headers = headers;
+    if is_classifier
+        && s.config.classifier.upstream_url.is_some()
+        && s.config.classifier.model.is_some()
+    {
+        if let Some(response) = claude_classifier_response(&s, &body_bytes).await { return Ok(response); }
+    }
     if is_simple_model(&model) {
         strip_beta_header_for_simple_model(&mut headers);
         strip_long_context_beta(&mut headers);
@@ -902,7 +1406,7 @@ async fn proxy_handler(
     let api_lane_usable = |tried: &HashSet<String>| -> bool {
         let Some(name) = api_lane_name.as_deref() else { return false };
         if tried.contains(name) { return false; }
-        if s.state.account_spend_today_usd(name) >= ov.daily_budget_usd { return false; }
+        if s.state.account_spend_today_usd(name) + s.state.reserved_today_usd(name) >= ov.daily_budget_usd { return false; }
         s.config.accounts.iter().any(|a| a.name == name && a.credential.is_some())
             && s.state.is_available(name)
     };
@@ -1098,9 +1602,8 @@ async fn proxy_handler(
         s.state.record_request_burst(&account_name);
 
         // Use the live (possibly refreshed) token rather than the one baked into config.
-        // For OpenAI/chatgpt.com accounts, Credential::bearer_token() returns id_token
-        // (short-lived OIDC JWT) which chatgpt.com requires. For all other providers it
-        // returns access_token. API-key accounts return the key directly.
+        // OAuth accounts use their access token. API-key accounts return the
+        // configured key directly.
         let token = {
             let creds = s.credentials.read().await;
             let cred = creds.get(&account_name)
@@ -1126,7 +1629,7 @@ async fn proxy_handler(
         // Defaults to the incoming model; overridden in the OpenAI-compat branch.
         let mut log_model = model.clone();
 
-        let (fwd_path, fwd_body, mut fwd_headers) = if req_is_anthropic == acct_is_anthropic {
+        let (fwd_path, mut fwd_body, mut fwd_headers) = if req_is_anthropic == acct_is_anthropic {
             // Same wire protocol — pass through unchanged.
             (path.clone(), body_bytes.clone(), headers.clone())
         } else if req_is_anthropic && acct_is_chatgpt {
@@ -1168,6 +1671,29 @@ async fn proxy_handler(
                 headers.clone(),
             )
         };
+
+        let mut budget_guard = None;
+        if api_lane_name.as_deref() == Some(account_name.as_str()) {
+            if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&fwd_body) {
+                let output_field = if value.get("max_output_tokens").is_some() { "max_output_tokens" } else { "max_tokens" };
+                let requested = value.get(output_field).and_then(|v| v.as_u64()).unwrap_or(ov.max_output_tokens);
+                value[output_field] = serde_json::Value::from(requested.min(ov.max_output_tokens));
+                fwd_body = Bytes::from(serde_json::to_vec(&value).map_err(|_| ProxyError::BodyRead)?);
+            }
+            let Some(estimated) = crate::pricing::strict_api_cost_usd(
+                &log_model, fwd_body.len() as u64, ov.max_output_tokens,
+            ) else {
+                warn!(model = %log_model, "rejecting Claude API overflow for unpriced model");
+                tried.insert(account_name);
+                continue;
+            };
+            let Some(reservation) = s.state.reserve_budget(&account_name, estimated, ov.daily_budget_usd) else {
+                warn!(account = %account_name, estimated_usd = estimated, "Claude API overflow daily budget reservation rejected");
+                tried.insert(account_name);
+                continue;
+            };
+            budget_guard = Some(BudgetGuard::new(&s.state, reservation));
+        }
 
         // Resolve upstream URL: per-account override (set at load time for non-primary
         // providers, or explicitly in tests) → config server URL.
@@ -1278,7 +1804,8 @@ async fn proxy_handler(
                     // Got Anthropic response; client expects OpenAI.
                     translate_response_anthropic_to_openai(response).await
                 };
-                return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), s.supabase.as_ref(), &account_name, &account.provider.to_string(), &log_model, req_start_ms, &request_id, &path, tried.len(), is_classifier, trace_id.as_deref().unwrap_or("")).await);
+                let reservation = budget_guard.and_then(BudgetGuard::handoff);
+                return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), s.supabase.as_ref(), &account_name, &account.provider.to_string(), &log_model, req_start_ms, &request_id, &path, tried.len(), is_classifier, trace_id.as_deref().unwrap_or(""), reservation).await);
             }
             429 => {
                 let info = account.provider.parse_rate_limits(response.headers());
@@ -1387,11 +1914,8 @@ async fn proxy_handler(
                                 let fresh = fresh.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let mut store = CredentialsStore::load();
-                                    store.accounts.insert(name, Credential::Oauth(fresh.clone()));
+                                    store.insert_resolved(name, Credential::Oauth(fresh.clone()));
                                     store.save().ok();
-                                    if fresh.id_token.is_some() {
-                                        crate::oauth::write_codex_auth_file(&fresh);
-                                    }
                                 });
                                 // Mark as refreshed but don't add to tried — retry this account.
                                 refreshed.insert(account_name);
@@ -1508,6 +2032,7 @@ async fn tap_usage(
     retries: usize,
     is_classifier: bool,
     trace: &str,
+    budget_reservation: Option<String>,
 ) -> Response {
     use axum::body::Body;
     use crate::state::RequestLog;
@@ -1520,10 +2045,14 @@ async fn tap_usage(
         let sb         = supabase.cloned();
         let account    = account.to_owned();
         let provider   = provider.to_owned();
+        let is_codex_provider = provider == "openai";
+        let rate_state = state.clone();
+        let rate_account = account.clone();
         let model      = model.to_owned();
         let request_id = request_id.to_owned();
         let path       = path.to_owned();
         let trace      = trace.to_owned();
+        let reservation = budget_reservation.clone();
         let on_complete = Arc::new(move |input: u64, output: u64| {
             let duration_ms = now_ms().saturating_sub(req_start_ms);
             info!(
@@ -1553,7 +2082,11 @@ async fn tap_usage(
             };
             state.record_usage(&account, input, output);
             state.record_global(&model, input, output);
-            state.record_account_cost(&account, &model, input, output);
+            if let Some(ref id) = reservation {
+                state.reconcile_budget_reservation(id, &model, input, output);
+            } else {
+                state.record_account_cost(&account, &model, input, output);
+            }
             if let Some(ref t) = telem { t.push_event(&log); }
             if let Some(ref sb) = sb {
                 sb.emit_request_complete(&model, &provider, duration_ms, input, output);
@@ -1561,7 +2094,27 @@ async fn tap_usage(
             state.record_request(log);
         });
         let (parts, body) = resp.into_parts();
-        let wrapped = quota::wrap_streaming_body(body, on_complete);
+        let wrapped = if is_codex_provider {
+            let on_rate = Arc::new(move |update: quota::CodexRateUpdate| {
+                let primary = update.primary_used_percent.map(|v| (v / 100.0).clamp(0.0, 1.0));
+                let secondary = update.secondary_used_percent.map(|v| (v / 100.0).clamp(0.0, 1.0));
+                rate_state.update_rate_limits(&rate_account, RateLimitInfo {
+                    utilization_5h: primary,
+                    reset_5h: update.primary_reset_at,
+                    status_5h: primary.map(|v| if v >= 1.0 { "exhausted".into() } else { "allowed".into() }),
+                    utilization_7d: secondary,
+                    reset_7d: update.secondary_reset_at,
+                    status_7d: secondary.map(|v| if v >= 1.0 { "exhausted".into() } else { "allowed".into() }),
+                    overage_status: None,
+                    overage_disabled_reason: None,
+                    representative_claim: None,
+                    updated_ms: now_ms(),
+                });
+            });
+            quota::wrap_streaming_body_with_codex_rates(body, on_complete, on_rate)
+        } else {
+            quota::wrap_streaming_body(body, on_complete)
+        };
         return Response::from_parts(parts, wrapped);
     }
 
@@ -1600,7 +2153,11 @@ async fn tap_usage(
     };
     state.record_usage(account, input, output);
     state.record_global(model, input, output);
-    state.record_account_cost(account, model, input, output);
+    if let Some(ref id) = budget_reservation {
+        state.reconcile_budget_reservation(id, model, input, output);
+    } else {
+        state.record_account_cost(account, model, input, output);
+    }
     if let Some(t) = telemetry { t.push_event(&log); }
     if let Some(sb) = supabase {
         sb.emit_request_complete(model, provider, duration_ms, input, output);
@@ -1671,11 +2228,8 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore, live_c
                 }
             };
             let mut store = crate::config::CredentialsStore::load();
-            store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
+            store.insert_resolved(account.name.clone(), Credential::Oauth(fresh.clone()));
             store.save().ok();
-            if fresh.id_token.is_some() {
-                crate::oauth::write_codex_auth_file(&fresh);
-            }
             // Update live credentials so the proxy uses the fresh token immediately.
             live_creds.write().await.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
 
@@ -1764,13 +2318,10 @@ async fn auth_probe_get(
             }
         };
         let mut store = crate::config::CredentialsStore::load();
-        store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
+        store.insert_resolved(account.name.clone(), Credential::Oauth(fresh.clone()));
         store.save().ok();
-        if fresh.id_token.is_some() {
-            crate::oauth::write_codex_auth_file(&fresh);
-        }
 
-        let fresh_token = fresh.id_token.as_deref().unwrap_or(&fresh.access_token);
+        let fresh_token = &fresh.access_token;
         match do_get(fresh_token).send().await {
             Ok(r2) if r2.status() == reqwest::StatusCode::UNAUTHORIZED => {
                 tracing::error!(account = %account.name, "401 after refresh — needs re-authorization");
@@ -1833,17 +2384,14 @@ async fn do_proactive_refresh(
     tracing::info!(account = %account.name, "proactive OpenAI token refresh");
     match account.provider.refresh_token(creds).await {
         Ok(fresh) => {
-            tracing::info!(account = %account.name, "proactive refresh ok — auth.json updated");
+            tracing::info!(account = %account.name, "proactive refresh ok — Shunt credential updated");
             {
                 let mut map = live_creds.write().await;
                 map.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
             }
             let mut store = crate::config::CredentialsStore::load();
-            store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
+            store.insert_resolved(account.name.clone(), Credential::Oauth(fresh.clone()));
             store.save().ok();
-            if fresh.id_token.is_some() {
-                crate::oauth::write_codex_auth_file(&fresh);
-            }
             state.clear_auth_failed(&account.name);
         }
         Err(e) => {
@@ -1854,13 +2402,9 @@ async fn do_proactive_refresh(
 }
 
 
-/// Keeps shunt's live credentials in sync with Codex CLI's auth.json.
-///
-/// Strategy: never proactively rotate the refresh_token — that races with
-/// Codex CLI's own refresh logic and causes "invalid_grant" errors. Instead,
-/// just periodically sync from auth.json so shunt picks up whatever Codex wrote.
-/// On-demand refresh (401 handler) covers the case where Codex isn't running
-/// and the token has actually expired.
+/// Refreshes Codex credentials without collapsing multiple schema-v2 accounts.
+/// Legacy configs retain the historical auth.json sync; v2 treats auth.json as
+/// an import-only source and thereafter updates Shunt's own credential store.
 pub async fn openai_token_refresh_loop(
     config: Arc<Config>,
     state: StateStore,
@@ -1873,7 +2417,9 @@ pub async fn openai_token_refresh_loop(
         if state.account_states().get(&account.name).map(|s| s.auth_failed).unwrap_or(false) {
             continue;
         }
-        sync_live_creds_from_auth_json(&account.name, &live_creds).await;
+        if config.schema_version < crate::config::CONFIG_SCHEMA_VERSION {
+            sync_live_creds_from_auth_json(&account.name, &live_creds).await;
+        }
 
         let creds = {
             let map = live_creds.read().await;
@@ -1891,14 +2437,21 @@ pub async fn openai_token_refresh_loop(
         }
     }
 
-    // Periodic sync every 5 minutes — picks up any token Codex CLI has written.
-    // No proactive refresh: Codex owns the refresh lifecycle; shunt uses what Codex produces.
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
         for account in config.accounts.iter()
             .filter(|a| a.provider == crate::provider::Provider::OpenAI)
         {
-            sync_live_creds_from_auth_json(&account.name, &live_creds).await;
+            if config.schema_version < crate::config::CONFIG_SCHEMA_VERSION {
+                sync_live_creds_from_auth_json(&account.name, &live_creds).await;
+                continue;
+            }
+            let creds = live_creds.read().await.get(&account.name).cloned();
+            if let Some(oauth) = creds.as_ref().and_then(Credential::as_oauth) {
+                if access_token_expires_soon(oauth, 10) {
+                    do_proactive_refresh(account, oauth, &live_creds, &state).await;
+                }
+            }
         }
     }
 }
@@ -2042,11 +2595,8 @@ pub async fn recovery_watcher(
                     let fresh_owned = fresh.clone();
                     tokio::task::spawn_blocking(move || {
                         let mut store = crate::config::CredentialsStore::load();
-                        store.accounts.insert(name_owned, Credential::Oauth(fresh_owned.clone()));
+                        store.insert_resolved(name_owned, Credential::Oauth(fresh_owned.clone()));
                         store.save().ok();
-                        if fresh_owned.id_token.is_some() {
-                            crate::oauth::write_codex_auth_file(&fresh_owned);
-                        }
                     });
                     state.clear_auth_failed(name);
                     any_recovered = true;
@@ -2250,7 +2800,7 @@ pub async fn health_check_loop(
                                 match account.provider.refresh_token(oauth_cred).await {
                                     Ok(fresh) => {
                                         let mut store = crate::config::CredentialsStore::load();
-                                        store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
+                                        store.insert_resolved(account.name.clone(), Credential::Oauth(fresh.clone()));
                                         store.save().ok();
                                         live_creds.write().await.insert(account.name.clone(), Credential::Oauth(fresh));
                                         state.clear_auth_failed(&account.name);
@@ -2303,7 +2853,7 @@ pub async fn health_check_loop(
                                 match account.provider.refresh_token(oauth_cred).await {
                                     Ok(fresh) => {
                                         let mut store = crate::config::CredentialsStore::load();
-                                        store.accounts.insert(account.name.clone(), Credential::Oauth(fresh.clone()));
+                                        store.insert_resolved(account.name.clone(), Credential::Oauth(fresh.clone()));
                                         store.save().ok();
                                         live_creds.write().await.insert(account.name.clone(), Credential::Oauth(fresh));
                                         state.clear_auth_failed(&account.name);
@@ -3279,7 +3829,7 @@ mod tests {
     fn custom_classifier_prompt_file_declares_the_verdict_contract() {
         // Ship-time guard: the checked-in prompt must still tell the model to
         // emit the <block> grammar, or every verdict silently fails closed.
-        let prompt = include_str!("../../../.config/shunt/harness-classifier.txt");
+        let prompt = include_str!("../examples/classifier-harness-prompt.txt");
         assert!(prompt.contains("<block>no</block>"), "prompt must show the allow token");
         assert!(prompt.contains("<block>yes</block>"), "prompt must show the block token");
     }

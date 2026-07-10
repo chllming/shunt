@@ -1,2 +1,7 @@
 /target/
 *.tar.gz
+.env
+.env.local
+.npmrc
+node_modules/
+*.tgz

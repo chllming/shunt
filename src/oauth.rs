@@ -48,6 +48,14 @@ pub struct OAuthCredential {
     /// OpenAI id_token — required by the Codex CLI's ~/.codex/auth.json
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
+    /// ChatGPT workspace/account routed by the Codex backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[zeroize(skip)]
+    pub chatgpt_account_id: Option<String>,
+    /// Whether this workspace requires the FedRAMP routing header.
+    #[serde(default)]
+    #[zeroize(skip)]
+    pub chatgpt_account_is_fedramp: bool,
 }
 
 impl Clone for OAuthCredential {
@@ -58,6 +66,8 @@ impl Clone for OAuthCredential {
             expires_at: self.expires_at,
             email: self.email.clone(),
             id_token: self.id_token.clone(),
+            chatgpt_account_id: self.chatgpt_account_id.clone(),
+            chatgpt_account_is_fedramp: self.chatgpt_account_is_fedramp,
         }
     }
 }
@@ -70,6 +80,8 @@ impl std::fmt::Debug for OAuthCredential {
             .field("expires_at", &self.expires_at)
             .field("email", &self.email)
             .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
+            .field("chatgpt_account_id", &self.chatgpt_account_id)
+            .field("chatgpt_account_is_fedramp", &self.chatgpt_account_is_fedramp)
             .finish()
     }
 }
@@ -108,11 +120,13 @@ struct CodexTokens {
     refresh_token: Option<String>,
     #[serde(default)]
     id_token: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
-/// Write credentials to ~/.codex/auth.json so the Codex CLI can use them without re-login.
-///
-/// Called automatically after add-account and token refresh for OpenAI accounts.
+/// Legacy opt-in helper for callers that explicitly want to replace Codex's
+/// auth file. The Shunt daemon never calls this: schema-v2 treats auth.json as
+/// import-only and refreshes its own scoped credential copies.
 pub fn write_codex_auth_file(cred: &OAuthCredential) {
     let Some(ref id_token) = cred.id_token else { return };
     let path = codex_credentials_path();
@@ -124,6 +138,7 @@ pub fn write_codex_auth_file(cred: &OAuthCredential) {
             "access_token": cred.access_token,
             "refresh_token": cred.refresh_token,
             "id_token": id_token,
+            "account_id": cred.chatgpt_account_id,
         }
     });
     if let Ok(text) = serde_json::to_string_pretty(&auth) {
@@ -155,12 +170,37 @@ pub fn read_codex_credentials() -> Option<OAuthCredential> {
     let expires_at = jwt_exp_ms(&raw.tokens.access_token)
         .unwrap_or(now_ms + 3600 * 1000); // default: 1 hour from now
 
+    let claims = raw.tokens.id_token.as_deref().and_then(parse_chatgpt_claims);
     Some(OAuthCredential {
         access_token: raw.tokens.access_token,
         refresh_token: raw.tokens.refresh_token.unwrap_or_default(),
         expires_at,
-        email: None,
+        email: claims.as_ref().and_then(|c| c.email.clone()),
         id_token: raw.tokens.id_token,
+        chatgpt_account_id: raw.tokens.account_id.or_else(|| claims.as_ref().and_then(|c| c.account_id.clone())),
+        chatgpt_account_is_fedramp: claims.map(|c| c.fedramp).unwrap_or(false),
+    })
+}
+
+struct ChatgptClaims {
+    email: Option<String>,
+    account_id: Option<String>,
+    fedramp: bool,
+}
+
+fn parse_chatgpt_claims(token: &str) -> Option<ChatgptClaims> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let decoded = base64_url_decode(payload_b64)?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let auth = value.get("https://api.openai.com/auth");
+    Some(ChatgptClaims {
+        email: value.get("email").and_then(|v| v.as_str()).map(ToOwned::to_owned)
+            .or_else(|| value.get("https://api.openai.com/profile")
+                .and_then(|v| v.get("email")).and_then(|v| v.as_str()).map(ToOwned::to_owned)),
+        account_id: auth.and_then(|v| v.get("chatgpt_account_id"))
+            .and_then(|v| v.as_str()).map(ToOwned::to_owned),
+        fedramp: auth.and_then(|v| v.get("chatgpt_account_is_fedramp"))
+            .and_then(|v| v.as_bool()).unwrap_or(false),
     })
 }
 
@@ -171,7 +211,7 @@ pub fn read_codex_credentials() -> Option<OAuthCredential> {
 /// expire more than 25 hours in the future (which would suggest a forged `exp`).
 /// Callers fall back to `now + 1h` when this returns None.
 pub(crate) fn jwt_exp_ms(token: &str) -> Option<u64> {
-    let payload_b64 = token.splitn(3, '.').nth(1)?;
+    let payload_b64 = token.split('.').nth(1)?;
     let decoded = base64_url_decode(payload_b64)?;
     let v: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
     let exp_secs = v.get("exp")?.as_u64()?;
@@ -308,6 +348,8 @@ fn parse_claude_credentials_json(text: &str) -> Option<OAuthCredential> {
         expires_at: inner.expires_at,
         email: None,
         id_token: None,
+        chatgpt_account_id: None,
+        chatgpt_account_is_fedramp: false,
     })
 }
 
@@ -360,7 +402,10 @@ pub async fn refresh_token(cred: &OAuthCredential) -> Result<OAuthCredential> {
         .as_millis() as u64;
     let expires_at = now_ms + expires_in_secs * 1000;
 
-    Ok(OAuthCredential { access_token, refresh_token, expires_at, email: cred.email.clone(), id_token: None })
+    Ok(OAuthCredential {
+        access_token, refresh_token, expires_at, email: cred.email.clone(), id_token: None,
+        chatgpt_account_id: None, chatgpt_account_is_fedramp: false,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +593,8 @@ async fn exchange_code(code: &str, state: &str, redirect_uri: &str, verifier: &s
         expires_at: now_ms + expires_in * 1000,
         email: None,
         id_token: None,
+        chatgpt_account_id: None,
+        chatgpt_account_is_fedramp: false,
     })
 }
 
@@ -624,12 +671,17 @@ pub async fn refresh_openai_token(cred: &OAuthCredential) -> Result<OAuthCredent
         .unwrap_or_default()
         .as_millis() as u64;
 
+    let claims = id_token.as_deref().and_then(parse_chatgpt_claims);
     Ok(OAuthCredential {
         access_token,
         refresh_token,
         expires_at: now_ms + expires_in_secs * 1000,
         email: cred.email.clone(),
         id_token,
+        chatgpt_account_id: claims.as_ref().and_then(|c| c.account_id.clone())
+            .or_else(|| cred.chatgpt_account_id.clone()),
+        chatgpt_account_is_fedramp: claims.map(|c| c.fedramp)
+            .unwrap_or(cred.chatgpt_account_is_fedramp),
     })
 }
 
@@ -770,7 +822,16 @@ pub async fn run_openai_oauth_flow() -> Result<OAuthCredential> {
         now_ms + body["expires_in"].as_u64().unwrap_or(3600) * 1000
     });
 
-    Ok(OAuthCredential { access_token, refresh_token, expires_at, email: None, id_token })
+    let claims = id_token.as_deref().and_then(parse_chatgpt_claims);
+    Ok(OAuthCredential {
+        access_token,
+        refresh_token,
+        expires_at,
+        email: claims.as_ref().and_then(|c| c.email.clone()),
+        id_token,
+        chatgpt_account_id: claims.as_ref().and_then(|c| c.account_id.clone()),
+        chatgpt_account_is_fedramp: claims.map(|c| c.fedramp).unwrap_or(false),
+    })
 }
 
 // ---------------------------------------------------------------------------

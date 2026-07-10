@@ -209,18 +209,20 @@ fn load_addrs() -> Vec<(String, String)> {
     };
 
     let host = &cfg.server.host;
-    let primary_port = cfg.server.port;
-
+    let mut out = Vec::new();
+    if cfg.accounts.iter().any(|a| matches!(a.provider, Provider::Anthropic | Provider::AnthropicApi)) {
+        out.push(("claude".into(), format!("http://{host}:{}", cfg.pools.claude.port)));
+    }
+    if cfg.accounts.iter().any(|a| matches!(a.provider, Provider::OpenAI | Provider::OpenAIApi)) {
+        out.push(("codex".into(), format!("http://{host}:{}", cfg.pools.codex.port)));
+    }
     use std::collections::BTreeSet;
-    let providers: BTreeSet<String> = cfg.accounts.iter()
-        .map(|a| a.provider.to_string())
-        .collect();
-
-    providers.into_iter().map(|p| {
-        let port = match Provider::from_str(&p) {
-            Provider::Anthropic => primary_port,
-            other => other.default_port(),
-        };
+    let providers: BTreeSet<String> = cfg.accounts.iter().filter(|a| !matches!(a.provider,
+        Provider::Anthropic | Provider::AnthropicApi | Provider::OpenAI | Provider::OpenAIApi))
+        .map(|a| a.provider.to_string()).collect();
+    out.extend(providers.into_iter().map(|p| {
+        let port = Provider::from_str(&p).default_port();
         (p, format!("http://{host}:{port}"))
-    }).collect()
+    }));
+    out
 }
