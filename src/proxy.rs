@@ -2202,7 +2202,10 @@ pub async fn prefetch_rate_limits(config: Arc<Config>, state: StateStore, live_c
             }
             continue;
         };
-        let url = format!("{}{}", config.server.upstream_url, path);
+        let upstream = account.upstream_url.as_deref()
+            .unwrap_or(&config.server.upstream_url)
+            .trim_end_matches('/');
+        let url = format!("{upstream}{path}");
 
         let resp = prefetch_send(&client, &url, &account.provider, cred.bearer_token(), &body).await;
 
@@ -2669,7 +2672,10 @@ async fn post_cooldown_prefetch(
         }
         return;
     };
-    let url = format!("{upstream_url}{path}");
+    let upstream = account.upstream_url.as_deref()
+        .unwrap_or(upstream_url)
+        .trim_end_matches('/');
+    let url = format!("{upstream}{path}");
     match prefetch_send(client, &url, &account.provider, token, &body).await {
         Ok(r) => {
             // If the prefetch itself gets 429'd, the upstream rate limit hasn't
@@ -3567,6 +3573,69 @@ fn resolve_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn anthropic_prefetch_uses_the_account_upstream_override() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let hits = hits_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        [
+                            ("anthropic-ratelimit-unified-5h-utilization", "0.1"),
+                            ("anthropic-ratelimit-unified-7d-utilization", "0.2"),
+                        ],
+                        Json(json!({"type": "message"})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let account_name = "claude/smoke".to_owned();
+        let config = crate::config::Config {
+            schema_version: crate::config::CONFIG_SCHEMA_VERSION,
+            server: crate::config::ServerConfig {
+                upstream_url: "http://127.0.0.1:1".to_owned(),
+                ..Default::default()
+            },
+            accounts: vec![crate::config::AccountConfig {
+                name: account_name.clone(),
+                plan_type: "api".to_owned(),
+                provider: Provider::AnthropicApi,
+                credential: Some(Credential::Apikey { key: "test-key".to_owned() }),
+                upstream_url: Some(format!("http://{address}/")),
+                model: None,
+            }],
+            config_file: "/dev/null".into(),
+            model_mapping: Default::default(),
+            api_overflow: Default::default(),
+            pools: Default::default(),
+            secrets: Default::default(),
+            classifier: Default::default(),
+            bridge: Default::default(),
+        };
+        let state = StateStore::new_empty();
+        let live_credentials = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        prefetch_rate_limits(Arc::new(config), state.clone(), live_credentials).await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let limits = state.rate_limit_snapshot();
+        assert_eq!(limits[&account_name].utilization_5h, Some(0.1));
+        assert_eq!(limits[&account_name].utilization_7d, Some(0.2));
+        assert!(!state.account_states().get(&account_name).map(|s| s.auth_failed).unwrap_or(false));
+        server.abort();
+    }
 
     fn make_info(status_5h: Option<&str>, reset_5h: Option<u64>, status_7d: Option<&str>, reset_7d: Option<u64>) -> RateLimitInfo {
         RateLimitInfo {
