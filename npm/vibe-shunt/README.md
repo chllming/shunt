@@ -17,7 +17,7 @@ Every prompt also has a non-interactive flag. For example:
 
 ```bash
 npx vibe-shunt --yes
-npx vibe-shunt --repo chllming/shunt --version v0.1.148 --install-dir ~/.local/bin
+npx vibe-shunt --repo chllming/shunt --version v0.1.149 --install-dir ~/.local/bin
 npx vibe-shunt --yes --no-setup --no-install-clients --no-service --no-start
 ```
 

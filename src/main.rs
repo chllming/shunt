@@ -1,7 +1,9 @@
 use shunt::term::{bold_white, brand_green, cyan, dim};
+use std::path::{Path, PathBuf};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    let config_override = config_override_from_args(&args);
     let is_start = args.iter().any(|a| a == "start");
     let is_foreground = args.iter().any(|a| a == "--foreground");
     let is_daemon = args.iter().any(|a| a == "--daemon");
@@ -13,8 +15,8 @@ fn main() -> anyhow::Result<()> {
         // a no-op when the proxy is up — otherwise every new shell tears down the
         // listener for a moment and Claude Code sees ConnectionRefused mid-request.
         // Use `--force` (or `shunt restart`) to deliberately replace a running daemon.
-        if !is_force && daemon_healthy() {
-            print_already_running();
+        if !is_force && daemon_healthy(config_override.as_deref()) {
+            print_already_running(config_override.as_deref());
             return Ok(());
         }
 
@@ -25,7 +27,7 @@ fn main() -> anyhow::Result<()> {
         if !is_foreground {
             // Daemonize by re-execing self with --_daemon (avoids fork() issues on macOS).
             // The child runs the server in the background; we print a status line and exit.
-            spawn_daemon();
+            spawn_daemon(config_override.as_deref());
             // spawn_daemon() exits — we never reach here unless spawn failed.
         }
     }
@@ -34,6 +36,24 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?
         .block_on(shunt::cli::run())
+}
+
+/// Extract Clap's `--config PATH` or `--config=PATH` before the async runtime
+/// starts. The idempotency guard runs before full CLI parsing, but it must probe
+/// the control port belonging to the requested configuration rather than an
+/// unrelated daemon using the default config.
+fn config_override_from_args(args: &[String]) -> Option<PathBuf> {
+    for (index, argument) in args.iter().enumerate().skip(1) {
+        if argument == "--config" {
+            return args.get(index + 1).filter(|value| !value.starts_with('-')).map(PathBuf::from);
+        }
+        if let Some(value) = argument.strip_prefix("--config=") {
+            if !value.is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+    None
 }
 
 fn preflight_kill() {
@@ -57,14 +77,16 @@ fn preflight_kill() {
 /// HTTP/1.0 request to the control port's `/health` endpoint using blocking std
 /// sockets with tight timeouts. Runs BEFORE the tokio runtime and before any
 /// kill, so it must not depend on async and must never hang.
-fn daemon_healthy() -> bool {
+fn daemon_healthy(config_override: Option<&Path>) -> bool {
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
 
-    let control_port = shunt::config::load_config(None)
-        .map(|c| c.server.control_port)
-        .unwrap_or(19081);
+    let control_port = match shunt::config::load_config(config_override) {
+        Ok(config) => config.server.control_port,
+        Err(_) if config_override.is_some() => return false,
+        Err(_) => 19081,
+    };
 
     let mut addrs = match format!("127.0.0.1:{control_port}").to_socket_addrs() {
         Ok(it) => it,
@@ -89,8 +111,8 @@ fn daemon_healthy() -> bool {
 }
 
 /// Status line printed when `shunt start` finds the daemon already healthy.
-fn print_already_running() {
-    let addrs = load_addrs();
+fn print_already_running(config_override: Option<&Path>) {
+    let addrs = load_addrs(config_override);
     println!();
     println!("  {}  {}  {}",
         brand_green("◆"),
@@ -121,7 +143,7 @@ fn pid_is_shunt(pid: u32) -> bool {
 /// Re-exec self with --_daemon flag so the child runs the server.
 /// Opens the log file for the child's stdout/stderr, prints a brief status
 /// line to the terminal, then exits so the shell prompt returns.
-fn spawn_daemon() {
+fn spawn_daemon(config_override: Option<&Path>) {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -177,7 +199,7 @@ fn spawn_daemon() {
 
     match result {
         Ok(_child) => {
-            let addrs = load_addrs();
+            let addrs = load_addrs(config_override);
             println!();
             println!("  {}  {}  {}",
                 brand_green("◆"),
@@ -201,10 +223,10 @@ fn spawn_daemon() {
 
 /// Returns `(provider_label, url)` for each provider found in the config.
 /// Falls back to just the Anthropic default if the config can't be loaded.
-fn load_addrs() -> Vec<(String, String)> {
+fn load_addrs(config_override: Option<&Path>) -> Vec<(String, String)> {
     use shunt::provider::Provider;
 
-    let Ok(cfg) = shunt::config::load_config(None) else {
+    let Ok(cfg) = shunt::config::load_config(config_override) else {
         return vec![("anthropic".into(), "http://127.0.0.1:8082".into())];
     };
 
@@ -225,4 +247,75 @@ fn load_addrs() -> Vec<(String, String)> {
         (p, format!("http://{host}:{port}"))
     }));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_override_supports_separate_and_inline_values() {
+        let separate = vec![
+            "shunt".to_owned(),
+            "start".to_owned(),
+            "--config".to_owned(),
+            "/tmp/separate.toml".to_owned(),
+        ];
+        assert_eq!(
+            config_override_from_args(&separate),
+            Some(PathBuf::from("/tmp/separate.toml")),
+        );
+
+        let inline = vec![
+            "shunt".to_owned(),
+            "start".to_owned(),
+            "--config=/tmp/inline.toml".to_owned(),
+        ];
+        assert_eq!(
+            config_override_from_args(&inline),
+            Some(PathBuf::from("/tmp/inline.toml")),
+        );
+    }
+
+    #[test]
+    fn config_override_rejects_missing_values() {
+        let missing = vec!["shunt".to_owned(), "start".to_owned(), "--config".to_owned()];
+        assert_eq!(config_override_from_args(&missing), None);
+
+        let empty = vec!["shunt".to_owned(), "start".to_owned(), "--config=".to_owned()];
+        assert_eq!(config_override_from_args(&empty), None);
+    }
+
+    #[test]
+    fn address_discovery_uses_the_requested_config() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("shunt-main-config-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+schema_version = 2
+[server]
+host = "127.0.0.1"
+control_port = 29181
+[pools.claude]
+port = 28182
+[[pools.claude.accounts]]
+name = "smoke"
+provider = "anthropic-api"
+api_key = "test-only"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_addrs(Some(&config)),
+            vec![("claude".to_owned(), "http://127.0.0.1:28182".to_owned())],
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

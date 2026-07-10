@@ -1,6 +1,6 @@
 {
   "name": "vibe-shunt",
-  "version": "0.1.148",
+  "version": "0.1.149",
   "description": "Interactive, verified installer for the Shunt native Claude and Codex proxy",
   "type": "module",
   "bin": {
