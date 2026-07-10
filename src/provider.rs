@@ -34,6 +34,8 @@ pub enum WireProtocol {
     Anthropic,
     /// OpenAI-compatible Chat Completions format.
     OpenAICompat,
+    /// OpenAI Responses protocol used by stock Codex.
+    OpenAIResponses,
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +129,8 @@ impl Provider {
     pub fn wire_protocol(&self) -> WireProtocol {
         match self {
             Provider::Anthropic | Provider::AnthropicApi => WireProtocol::Anthropic,
-            _                   => WireProtocol::OpenAICompat,
+            Provider::OpenAI => WireProtocol::OpenAIResponses,
+            _ => WireProtocol::OpenAICompat,
         }
     }
 
@@ -140,8 +143,8 @@ impl Provider {
         match self {
             Provider::Anthropic   => "claude-sonnet-4-6",
             Provider::AnthropicApi => "claude-haiku-4-5-20251001",
-            Provider::OpenAI      => "gpt-4o",
-            Provider::OpenAIApi   => "gpt-4o",
+            Provider::OpenAI      => "gpt-5.4",
+            Provider::OpenAIApi   => "gpt-5.4",
             Provider::OllamaCloud => "llama3.3",
             Provider::Groq        => "llama-3.3-70b-versatile",
             Provider::Mistral     => "mistral-large-latest",
@@ -370,9 +373,10 @@ impl Provider {
 
         match self {
             Provider::Anthropic | Provider::AnthropicApi => parse_anthropic_rate_limits(headers, now_ms),
+            Provider::OpenAI => parse_codex_rate_limits(headers, now_ms)
+                .or_else(|| parse_openai_rate_limits(headers, now_ms)),
             // OpenAI-compat providers that return x-ratelimit-* headers.
-            Provider::OpenAI
-            | Provider::OpenAIApi
+            Provider::OpenAIApi
             | Provider::OllamaCloud
             | Provider::Groq
             | Provider::Mistral
@@ -421,6 +425,30 @@ impl Provider {
             _ => anyhow::bail!("provider {} does not support token refresh", self),
         }
     }
+}
+
+fn parse_codex_rate_limits(headers: &HeaderMap, now_ms: u64) -> Option<RateLimitInfo> {
+    fn number(h: &HeaderMap, name: &str) -> Option<f64> {
+        h.get(name)?.to_str().ok()?.parse().ok()
+    }
+    fn integer(h: &HeaderMap, name: &str) -> Option<u64> {
+        h.get(name)?.to_str().ok()?.parse().ok()
+    }
+    let primary = number(headers, "x-codex-primary-used-percent").map(|v| (v / 100.0).clamp(0.0, 1.0));
+    let secondary = number(headers, "x-codex-secondary-used-percent").map(|v| (v / 100.0).clamp(0.0, 1.0));
+    if primary.is_none() && secondary.is_none() { return None; }
+    Some(RateLimitInfo {
+        utilization_5h: primary,
+        reset_5h: integer(headers, "x-codex-primary-reset-at"),
+        status_5h: primary.map(|v| if v >= 1.0 { "exhausted".into() } else { "allowed".into() }),
+        utilization_7d: secondary,
+        reset_7d: integer(headers, "x-codex-secondary-reset-at"),
+        status_7d: secondary.map(|v| if v >= 1.0 { "exhausted".into() } else { "allowed".into() }),
+        overage_status: None,
+        overage_disabled_reason: None,
+        representative_claim: None,
+        updated_ms: now_ms,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -598,7 +626,8 @@ mod tests {
     #[test]
     fn test_wire_protocol() {
         assert_eq!(Provider::Anthropic.wire_protocol(), WireProtocol::Anthropic);
-        assert_eq!(Provider::OpenAI.wire_protocol(), WireProtocol::OpenAICompat);
+        assert_eq!(Provider::OpenAI.wire_protocol(), WireProtocol::OpenAIResponses);
+        assert_eq!(Provider::OpenAIApi.wire_protocol(), WireProtocol::OpenAICompat);
         assert_eq!(Provider::Groq.wire_protocol(), WireProtocol::OpenAICompat);
         assert_eq!(Provider::Local.wire_protocol(), WireProtocol::OpenAICompat);
     }

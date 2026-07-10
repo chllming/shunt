@@ -165,6 +165,14 @@ pub struct DailyBucket {
     pub api_cost_usd: f64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct BudgetReservation {
+    account: String,
+    day: String,
+    usd: f64,
+    created_ms: u64,
+}
+
 /// Snapshot returned by `savings_snapshot()` for the status endpoint + CLI.
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct SavingsSnapshot {
@@ -192,34 +200,50 @@ struct StateData {
     /// If set, all requests are forced to this account (overrides routing).
     #[serde(default)]
     pinned_account: Option<String>,
+    #[serde(default)]
+    pinned_by_pool: HashMap<String, Option<String>>,
     /// The most recent account that successfully handled a proxied request.
     #[serde(default)]
     last_used_account: Option<String>,
+    #[serde(default)]
+    last_used_by_pool: HashMap<String, String>,
     /// Recent request log — capped at MAX_RECENT entries, persisted to survive restarts.
     #[serde(default)]
     recent_requests: VecDeque<RequestLog>,
     /// Runtime model override — all requests use this model if set (ephemeral).
     #[serde(skip)]
     model_override: Option<String>,
+    #[serde(skip)]
+    model_override_by_pool: HashMap<String, String>,
     /// Runtime routing strategy override (ephemeral — not persisted).
     #[serde(skip)]
     routing_strategy_override: Option<RoutingStrategy>,
+    #[serde(skip)]
+    routing_strategy_by_pool: HashMap<String, RoutingStrategy>,
     /// Per-account burst window: timestamps of recent requests (ephemeral).
     #[serde(skip)]
     burst_windows: HashMap<String, VecDeque<u64>>,
     /// Runtime burst RPM limit override (ephemeral).
     #[serde(skip)]
     burst_rpm_limit_override: Option<u32>,
+    #[serde(skip)]
+    burst_rpm_limit_by_pool: HashMap<String, u32>,
     /// Runtime fallback model override (ephemeral).
     /// `Some(Some("model"))` = explicit override, `Some(None)` = explicitly disabled, `None` = use config/auto.
     #[serde(skip)]
     fallback_model_override: Option<Option<String>>,
+    #[serde(skip)]
+    fallback_model_by_pool: HashMap<String, Option<String>>,
     /// Runtime effort override (ephemeral). None = passthrough, Some("max") = override.
     #[serde(skip)]
     effort_override: Option<String>,
+    #[serde(skip)]
+    effort_by_pool: HashMap<String, String>,
     /// Runtime thinking mode override (ephemeral). None = passthrough, Some("adaptive"/"disabled") = override.
     #[serde(skip)]
     thinking_override: Option<String>,
+    #[serde(skip)]
+    thinking_by_pool: HashMap<String, String>,
     /// Daily token + cost buckets keyed by "YYYY-MM-DD" (all accounts combined).
     #[serde(default)]
     global_daily: HashMap<String, DailyBucket>,
@@ -227,6 +251,10 @@ struct StateData {
     /// enforce the API overflow lane's daily USD budget.
     #[serde(default)]
     per_account_daily: HashMap<String, HashMap<String, DailyBucket>>,
+    /// In-flight overflow reservations. They are persisted and count for their
+    /// entire UTC day if a process dies before usage can be reconciled.
+    #[serde(default)]
+    budget_reservations: HashMap<String, BudgetReservation>,
     /// All-time totals.
     #[serde(default)]
     all_time_input: u64,
@@ -244,12 +272,18 @@ struct StateData {
 pub struct StateStore {
     path: PathBuf,
     inner: Arc<Mutex<StateData>>,
+    /// Serializes snapshots with durable writes so an older background
+    /// snapshot cannot overwrite a just-admitted budget reservation.
+    disk_lock: Arc<Mutex<()>>,
     /// Set to true when a write is needed; the background writer thread clears it.
     pending: Arc<AtomicBool>,
     /// Monotonically-increasing counter for round-robin account selection.
     round_robin: Arc<AtomicUsize>,
     /// When true, all daemon alert notifications are suppressed (ephemeral).
     alerts_muted: Arc<AtomicBool>,
+    /// Runtime namespace for pool-specific pins and overrides. Legacy aliases
+    /// intentionally use `claude`.
+    namespace: String,
 }
 
 impl StateStore {
@@ -259,9 +293,11 @@ impl StateStore {
         Self {
             path: PathBuf::from("/dev/null"),
             inner: Arc::new(Mutex::new(StateData::default())),
+            disk_lock: Arc::new(Mutex::new(())),
             pending: Arc::new(AtomicBool::new(false)),
             round_robin: Arc::new(AtomicUsize::new(0)),
             alerts_muted: Arc::new(AtomicBool::new(false)),
+            namespace: "claude".into(),
         }
     }
 
@@ -291,12 +327,21 @@ impl StateStore {
         let store = Self {
             path: path.to_owned(),
             inner: Arc::new(Mutex::new(data)),
+            disk_lock: Arc::new(Mutex::new(())),
             pending: Arc::new(AtomicBool::new(false)),
             round_robin: Arc::new(AtomicUsize::new(0)),
             alerts_muted: Arc::new(AtomicBool::new(false)),
+            namespace: "claude".into(),
         };
         store.start_writer_thread();
         store
+    }
+
+    pub fn scoped(&self, namespace: &str) -> Self {
+        let mut scoped = self.clone();
+        scoped.namespace = namespace.to_owned();
+        scoped.round_robin = Arc::new(AtomicUsize::new(0));
+        scoped
     }
 
     /// Spawn a single background thread that flushes state to disk at most every 100 ms.
@@ -304,11 +349,13 @@ impl StateStore {
     fn start_writer_thread(&self) {
         let pending = Arc::clone(&self.pending);
         let inner   = Arc::clone(&self.inner);
+        let disk_lock = Arc::clone(&self.disk_lock);
         let path    = self.path.clone();
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if pending.compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    let _disk = disk_lock.lock();
                     let data = inner.lock().clone();
                     if let Err(e) = write_to_disk(&data, &path) {
                         warn!("Failed to persist state: {e}");
@@ -322,6 +369,7 @@ impl StateStore {
     /// the final state (including the last few requests and token counts) is
     /// persisted before the process exits.
     pub fn flush_sync(&self) {
+        let _disk = self.disk_lock.lock();
         let data = self.inner.lock().clone();
         if let Err(e) = write_to_disk(&data, &self.path) {
             warn!("Final state flush failed: {e}");
@@ -754,13 +802,16 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn get_pinned(&self) -> Option<String> {
-        self.inner.lock().pinned_account.clone()
+        let data = self.inner.lock();
+        if self.namespace == "claude" { data.pinned_account.clone() }
+        else { data.pinned_by_pool.get(&self.namespace).cloned().flatten() }
     }
 
     pub fn set_pinned(&self, name: Option<String>) {
         {
             let mut data = self.inner.lock();
-            data.pinned_account = name;
+            if self.namespace == "claude" { data.pinned_account = name; }
+            else { data.pinned_by_pool.insert(self.namespace.clone(), name); }
         }
         self.persist();
     }
@@ -770,13 +821,16 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn get_last_used(&self) -> Option<String> {
-        self.inner.lock().last_used_account.clone()
+        let data = self.inner.lock();
+        if self.namespace == "claude" { data.last_used_account.clone() }
+        else { data.last_used_by_pool.get(&self.namespace).cloned() }
     }
 
     pub fn set_last_used(&self, name: &str) {
         {
             let mut data = self.inner.lock();
-            data.last_used_account = Some(name.to_owned());
+            if self.namespace == "claude" { data.last_used_account = Some(name.to_owned()); }
+            else { data.last_used_by_pool.insert(self.namespace.clone(), name.to_owned()); }
         }
         self.persist();
     }
@@ -786,15 +840,21 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn get_model_override(&self) -> Option<String> {
-        self.inner.lock().model_override.clone()
+        let data = self.inner.lock();
+        if self.namespace == "claude" { data.model_override.clone() }
+        else { data.model_override_by_pool.get(&self.namespace).cloned() }
     }
 
     pub fn set_model_override(&self, model: String) {
-        self.inner.lock().model_override = Some(model);
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.model_override = Some(model); }
+        else { data.model_override_by_pool.insert(self.namespace.clone(), model); }
     }
 
     pub fn clear_model_override(&self) {
-        self.inner.lock().model_override = None;
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.model_override = None; }
+        else { data.model_override_by_pool.remove(&self.namespace); }
     }
 
     // -----------------------------------------------------------------------
@@ -802,15 +862,21 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn get_routing_strategy(&self) -> Option<RoutingStrategy> {
-        self.inner.lock().routing_strategy_override
+        let data = self.inner.lock();
+        if self.namespace == "claude" { data.routing_strategy_override }
+        else { data.routing_strategy_by_pool.get(&self.namespace).copied() }
     }
 
     pub fn set_routing_strategy(&self, strategy: RoutingStrategy) {
-        self.inner.lock().routing_strategy_override = Some(strategy);
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.routing_strategy_override = Some(strategy); }
+        else { data.routing_strategy_by_pool.insert(self.namespace.clone(), strategy); }
     }
 
     pub fn clear_routing_strategy(&self) {
-        self.inner.lock().routing_strategy_override = None;
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.routing_strategy_override = None; }
+        else { data.routing_strategy_by_pool.remove(&self.namespace); }
     }
 
     // -----------------------------------------------------------------------
@@ -818,15 +884,21 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn get_burst_rpm_limit_override(&self) -> Option<u32> {
-        self.inner.lock().burst_rpm_limit_override
+        let data = self.inner.lock();
+        if self.namespace == "claude" { data.burst_rpm_limit_override }
+        else { data.burst_rpm_limit_by_pool.get(&self.namespace).copied() }
     }
 
     pub fn set_burst_rpm_limit_override(&self, limit: u32) {
-        self.inner.lock().burst_rpm_limit_override = Some(limit);
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.burst_rpm_limit_override = Some(limit); }
+        else { data.burst_rpm_limit_by_pool.insert(self.namespace.clone(), limit); }
     }
 
     pub fn clear_burst_rpm_limit_override(&self) {
-        self.inner.lock().burst_rpm_limit_override = None;
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.burst_rpm_limit_override = None; }
+        else { data.burst_rpm_limit_by_pool.remove(&self.namespace); }
     }
 
     // -----------------------------------------------------------------------
@@ -836,15 +908,21 @@ impl StateStore {
     /// Returns `Some(Some("model"))` for explicit override, `Some(None)` for explicitly disabled,
     /// `None` for "use config/auto".
     pub fn get_fallback_model_override(&self) -> Option<Option<String>> {
-        self.inner.lock().fallback_model_override.clone()
+        let data = self.inner.lock();
+        if self.namespace == "claude" { data.fallback_model_override.clone() }
+        else { data.fallback_model_by_pool.get(&self.namespace).cloned() }
     }
 
     pub fn set_fallback_model_override(&self, model: Option<String>) {
-        self.inner.lock().fallback_model_override = Some(model);
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.fallback_model_override = Some(model); }
+        else { data.fallback_model_by_pool.insert(self.namespace.clone(), model); }
     }
 
     pub fn clear_fallback_model_override(&self) {
-        self.inner.lock().fallback_model_override = None;
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.fallback_model_override = None; }
+        else { data.fallback_model_by_pool.remove(&self.namespace); }
     }
 
     // -----------------------------------------------------------------------
@@ -852,15 +930,21 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn get_effort_override(&self) -> Option<String> {
-        self.inner.lock().effort_override.clone()
+        let data = self.inner.lock();
+        if self.namespace == "claude" { data.effort_override.clone() }
+        else { data.effort_by_pool.get(&self.namespace).cloned() }
     }
 
     pub fn set_effort_override(&self, effort: String) {
-        self.inner.lock().effort_override = Some(effort);
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.effort_override = Some(effort); }
+        else { data.effort_by_pool.insert(self.namespace.clone(), effort); }
     }
 
     pub fn clear_effort_override(&self) {
-        self.inner.lock().effort_override = None;
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.effort_override = None; }
+        else { data.effort_by_pool.remove(&self.namespace); }
     }
 
     // -----------------------------------------------------------------------
@@ -868,15 +952,21 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     pub fn get_thinking_override(&self) -> Option<String> {
-        self.inner.lock().thinking_override.clone()
+        let data = self.inner.lock();
+        if self.namespace == "claude" { data.thinking_override.clone() }
+        else { data.thinking_by_pool.get(&self.namespace).cloned() }
     }
 
     pub fn set_thinking_override(&self, mode: String) {
-        self.inner.lock().thinking_override = Some(mode);
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.thinking_override = Some(mode); }
+        else { data.thinking_by_pool.insert(self.namespace.clone(), mode); }
     }
 
     pub fn clear_thinking_override(&self) {
-        self.inner.lock().thinking_override = None;
+        let mut data = self.inner.lock();
+        if self.namespace == "claude" { data.thinking_override = None; }
+        else { data.thinking_by_pool.remove(&self.namespace); }
     }
 
     // -----------------------------------------------------------------------
@@ -974,6 +1064,82 @@ impl StateStore {
             .and_then(|m| m.get(&today))
             .map(|b| b.api_cost_usd)
             .unwrap_or(0.0)
+    }
+
+    /// Atomically reserve worst-case API spend before an overflow request is
+    /// dispatched. Returns a reservation id, or None if it would cross budget.
+    pub fn reserve_budget(&self, account: &str, estimated_usd: f64, daily_budget_usd: f64) -> Option<String> {
+        if !estimated_usd.is_finite() || estimated_usd <= 0.0 || daily_budget_usd <= 0.0 { return None; }
+        let today = today_key();
+        let id = uuid::Uuid::new_v4().to_string();
+        let _disk = (self.path != Path::new("/dev/null")).then(|| self.disk_lock.lock());
+        {
+            let mut data = self.inner.lock();
+            let spent = data.per_account_daily.get(account)
+                .and_then(|m| m.get(&today)).map(|b| b.api_cost_usd).unwrap_or(0.0);
+            let reserved: f64 = data.budget_reservations.values()
+                .filter(|r| r.account == account && r.day == today).map(|r| r.usd).sum();
+            if spent + reserved + estimated_usd > daily_budget_usd + f64::EPSILON { return None; }
+            data.budget_reservations.insert(id.clone(), BudgetReservation {
+                account: account.to_owned(), day: today, usd: estimated_usd, created_ms: now_ms(),
+            });
+            // Budget admission is the one state transition that must be durable
+            // before its downstream side effect (billable API dispatch).
+            if self.path != Path::new("/dev/null") {
+                if let Err(error) = write_to_disk(&data, &self.path) {
+                    data.budget_reservations.remove(&id);
+                    warn!("Failed to persist API budget reservation: {error}");
+                    return None;
+                }
+            }
+        }
+        Some(id)
+    }
+
+    pub fn release_budget_reservation(&self, reservation_id: &str) {
+        if self.inner.lock().budget_reservations.remove(reservation_id).is_some() {
+            self.persist();
+        }
+    }
+
+    /// Replace a worst-case reservation with measured spend under one lock, so
+    /// another request can never observe the budget between release and charge.
+    /// Unknown/duplicate reservation ids are ignored to keep stream completion
+    /// callbacks idempotent.
+    pub fn reconcile_budget_reservation(
+        &self,
+        reservation_id: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) {
+        if input_tokens == 0 && output_tokens == 0 { return; }
+        let cost = crate::pricing::api_cost_usd(model, input_tokens, output_tokens);
+        {
+            let mut data = self.inner.lock();
+            let Some(reservation) = data.budget_reservations.remove(reservation_id) else {
+                return;
+            };
+            let per = data.per_account_daily.entry(reservation.account).or_default();
+            let bucket = per.entry(reservation.day).or_default();
+            bucket.input_tokens = bucket.input_tokens.saturating_add(input_tokens);
+            bucket.output_tokens = bucket.output_tokens.saturating_add(output_tokens);
+            bucket.api_cost_usd += cost;
+            if per.len() > 100 {
+                let cutoff = epoch_to_ymd(
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+                        .saturating_sub(90 * 86400)
+                );
+                per.retain(|key, _| key.as_str() >= cutoff.as_str());
+            }
+        }
+        self.persist();
+    }
+
+    pub fn reserved_today_usd(&self, account: &str) -> f64 {
+        let today = today_key();
+        self.inner.lock().budget_reservations.values()
+            .filter(|r| r.account == account && r.day == today).map(|r| r.usd).sum()
     }
 
     /// Snapshot of daily and all-time savings for the status endpoint and CLI.
@@ -1099,6 +1265,55 @@ mod tests {
         assert_eq!(snap.len(), MAX_RECENT, "buffer must not grow beyond MAX_RECENT");
         // Most recent first
         assert!(snap[0].ts_ms > snap[snap.len() - 1].ts_ms, "snapshot must be newest-first");
+    }
+
+    #[test]
+    fn budget_reservations_are_atomic_and_releasable() {
+        let store = StateStore::new_empty();
+        let first = store.reserve_budget("api", 4.0, 5.0).expect("first reservation");
+        assert!((store.reserved_today_usd("api") - 4.0).abs() < f64::EPSILON);
+        assert!(store.reserve_budget("api", 2.0, 5.0).is_none());
+        store.release_budget_reservation(&first);
+        assert!(store.reserve_budget("api", 2.0, 5.0).is_some());
+    }
+
+    #[test]
+    fn budget_reconciliation_atomically_replaces_the_reservation() {
+        let store = StateStore::new_empty();
+        let reservation = store.reserve_budget("api", 4.0, 5.0).unwrap();
+        store.reconcile_budget_reservation(&reservation, "gpt-5.4", 200_000, 0);
+        assert_eq!(store.reserved_today_usd("api"), 0.0);
+        assert!((store.account_spend_today_usd("api") - 1.0).abs() < 1e-9);
+        assert!(store.reserve_budget("api", 4.0, 5.0).is_some());
+    }
+
+    #[test]
+    fn budget_reservation_is_durable_before_admission_returns() {
+        let path = std::env::temp_dir().join(format!(
+            "shunt-budget-state-{}.json",
+            uuid::Uuid::new_v4(),
+        ));
+        let store = StateStore::load(&path);
+        let id = store.reserve_budget("api", 1.0, 5.0).unwrap();
+        let persisted: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).unwrap(),
+        ).unwrap();
+        assert_eq!(persisted["budget_reservations"][id.as_str()]["account"], "api");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pool_scopes_keep_runtime_overrides_independent() {
+        let claude = StateStore::new_empty().scoped("claude");
+        let codex = claude.scoped("codex");
+        claude.set_pinned(Some("claude/main".into()));
+        codex.set_pinned(Some("codex/main".into()));
+        claude.set_model_override("claude-sonnet".into());
+        codex.set_model_override("gpt-5.4".into());
+        assert_eq!(claude.get_pinned().as_deref(), Some("claude/main"));
+        assert_eq!(codex.get_pinned().as_deref(), Some("codex/main"));
+        assert_eq!(claude.get_model_override().as_deref(), Some("claude-sonnet"));
+        assert_eq!(codex.get_model_override().as_deref(), Some("gpt-5.4"));
     }
 
     #[test]

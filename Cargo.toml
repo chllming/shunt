@@ -1,9 +1,9 @@
 [package]
 name = "shunt-proxy"
-version = "0.1.147"
+version = "0.1.148"
 edition = "2021"
 authors = ["Ramcharan <sairamcharansudagoni@gmail.com>"]
-description = "A local proxy that pools multiple Claude accounts behind a single endpoint, routing requests to maximise rate limits"
+description = "A local proxy with isolated native Claude and Codex subscription pools"
 license = "MIT"
 repository = "https://github.com/ramc10/shunt"
 homepage = "https://github.com/ramc10/shunt"

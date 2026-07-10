@@ -129,27 +129,23 @@ async fn handle_tunnel(socket: WebSocket, state: RelayState) {
     let (mut sink, mut stream) = socket.split();
 
     // ── Step 1: expect a Register frame ─────────────────────────────────────
-    let subdomain = loop {
-        match stream.next().await {
-            Some(Ok(Message::Text(text))) => {
-                match serde_json::from_str::<ClientFrame>(&text) {
-                    Ok(ClientFrame::Register { subdomain, token }) => {
-                        if token != *state.allowed_token {
-                            let _ = sink.send(Message::Text(
-                                serde_json::to_string(&RelayFrame::Deny { reason: "invalid token" }).unwrap()
-                            )).await;
-                            return;
-                        }
-                        let _ = sink.send(Message::Text(
-                            serde_json::to_string(&RelayFrame::Ack { subdomain: &subdomain }).unwrap()
-                        )).await;
-                        break subdomain;
-                    }
-                    _ => { return; } // unexpected frame before registration
+    let subdomain = match stream.next().await {
+        Some(Ok(Message::Text(text))) => match serde_json::from_str::<ClientFrame>(&text) {
+            Ok(ClientFrame::Register { subdomain, token }) => {
+                if token != *state.allowed_token {
+                    let _ = sink.send(Message::Text(
+                        serde_json::to_string(&RelayFrame::Deny { reason: "invalid token" }).unwrap()
+                    )).await;
+                    return;
                 }
+                let _ = sink.send(Message::Text(
+                    serde_json::to_string(&RelayFrame::Ack { subdomain: &subdomain }).unwrap()
+                )).await;
+                subdomain
             }
-            _ => return,
-        }
+            _ => return, // unexpected frame before registration
+        },
+        _ => return,
     };
 
     // ── Step 2: register tunnel ──────────────────────────────────────────────

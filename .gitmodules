@@ -1,0 +1,6 @@
+[submodule "vendors/codex"]
+	path = vendors/codex
+	url = https://github.com/openai/codex.git
+[submodule "vendors/opencode"]
+	path = vendors/opencode
+	url = https://github.com/anomalyco/opencode.git
