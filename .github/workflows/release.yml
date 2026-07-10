@@ -107,13 +107,16 @@ jobs:
     name: Publish to crates.io
     needs: release
     runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Publish
-        run: cargo publish --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish --allow-dirty --token "$CARGO_REGISTRY_TOKEN"
 
   publish-npm:
     name: Publish vibe-shunt to npm
