@@ -1,6 +1,6 @@
 [package]
 name = "shunt-proxy"
-version = "0.1.149"
+version = "0.2.0"
 edition = "2021"
 authors = ["Ramcharan <sairamcharansudagoni@gmail.com>"]
 description = "A local proxy with isolated native Claude and Codex subscription pools"

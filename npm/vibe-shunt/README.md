@@ -9,6 +9,7 @@ npx vibe-shunt
 The installer downloads a platform release from `chllming/shunt`, verifies it against the release's `checksums.txt`, installs `shunt`, and offers to:
 
 - run first-time setup;
+- choose Website3 user-vault mode (recommended) or local-only credential mode;
 - install managed Claude and Codex client entries;
 - register and start a macOS launch agent or Linux user service; or
 - start Shunt once without installing a service.
@@ -17,7 +18,9 @@ Every prompt also has a non-interactive flag. For example:
 
 ```bash
 npx vibe-shunt --yes
-npx vibe-shunt --repo chllming/shunt --version v0.1.149 --install-dir ~/.local/bin
+npx vibe-shunt --yes --mode website
+npx vibe-shunt --yes --mode local
+npx vibe-shunt --repo chllming/shunt --version v0.2.0 --install-dir ~/.local/bin
 npx vibe-shunt --yes --no-setup --no-install-clients --no-service --no-start
 ```
 

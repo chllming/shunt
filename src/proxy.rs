@@ -2405,8 +2405,8 @@ async fn do_proactive_refresh(
 }
 
 
-/// Refreshes Codex credentials without collapsing multiple schema-v2 accounts.
-/// Legacy configs retain the historical auth.json sync; v2 treats auth.json as
+/// Refreshes Codex credentials without collapsing multiple native-pool accounts.
+/// Legacy configs retain the historical auth.json sync; v2+ treats auth.json as
 /// an import-only source and thereafter updates Shunt's own credential store.
 pub async fn openai_token_refresh_loop(
     config: Arc<Config>,
@@ -2420,7 +2420,7 @@ pub async fn openai_token_refresh_loop(
         if state.account_states().get(&account.name).map(|s| s.auth_failed).unwrap_or(false) {
             continue;
         }
-        if config.schema_version < crate::config::CONFIG_SCHEMA_VERSION {
+        if config.schema_version < crate::config::NATIVE_POOLS_SCHEMA_VERSION {
             sync_live_creds_from_auth_json(&account.name, &live_creds).await;
         }
 
@@ -2445,7 +2445,7 @@ pub async fn openai_token_refresh_loop(
         for account in config.accounts.iter()
             .filter(|a| a.provider == crate::provider::Provider::OpenAI)
         {
-            if config.schema_version < crate::config::CONFIG_SCHEMA_VERSION {
+            if config.schema_version < crate::config::NATIVE_POOLS_SCHEMA_VERSION {
                 sync_live_creds_from_auth_json(&account.name, &live_creds).await;
                 continue;
             }

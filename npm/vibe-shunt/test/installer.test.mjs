@@ -21,6 +21,7 @@ test("recommended defaults install and configure the fork", () => {
   assert.equal(options.repo, DEFAULT_REPO);
   assert.equal(options.version, "latest");
   assert.equal(options.setup, true);
+  assert.equal(options.mode, "website");
   assert.equal(options.installClients, true);
   assert.equal(options.service, true);
   assert.equal(options.start, false);
@@ -35,6 +36,8 @@ test("parses explicit unattended choices", () => {
     "--install-dir",
     "/tmp/shunt-bin",
     "--no-setup",
+    "--mode",
+    "local",
     "--no-install-clients",
     "--no-service",
     "--start",
@@ -46,6 +49,7 @@ test("parses explicit unattended choices", () => {
   assert.equal(options.version, "v1.2.3");
   assert.equal(options.installDir, "/tmp/shunt-bin");
   assert.equal(options.setup, false);
+  assert.equal(options.mode, "local");
   assert.equal(options.installClients, false);
   assert.equal(options.service, false);
   assert.equal(options.start, true);
@@ -117,4 +121,6 @@ test("rejects malformed repositories, versions, and unknown arguments", () => {
   assert.throws(() => validateOptions(badRepo), /invalid GitHub repository/);
   const badVersion = applyRecommendedDefaults(parseArgs(["--version", "tomorrow"], {}));
   assert.throws(() => validateOptions(badVersion), /invalid release version/);
+  const badMode = applyRecommendedDefaults(parseArgs(["--mode", "doppler"], {}));
+  assert.throws(() => validateOptions(badMode), /invalid setup mode/);
 });

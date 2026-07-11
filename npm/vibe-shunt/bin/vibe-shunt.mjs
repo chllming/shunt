@@ -43,6 +43,8 @@ Options:
       --install-dir <path>   Binary destination (default: ~/.local/bin)
       --setup                Run first-time setup after installation
       --no-setup             Skip first-time setup
+      --mode <mode>          Setup mode: website (recommended) or local
+      --website-url <url>    Website3 base URL (default: https://beyondwork.ai)
       --install-clients      Install managed Claude and Codex client entries
       --no-install-clients   Do not install managed client entries
       --service              Install and start the login service
@@ -74,6 +76,8 @@ export function parseArgs(argv, env = process.env) {
     version: "latest",
     installDir: env.VIBE_SHUNT_INSTALL_DIR || join(homedir(), ".local", "bin"),
     setup: undefined,
+    mode: undefined,
+    websiteUrl: env.SHUNT_WEBSITE_URL || "https://beyondwork.ai",
     installClients: undefined,
     service: undefined,
     start: undefined,
@@ -124,6 +128,14 @@ export function parseArgs(argv, env = process.env) {
       case "--no-setup":
         options.setup = false;
         options.provided.add("setup");
+        break;
+      case "--mode":
+        options.mode = value();
+        options.provided.add("mode");
+        break;
+      case "--website-url":
+        options.websiteUrl = value();
+        options.provided.add("websiteUrl");
         break;
       case "--install-clients":
         options.installClients = true;
@@ -192,6 +204,15 @@ export function validateOptions(options) {
   if (options.setup === false && options.installClients === true) {
     throw new Error("--install-clients requires --setup");
   }
+  if (!new Set(["website", "local"]).has(options.mode)) {
+    throw new Error(`invalid setup mode "${options.mode}"; expected website or local`);
+  }
+  try {
+    const websiteUrl = new URL(options.websiteUrl);
+    if (!new Set(["http:", "https:"]).has(websiteUrl.protocol)) throw new Error();
+  } catch {
+    throw new Error(`invalid Website3 URL "${options.websiteUrl}"`);
+  }
   if (options.service === true && options.start === true) {
     throw new Error("--service and --start are mutually exclusive; the service starts Shunt");
   }
@@ -204,6 +225,7 @@ export function applyRecommendedDefaults(options) {
     ...options,
     installDir: resolve(options.installDir.replace(/^~(?=$|\/)/, homedir())),
     setup: options.setup ?? true,
+    mode: options.mode ?? "website",
     installClients: options.installClients ?? (options.setup ?? true),
     service,
     start: options.start ?? !service,
@@ -244,6 +266,14 @@ export async function collectInteractiveOptions(options, input = process.stdin, 
     }
     if (options.setup === undefined) {
       options.setup = await askBoolean(reader, "Run Shunt setup after installing?", true);
+    }
+    if (options.setup && options.mode === undefined) {
+      const useWebsite = await askBoolean(
+        reader,
+        "Use Website3 sign-in and your user-scoped vault? (choose no for local-only setup)",
+        true,
+      );
+      options.mode = useWebsite ? "website" : "local";
     }
     if (options.setup && options.installClients === undefined) {
       options.installClients = await askBoolean(
@@ -393,6 +423,8 @@ export function printPlan(options, target, output = process.stdout) {
   printChoice("Platform", target, output);
   printChoice("Destination", join(options.installDir, "shunt"), output);
   printChoice("Run setup", options.setup ? "yes" : "no", output);
+  printChoice("Credential mode", options.setup ? options.mode : "not configured", output);
+  if (options.setup && options.mode === "website") printChoice("Website3", options.websiteUrl, output);
   printChoice("Client entries", options.installClients ? "yes" : "no", output);
   printChoice("Login service", options.service ? "yes" : "no", output);
   printChoice("Start once", options.start ? "yes" : "no", output);
@@ -452,7 +484,8 @@ export async function install(options) {
   }
 
   if (options.setup) {
-    const setupArgs = ["setup"];
+    const setupArgs = ["setup", "--mode", options.mode];
+    if (options.mode === "website") setupArgs.push("--website-url", options.websiteUrl);
     if (options.installClients) setupArgs.push("--install-clients");
     run(destination, setupArgs);
   }

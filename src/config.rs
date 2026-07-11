@@ -204,6 +204,24 @@ impl CredentialsStore {
         }
         self.accounts.get_mut(resolved_name)
     }
+
+    pub fn resolved_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.accounts.keys().cloned().collect();
+        for (pool, accounts) in &self.pools {
+            names.extend(accounts.keys().map(|name| format!("{pool}/{name}")));
+        }
+        names.sort();
+        names
+    }
+
+    pub fn remove_resolved(&mut self, resolved_name: &str) -> bool {
+        if let Some((pool, name)) = resolved_name.split_once('/') {
+            if matches!(pool, "claude" | "codex") {
+                return self.pools.get_mut(pool).and_then(|accounts| accounts.remove(name)).is_some();
+            }
+        }
+        self.accounts.remove(resolved_name).is_some()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +250,14 @@ struct RawConfig {
     classifier: RawClassifier,
     #[serde(default)]
     bridge: RawBridge,
+    #[serde(default)]
+    website: RawWebsite,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RawWebsite {
+    base_url: Option<String>,
+    cache_max_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -480,6 +506,10 @@ struct RawAccount {
     _owner: Option<String>,
     #[serde(default)]
     credential_source: Option<String>,
+    /// Opaque identifier in the selected credential source. This is metadata,
+    /// never the credential value itself.
+    #[serde(default)]
+    credential_id: Option<String>,
 }
 
 fn default_host() -> String { "127.0.0.1".into() }
@@ -654,7 +684,82 @@ pub struct AccountConfig {
     pub model: Option<String>,
 }
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachmentInfo {
+    pub name: String,
+    pub provider: String,
+    pub credential_source: String,
+    pub credential_id: String,
+}
+
+/// Read attachment metadata without resolving any secret material. This also
+/// works when every account has been detached, unlike the runtime loader.
+pub fn attachment_inventory(path: &Path) -> Result<Vec<AttachmentInfo>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read config: {}", path.display()))?;
+    let raw: RawConfig = toml::from_str(&text)
+        .with_context(|| format!("Failed to parse config: {}", path.display()))?;
+    let schema = raw.schema_version.unwrap_or(1);
+    let mut specs: Vec<(PoolKind, RawAccount)> = Vec::new();
+    if schema >= NATIVE_POOLS_SCHEMA_VERSION {
+        if let Some(pool) = raw.pools.claude { specs.extend(pool.accounts.into_iter().map(|a| (PoolKind::Claude, a))); }
+        if let Some(pool) = raw.pools.codex { specs.extend(pool.accounts.into_iter().map(|a| (PoolKind::Codex, a))); }
+    }
+    specs.extend(raw.accounts.into_iter().map(|a| (PoolKind::Legacy, a)));
+    specs.into_iter().map(|(pool, account)| {
+        let source = CredentialSourceKind::parse(account.credential_source.as_deref())?;
+        let name = scoped_account_name(pool, &account.name, schema);
+        Ok(AttachmentInfo {
+            credential_id: account.credential_id.unwrap_or_else(|| name.clone()),
+            provider: account.provider.unwrap_or_else(|| match pool {
+                PoolKind::Codex => "openai".into(),
+                _ => "anthropic".into(),
+            }),
+            credential_source: source.as_str().into(),
+            name,
+        })
+    }).collect()
+}
+
+/// Schema v2 introduced native Claude and Codex pools. Keep this boundary
+/// separate from the latest schema so v2 configs continue to load safely.
+pub const NATIVE_POOLS_SCHEMA_VERSION: u32 = 2;
+/// Schema v3 makes account blocks explicit routing attachments to credential
+/// references. Removing an attachment must not delete its source credential.
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialSourceKind {
+    LocalStore,
+    ProviderCli,
+    EnvFile,
+    WebsiteBroker,
+    None,
+}
+
+impl CredentialSourceKind {
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        match value.unwrap_or("local-store") {
+            "local-store" | "shunt_store" => Ok(Self::LocalStore),
+            "provider-cli" | "codex_auth_file" | "claude_credentials_file" | "local_cli" => Ok(Self::ProviderCli),
+            "env-file" => Ok(Self::EnvFile),
+            "website-broker" => Ok(Self::WebsiteBroker),
+            "none" => Ok(Self::None),
+            other => bail!("Unsupported credential_source '{other}'"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalStore => "local-store",
+            Self::ProviderCli => "provider-cli",
+            Self::EnvFile => "env-file",
+            Self::WebsiteBroker => "website-broker",
+            Self::None => "none",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -810,7 +915,7 @@ pub struct Config {
 // Loading
 // ---------------------------------------------------------------------------
 
-fn load_env_file(path: &Path) -> Result<()> {
+fn load_env_file(path: &Path) -> Result<HashMap<String, String>> {
     if !path.is_absolute() {
         bail!("secrets.env_file must be an absolute path: {}", path.display());
     }
@@ -829,6 +934,7 @@ fn load_env_file(path: &Path) -> Result<()> {
 
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read secrets.env_file: {}", path.display()))?;
+    let mut values = HashMap::new();
     for (line_no, raw_line) in text.lines().enumerate() {
         let mut line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') { continue; }
@@ -851,13 +957,18 @@ fn load_env_file(path: &Path) -> Result<()> {
         } else {
             raw_value.to_owned()
         };
-        // Explicit process environment wins over the file, which makes one-off
-        // operator overrides possible without rewriting the secret file.
-        if std::env::var_os(key).is_none() {
-            std::env::set_var(key, value);
-        }
+        values.insert(key.to_owned(), value);
     }
-    Ok(())
+    Ok(values)
+}
+
+fn selected_secret(values: &HashMap<String, String>, key: &str) -> Option<String> {
+    // Publishing credentials are never valid Shunt runtime credentials. This
+    // guard prevents an overly broad env file from accidentally attaching one.
+    if matches!(key, "NPMJS" | "NPM_TOKEN" | "NODE_AUTH_TOKEN") {
+        return None;
+    }
+    std::env::var(key).ok().or_else(|| values.get(key).cloned())
 }
 
 fn resolve_overflow(raw: Option<RawApiOverflow>, default_key_env: &str) -> ApiOverflowConfig {
@@ -892,7 +1003,7 @@ fn resolve_pool(raw: Option<RawPool>, kind: PoolKind) -> PoolConfig {
 }
 
 fn scoped_account_name(kind: PoolKind, name: &str, schema_version: u32) -> String {
-    if schema_version >= CONFIG_SCHEMA_VERSION && kind != PoolKind::Legacy {
+    if schema_version >= NATIVE_POOLS_SCHEMA_VERSION && kind != PoolKind::Legacy {
         format!("{}/{}", kind.as_str(), name)
     } else {
         name.to_owned()
@@ -920,13 +1031,21 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         bail!("Config schema_version {schema_version} is newer than this shunt supports ({CONFIG_SCHEMA_VERSION})");
     }
     let has_native_pools = raw.pools.claude.is_some() || raw.pools.codex.is_some();
-    if has_native_pools && schema_version < CONFIG_SCHEMA_VERSION {
-        bail!("[pools.*] requires schema_version = {CONFIG_SCHEMA_VERSION}");
+    if has_native_pools && schema_version < NATIVE_POOLS_SCHEMA_VERSION {
+        bail!("[pools.*] requires schema_version >= {NATIVE_POOLS_SCHEMA_VERSION}");
     }
 
-    if let Some(env_file) = raw.secrets.env_file.as_deref() {
-        load_env_file(env_file)?;
-    }
+    let env_values = match raw.secrets.env_file.as_deref() {
+        Some(env_file) => load_env_file(env_file)?,
+        None => HashMap::new(),
+    };
+    let website_config = crate::website::BrokerConfig {
+        base_url: raw.website.base_url.clone()
+            .or_else(|| std::env::var("SHUNT_WEBSITE_URL").ok())
+            .unwrap_or_else(|| crate::website::DEFAULT_WEBSITE_URL.into()),
+        cache_max_secs: raw.website.cache_max_secs.unwrap_or(crate::website::MAX_GRACE_CACHE_SECS)
+            .min(crate::website::MAX_GRACE_CACHE_SECS),
+    };
 
     let claude_raw_pool = raw.pools.claude.clone();
     let codex_raw_pool = raw.pools.codex.clone();
@@ -936,7 +1055,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     };
 
     let mut account_specs: Vec<(PoolKind, RawAccount)> = Vec::new();
-    if schema_version >= CONFIG_SCHEMA_VERSION {
+    if schema_version >= NATIVE_POOLS_SCHEMA_VERSION {
         if let Some(pool) = claude_raw_pool { account_specs.extend(pool.accounts.into_iter().map(|a| (PoolKind::Claude, a))); }
         if let Some(pool) = codex_raw_pool { account_specs.extend(pool.accounts.into_iter().map(|a| (PoolKind::Codex, a))); }
         account_specs.extend(raw.accounts.iter().cloned().map(|a| (PoolKind::Legacy, a)));
@@ -1000,7 +1119,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 
     let server = ServerConfig {
         host: raw.server.host,
-        port: if schema_version >= CONFIG_SCHEMA_VERSION { pools.claude.port } else { raw.server.port },
+        port: if schema_version >= NATIVE_POOLS_SCHEMA_VERSION { pools.claude.port } else { raw.server.port },
         control_port: raw.server.control_port,
         log_level: raw.server.log_level,
         upstream_url,
@@ -1009,7 +1128,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         custom_domain: raw.server.custom_domain,
         sticky_ttl_ms: raw.server.sticky_ttl_minutes.unwrap_or(10) * 60 * 1000,
         expiry_soon_secs: raw.server.expiry_soon_minutes.unwrap_or(30) * 60,
-        routing_strategy: if schema_version >= CONFIG_SCHEMA_VERSION {
+        routing_strategy: if schema_version >= NATIVE_POOLS_SCHEMA_VERSION {
             pools.claude.routing_strategy
         } else {
             raw.server.routing_strategy.as_deref().and_then(RoutingStrategy::from_str).unwrap_or_default()
@@ -1024,7 +1143,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         telemetry_token,
         instance_name,
         burst_rpm_limit: raw.server.burst_rpm_limit.unwrap_or(10),
-        fallback_model: if schema_version >= CONFIG_SCHEMA_VERSION {
+        fallback_model: if schema_version >= NATIVE_POOLS_SCHEMA_VERSION {
             pools.claude.fallback_models.first().cloned().or(raw.server.fallback_model)
         } else {
             raw.server.fallback_model
@@ -1038,7 +1157,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     };
 
     let mut api_overflow = resolve_overflow(raw.api_overflow.clone(), "ANTHROPIC_API_KEY");
-    if schema_version < CONFIG_SCHEMA_VERSION {
+    if schema_version < NATIVE_POOLS_SCHEMA_VERSION {
         api_overflow.account = api_overflow.account
             .or_else(|| std::env::var("SHUNT_API_OVERFLOW_ACCOUNT").ok());
         api_overflow.daily_budget_usd = std::env::var("SHUNT_API_OVERFLOW_DAILY_BUDGET_USD")
@@ -1068,7 +1187,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
             PoolKind::Codex if !matches!(provider, Provider::OpenAI | Provider::OpenAIApi) => {
                 bail!("Codex pool account '{}' must use provider openai/codex or openai-api", a.name);
             }
-            PoolKind::Legacy if schema_version >= CONFIG_SCHEMA_VERSION
+            PoolKind::Legacy if schema_version >= NATIVE_POOLS_SCHEMA_VERSION
                 && matches!(provider, Provider::Anthropic | Provider::AnthropicApi | Provider::OpenAI | Provider::OpenAIApi) =>
             {
                 bail!("Native provider account '{}' must be declared under [pools.claude] or [pools.codex]", a.name);
@@ -1087,9 +1206,14 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         //
         // API-key providers: credentials.json first, then inline api_key field,
         // then api_key_env field, then the provider's well-known env var.
-        let allow_cli_import = schema_version < CONFIG_SCHEMA_VERSION
-            || matches!(a.credential_source.as_deref(), Some("codex_auth_file" | "claude_credentials_file" | "local_cli"));
-        let cred: Option<Credential> = store.get(*kind, &a.name)
+        let source = CredentialSourceKind::parse(a.credential_source.as_deref())?;
+        if schema_version >= CONFIG_SCHEMA_VERSION && a.credential_id.as_deref().unwrap_or("").is_empty()
+            && source != CredentialSourceKind::None
+        {
+            bail!("Account '{}' must declare credential_id in schema v{CONFIG_SCHEMA_VERSION}", a.name);
+        }
+        let allow_cli_import = source == CredentialSourceKind::ProviderCli;
+        let legacy_or_local = || store.get(*kind, &a.name)
             .or_else(|| {
                 // Inline api_key from TOML (less secure, but convenient for testing).
                 a.api_key.as_deref().map(|k| {
@@ -1100,7 +1224,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
             .or_else(|| {
                 // api_key_env: name of env var holding the key.
                 a.api_key_env.as_deref()
-                    .and_then(|var| std::env::var(var).ok())
+                    .and_then(|var| selected_secret(&env_values, var))
                     .map(|k| Credential::Apikey { key: k })
             })
             .or_else(|| {
@@ -1108,6 +1232,17 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
                 // well-known env var (API-key providers).
                 if allow_cli_import { provider.read_local_credentials() } else { None }
             });
+        let cred: Option<Credential> = match source {
+            CredentialSourceKind::WebsiteBroker => Some(crate::website::resolve_credential(
+                &website_config,
+                a.credential_id.as_deref().context("website-broker account missing credential_id")?,
+            ).with_context(|| format!("Failed to lease Website3 credential for account '{}'", a.name))?),
+            CredentialSourceKind::EnvFile => a.api_key_env.as_deref()
+                .and_then(|var| selected_secret(&env_values, var))
+                .map(|key| Credential::Apikey { key }),
+            CredentialSourceKind::None => None,
+            CredentialSourceKind::LocalStore | CredentialSourceKind::ProviderCli => legacy_or_local(),
+        };
 
         // Upstream URL: per-account override from TOML takes priority, then
         // non-primary-provider accounts get the provider's default URL so
@@ -1119,7 +1254,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
                 .with_context(|| format!("account '{}' upstream_url failed validation", a.name))?;
         }
         let acct_upstream = a.upstream_url.clone().or_else(|| {
-            if schema_version >= CONFIG_SCHEMA_VERSION || provider != primary_provider {
+            if schema_version >= NATIVE_POOLS_SCHEMA_VERSION || provider != primary_provider {
                 Some(provider.default_upstream_url().to_owned())
             } else {
                 None
@@ -1147,7 +1282,7 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
         let resolved_name = scoped_account_name(kind, &configured, schema_version);
         pool.overflow.account = Some(resolved_name.clone());
         if accounts.iter().any(|a| a.name == resolved_name) { continue; }
-        let key = pool.overflow.key_env.as_deref().and_then(|key_env| std::env::var(key_env).ok());
+        let key = pool.overflow.key_env.as_deref().and_then(|key_env| selected_secret(&env_values, key_env));
         accounts.push(AccountConfig {
             name: resolved_name,
             plan_type: "api-overflow".into(),
@@ -1197,15 +1332,96 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
     })
 }
 
-/// Convert a legacy flat config to schema v2. Dry-run returns the complete
+fn upgrade_account_reference(account: &mut toml::Value, pool: PoolKind) {
+    let Some(table) = account.as_table_mut() else { return };
+    let Some(name) = table.get("name").and_then(toml::Value::as_str).map(ToOwned::to_owned) else { return };
+    let provider = table.get("provider").and_then(toml::Value::as_str).unwrap_or(match pool {
+        PoolKind::Codex => "openai",
+        _ => "anthropic",
+    });
+    let old_source = table.get("credential_source").and_then(toml::Value::as_str);
+    let source = if table.contains_key("api_key_env") {
+        "env-file"
+    } else if matches!(provider, "local") {
+        "none"
+    } else {
+        match old_source {
+            Some("codex_auth_file" | "claude_credentials_file" | "local_cli" | "provider-cli") => "provider-cli",
+            Some("env-file") => "env-file",
+            Some("website-broker") => "website-broker",
+            Some("none") => "none",
+            _ => "local-store",
+        }
+    };
+    let id = match source {
+        "env-file" => table.get("api_key_env").and_then(toml::Value::as_str)
+            .map(|key| format!("env:{key}")),
+        "none" => Some(format!("none:{name}")),
+        _ => Some(if pool == PoolKind::Legacy { name.clone() } else { format!("{}/{name}", pool.as_str()) }),
+    };
+    table.insert("credential_source".into(), toml::Value::String(source.into()));
+    if !table.contains_key("credential_id") {
+        if let Some(id) = id { table.insert("credential_id".into(), toml::Value::String(id)); }
+    }
+}
+
+fn upgrade_v3_references(root: &mut toml::Table) {
+    if let Some(accounts) = root.get_mut("accounts").and_then(toml::Value::as_array_mut) {
+        for account in accounts { upgrade_account_reference(account, PoolKind::Legacy); }
+    }
+    if let Some(pools) = root.get_mut("pools").and_then(toml::Value::as_table_mut) {
+        for (name, kind) in [("claude", PoolKind::Claude), ("codex", PoolKind::Codex)] {
+            if let Some(accounts) = pools.get_mut(name).and_then(toml::Value::as_table_mut)
+                .and_then(|pool| pool.get_mut("accounts")).and_then(toml::Value::as_array_mut)
+            {
+                for account in accounts { upgrade_account_reference(account, kind); }
+            }
+        }
+    }
+}
+
+fn write_migrated_config(path: &Path, migrated: &str, backup_suffix: &str) -> Result<()> {
+    let backup = path.with_extension(backup_suffix);
+    if !backup.exists() { std::fs::copy(path, &backup)?; }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, migrated)?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Upgrade config metadata to the latest schema. Dry-run returns the complete
 /// proposed TOML without touching disk. Apply is backup-first and idempotent.
 pub fn migrate_config_file(path: &Path, apply: bool, env_file: Option<&Path>) -> Result<String> {
     let original = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config: {}", path.display()))?;
     let mut root: toml::Table = toml::from_str(&original)
         .with_context(|| format!("Failed to parse config: {}", path.display()))?;
-    if root.get("schema_version").and_then(toml::Value::as_integer) == Some(CONFIG_SCHEMA_VERSION as i64) {
+    let old_schema = root.get("schema_version").and_then(toml::Value::as_integer).unwrap_or(1);
+    if old_schema > CONFIG_SCHEMA_VERSION as i64 {
+        bail!("Config schema_version {old_schema} is newer than this shunt supports ({CONFIG_SCHEMA_VERSION})");
+    }
+    if old_schema == CONFIG_SCHEMA_VERSION as i64 {
         return Ok(original);
+    }
+
+    // Native-pool v2 already has the correct topology. Its v3 migration only
+    // adds attachment references; rebuilding pools here would lose accounts.
+    if old_schema >= NATIVE_POOLS_SCHEMA_VERSION as i64 {
+        upgrade_v3_references(&mut root);
+        root.insert("schema_version".into(), toml::Value::Integer(CONFIG_SCHEMA_VERSION as i64));
+        if let Some(env_file) = env_file {
+            if !env_file.is_absolute() { bail!("--env-file must be an absolute path"); }
+            let secrets = root.entry("secrets").or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut().context("secrets must be a TOML table")?;
+            secrets.insert("env_file".into(), toml::Value::String(env_file.to_string_lossy().into_owned()));
+        }
+        let migrated = toml::to_string_pretty(&root)?;
+        if apply { write_migrated_config(path, &migrated, "toml.bak-v2")?; }
+        return Ok(migrated);
     }
 
     let accounts = root.remove("accounts").and_then(|v| v.as_array().cloned()).unwrap_or_default();
@@ -1300,18 +1516,11 @@ pub fn migrate_config_file(path: &Path, apply: bool, env_file: Option<&Path>) ->
         ("retention_hours".into(), toml::Value::Integer(24)),
         ("network_ceiling".into(), toml::Value::String("allowlisted".into())),
     ])));
+    upgrade_v3_references(&mut root);
     let migrated = toml::to_string_pretty(&root)?;
     if !apply { return Ok(migrated); }
 
-    let backup = path.with_extension("toml.bak-v1");
-    if !backup.exists() { std::fs::copy(path, &backup)?; }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, &migrated)?;
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)?;
+    write_migrated_config(path, &migrated, "toml.bak-v1")?;
 
     let credential_backup = credentials_path().with_extension("json.bak-v1");
     if credentials_path().exists() && !credential_backup.exists() {
@@ -1402,11 +1611,11 @@ pub fn config_needs_migration(path: &Path) -> Result<bool> {
 
 pub fn config_template(accounts: &[(&str, &str)]) -> String {
     let mut out = String::from(
-        "schema_version = 2\n\n[server]\nhost = \"127.0.0.1\"\ncontrol_port = 19081\nlog_level = \"info\"\n\n[pools.claude]\nport = 8082\nrouting_strategy = \"maximus\"\n\n[pools.claude.overflow]\nenabled = false\nkey_env = \"ANTHROPIC_API_KEY\"\ndaily_budget_usd = 500.0\nmax_output_tokens = 32768\n\n[pools.codex]\nport = 8083\nrouting_strategy = \"maximus\"\n\n[pools.codex.overflow]\nenabled = false\nkey_env = \"OPENAI_API_KEY\"\ndaily_budget_usd = 500.0\nmax_output_tokens = 32768\n\n[classifier]\nenabled = true\nfail_closed = true\n\n[bridge]\nenabled = true\nconcurrency_per_provider = 2\nqueue_capacity = 32\ntimeout_secs = 1800\nmax_depth = 1\nretention_hours = 24\nnetwork_ceiling = \"allowlisted\"\n",
+        "schema_version = 3\n\n[server]\nhost = \"127.0.0.1\"\ncontrol_port = 19081\nlog_level = \"info\"\n\n[pools.claude]\nport = 8082\nrouting_strategy = \"maximus\"\n\n[pools.claude.overflow]\nenabled = false\nkey_env = \"ANTHROPIC_API_KEY\"\ndaily_budget_usd = 500.0\nmax_output_tokens = 32768\n\n[pools.codex]\nport = 8083\nrouting_strategy = \"maximus\"\n\n[pools.codex.overflow]\nenabled = false\nkey_env = \"OPENAI_API_KEY\"\ndaily_budget_usd = 500.0\nmax_output_tokens = 32768\n\n[classifier]\nenabled = true\nfail_closed = true\n\n[bridge]\nenabled = true\nconcurrency_per_provider = 2\nqueue_capacity = 32\ntimeout_secs = 1800\nmax_depth = 1\nretention_hours = 24\nnetwork_ceiling = \"allowlisted\"\n",
     );
     for (name, plan_type) in accounts {
         out.push_str(&format!(
-            "\n[[pools.claude.accounts]]\nname = \"{name}\"\nplan_type = \"{plan_type}\"\nprovider = \"anthropic\"\ncredential_source = \"claude_credentials_file\"\n"
+            "\n[[pools.claude.accounts]]\nname = \"{name}\"\nplan_type = \"{plan_type}\"\nprovider = \"anthropic\"\ncredential_source = \"local-store\"\ncredential_id = \"claude/{name}\"\n"
         ));
     }
     out
@@ -1481,7 +1690,7 @@ upstream_url = "http://127.0.0.1:11434"
 model = "qwen-test"
 "#).unwrap();
         let preview = migrate_config_file(&path, false, None).unwrap();
-        assert!(preview.contains("schema_version = 2"));
+        assert!(preview.contains("schema_version = 3"));
         assert!(preview.contains("[pools.claude]"));
         assert!(preview.contains("[pools.codex]"));
         assert!(preview.contains("[[pools.claude.accounts]]"));
@@ -1505,6 +1714,52 @@ model = "qwen-test"
     fn secret_env_file_must_be_absolute() {
         let err = load_env_file(Path::new(".env.local")).unwrap_err().to_string();
         assert!(err.contains("absolute"));
+    }
+
+    #[test]
+    fn v2_migration_preserves_native_accounts_and_adds_references() {
+        let dir = temp_dir("migration-v2-v3");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, r#"
+schema_version = 2
+[server]
+host = "127.0.0.1"
+[pools.claude]
+port = 8082
+[[pools.claude.accounts]]
+name = "main"
+provider = "anthropic"
+credential_source = "shunt_store"
+[pools.codex]
+port = 8083
+[[pools.codex.accounts]]
+name = "work"
+provider = "openai"
+credential_source = "codex_auth_file"
+"#).unwrap();
+        let preview = migrate_config_file(&path, false, None).unwrap();
+        let migrated: toml::Value = toml::from_str(&preview).unwrap();
+        assert_eq!(migrated["schema_version"].as_integer(), Some(3));
+        let claude = migrated["pools"]["claude"]["accounts"].as_array().unwrap();
+        let codex = migrated["pools"]["codex"]["accounts"].as_array().unwrap();
+        assert_eq!(claude.len(), 1);
+        assert_eq!(codex.len(), 1);
+        assert_eq!(claude[0]["credential_source"].as_str(), Some("local-store"));
+        assert_eq!(claude[0]["credential_id"].as_str(), Some("claude/main"));
+        assert_eq!(codex[0]["credential_source"].as_str(), Some("provider-cli"));
+        assert_eq!(codex[0]["credential_id"].as_str(), Some("codex/work"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().contains("schema_version = 2"), true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn publishing_tokens_are_not_selectable_runtime_secrets() {
+        let values = HashMap::from([
+            ("NPMJS".to_owned(), "publish-secret".to_owned()),
+            ("ANTHROPIC_API_KEY".to_owned(), "runtime-secret".to_owned()),
+        ]);
+        assert_eq!(selected_secret(&values, "NPMJS"), None);
+        assert_eq!(selected_secret(&values, "ANTHROPIC_API_KEY").as_deref(), Some("runtime-secret"));
     }
 
     #[test]

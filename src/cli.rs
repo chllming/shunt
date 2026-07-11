@@ -28,6 +28,12 @@ enum Command {
         /// Back up and install managed Claude, Codex, and MCP client entries.
         #[arg(long)]
         install_clients: bool,
+        /// Credential mode: local provider sessions or Website3 user vault.
+        #[arg(long, value_parser = ["local", "website"], default_value = "local")]
+        mode: String,
+        /// Website3 base URL (defaults to https://beyondwork.ai).
+        #[arg(long)]
+        website_url: Option<String>,
     },
     /// Start the proxy (runs setup first if not configured)
     Start {
@@ -106,7 +112,7 @@ enum Command {
         #[arg(long)]
         owner: Option<String>,
     },
-    /// Preview or apply the automatic schema-v2 migration.
+    /// Preview or apply the automatic config migration.
     Migrate {
         #[arg(long)]
         config: Option<PathBuf>,
@@ -127,13 +133,33 @@ enum Command {
         #[command(subcommand)]
         action: BridgeAction,
     },
-    /// Remove an account from the pool
+    /// Authenticate to Website3 and inspect the user-scoped vault
+    Website {
+        #[command(subcommand)]
+        action: WebsiteAction,
+    },
+    /// Detach an account from routing without deleting its source credential
     #[command(visible_alias = "remove")]
     RemoveAccount {
         #[arg(long)]
         config: Option<PathBuf>,
         /// Name of the account to remove (omit to pick interactively)
         name: Option<String>,
+    },
+    /// List routing attachments and redacted local credential inventory
+    Inventory {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Emit stable machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Permanently delete a detached credential from Shunt's local store
+    DeleteCredential {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Pool-qualified credential name, for example claude/main.
+        name: String,
     },
     /// Enable remote access — expose the proxy to other devices
     ///
@@ -470,6 +496,38 @@ enum BridgeAction {
     Cleanup,
 }
 
+#[derive(Subcommand)]
+enum WebsiteAction {
+    /// Sign in using Website3's browser device flow.
+    Login {
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Remove this Shunt installation's Website3 session and cached leases.
+    Logout,
+    /// List the redacted user-scoped subscription and key inventory.
+    Inventory {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add an API key to the Website3/Fabric user vault and attach it locally.
+    AddKey {
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        label: String,
+        /// Optional Space grant created alongside the user grant.
+        #[arg(long)]
+        space: Option<String>,
+    },
+}
+
 pub async fn run() -> Result<()> {
     // Intercept --version / -V before clap to show branded banner
     let args: Vec<String> = std::env::args().collect();
@@ -484,7 +542,7 @@ pub async fn run() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Setup { config, env_file, install_clients } => cmd_setup(config, env_file, install_clients).await,
+        Command::Setup { config, env_file, install_clients, mode, website_url } => cmd_setup(config, env_file, install_clients, &mode, website_url.as_deref()).await,
         Command::Start { config, host, port, foreground, verbose, force, daemon } => cmd_start(config, host, port, foreground, verbose, force, daemon).await,
         Command::Stop => cmd_stop().await,
         Command::Restart { config } => cmd_restart(config).await,
@@ -495,7 +553,10 @@ pub async fn run() -> Result<()> {
         Command::Migrate { config, dry_run: _, apply, env_file } => cmd_migrate(config, apply, env_file).await,
         Command::ClientToken { pool } => cmd_client_token(&pool),
         Command::Bridge { action } => cmd_bridge(action).await,
+        Command::Website { action } => cmd_website(action).await,
         Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
+        Command::Inventory { config, json } => cmd_inventory(config, json),
+        Command::DeleteCredential { config, name } => cmd_delete_credential(config, &name),
         Command::Logout { config, name, all } => cmd_logout(config, name, all).await,
         Command::Monitor { config } => cmd_monitor(config).await,
         Command::Connect { code } => cmd_connect(code).await,
@@ -535,7 +596,7 @@ pub async fn run() -> Result<()> {
 // setup
 // ---------------------------------------------------------------------------
 
-pub async fn cmd_setup(config_override: Option<PathBuf>, env_file: Option<PathBuf>, install_clients: bool) -> Result<()> {
+pub async fn cmd_setup(config_override: Option<PathBuf>, env_file: Option<PathBuf>, install_clients: bool, mode: &str, website_url: Option<&str>) -> Result<()> {
     let config_p = config_override.clone().unwrap_or_else(config_path);
 
     print_splash(&[
@@ -547,7 +608,7 @@ pub async fn cmd_setup(config_override: Option<PathBuf>, env_file: Option<PathBu
     if config_p.exists() {
         if crate::config::config_needs_migration(&config_p)? {
             crate::config::migrate_config_file(&config_p, true, env_file.as_deref())?;
-            println!("  {} Migrated config to schema v2.", green(CHECK));
+            println!("  {} Migrated config to schema v{}.", green(CHECK), crate::config::CONFIG_SCHEMA_VERSION);
         } else if let Some(ref env_file) = env_file {
             set_env_file_in_config(&config_p, env_file)?;
         }
@@ -563,6 +624,10 @@ pub async fn cmd_setup(config_override: Option<PathBuf>, env_file: Option<PathBu
         if install_clients { install_client_configs(&config_p)?; }
         println!();
         return Ok(());
+    }
+
+    if mode == "website" {
+        return cmd_setup_website(config_override, env_file, install_clients, website_url).await;
     }
 
     // Auto-detect existing Claude Code session — no user action needed
@@ -626,7 +691,7 @@ pub async fn cmd_setup(config_override: Option<PathBuf>, env_file: Option<PathBu
     store.insert(crate::config::PoolKind::Claude, "main".into(), Credential::Oauth(cred));
     if let Some(codex_credential) = crate::oauth::read_codex_credentials() {
         let mut text = std::fs::read_to_string(&config_p)?;
-        text.push_str("\n[[pools.codex.accounts]]\nname = \"main\"\nprovider = \"openai\"\ncredential_source = \"codex_auth_file\"\n");
+        text.push_str("\n[[pools.codex.accounts]]\nname = \"main\"\nprovider = \"openai\"\ncredential_source = \"local-store\"\ncredential_id = \"codex/main\"\n");
         std::fs::write(&config_p, text)?;
         store.insert(crate::config::PoolKind::Codex, "main".into(), Credential::Oauth(codex_credential));
         println!("  {} Codex session found", green(CHECK));
@@ -654,6 +719,166 @@ pub async fn cmd_setup(config_override: Option<PathBuf>, env_file: Option<PathBu
     println!("  {} Run {} to start.", green(CHECK), cyan("shunt start"));
     println!("  {} Then restart any open Claude Code windows.", dim("·"));
 
+    Ok(())
+}
+
+async fn cmd_setup_website(
+    config_override: Option<PathBuf>,
+    env_file: Option<PathBuf>,
+    install_clients: bool,
+    website_url: Option<&str>,
+) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+    let broker = website_broker_config(website_url);
+    if crate::website::load_session().is_err() {
+        website_login(&broker).await?;
+    }
+    let inventory = crate::website::inventory(&broker).await?;
+    let available: Vec<_> = inventory.into_iter().filter(|account| account.available).collect();
+    if available.is_empty() { bail!("Website3 returned no available subscriptions or runtime keys"); }
+
+    println!();
+    println!("  Select Website3 accounts to attach to this Shunt installation:");
+    use std::io::IsTerminal;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let mut selected = Vec::new();
+    for account in available {
+        let prompt = format!("Attach {} ({})?", account.label, account.provider);
+        if !interactive || term::confirm(&prompt) { selected.push(account); }
+    }
+    if selected.is_empty() { bail!("No Website3 accounts selected"); }
+
+    let mut text = config_template(&[]);
+    text.push_str(&format!("\n[website]\nbase_url = {:?}\ncache_max_secs = 3600\n", broker.base_url));
+    for account in selected {
+        let provider = account.provider.to_ascii_lowercase();
+        let (table, canonical_provider) = match provider.as_str() {
+            "anthropic" | "claude" => ("pools.claude.accounts", "anthropic"),
+            "openai" | "codex" => ("pools.codex.accounts", "openai"),
+            "anthropic-api" => ("pools.claude.accounts", "anthropic-api"),
+            "openai-api" => ("pools.codex.accounts", "openai-api"),
+            _ => ("accounts", provider.as_str()),
+        };
+        let raw_name = sanitize_account_name(&account.label, &account.id);
+        text.push_str(&format!(
+            "\n[[{table}]]\nname = {:?}\nprovider = {:?}\nplan_type = {:?}\ncredential_source = \"website-broker\"\ncredential_id = {:?}\n",
+            raw_name,
+            canonical_provider,
+            account.plan_type.as_deref().unwrap_or("website"),
+            account.id,
+        ));
+    }
+    if let Some(parent) = config_p.parent() { std::fs::create_dir_all(parent)?; }
+    std::fs::write(&config_p, text)?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_p, std::fs::Permissions::from_mode(0o600))?;
+    }
+    if let Some(ref env_file) = env_file { set_env_file_in_config(&config_p, env_file)?; }
+    if install_clients { install_client_configs(&config_p)?; }
+    println!("  {} Website3 accounts attached. Source credentials were not copied locally.", green(CHECK));
+    println!("  {} Config {}", green("→"), dim(&config_p.display().to_string()));
+    Ok(())
+}
+
+fn sanitize_account_name(label: &str, fallback: &str) -> String {
+    let value: String = label.to_ascii_lowercase().chars()
+        .map(|character| if character.is_ascii_alphanumeric() { character } else { '-' })
+        .collect::<String>().trim_matches('-').to_owned();
+    if value.is_empty() {
+        fallback.chars().filter(|character| character.is_ascii_alphanumeric() || *character == '-').take(32).collect()
+    } else { value }
+}
+
+fn website_broker_config(url: Option<&str>) -> crate::website::BrokerConfig {
+    let mut config = crate::website::BrokerConfig::default();
+    if let Some(url) = url { config.base_url = url.trim_end_matches('/').to_owned(); }
+    config
+}
+
+async fn website_login(config: &crate::website::BrokerConfig) -> Result<()> {
+    let authorization = crate::website::begin_device_login(config).await?;
+    println!("  Open {}", cyan(&authorization.verification_uri_complete));
+    println!("  Code: {}", bold(&authorization.user_code));
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(&authorization.verification_uri_complete).status();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(&authorization.verification_uri_complete).status();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(authorization.expires_in);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_secs(authorization.interval.clamp(2, 15))).await;
+        if let Some(session) = crate::website::poll_device_login(config, &authorization.device_code).await? {
+            crate::website::save_session(&session)?;
+            println!("  {} Signed in to Website3.", green(CHECK));
+            return Ok(());
+        }
+    }
+    bail!("Website3 device login expired")
+}
+
+async fn cmd_website(action: WebsiteAction) -> Result<()> {
+    match action {
+        WebsiteAction::Login { url } => website_login(&website_broker_config(url.as_deref())).await,
+        WebsiteAction::Logout => {
+            crate::website::logout()?;
+            println!("  {} Website3 session and grace cache removed; source vault entries were not deleted.", green(CHECK));
+            Ok(())
+        }
+        WebsiteAction::Inventory { url, json } => {
+            let accounts = crate::website::inventory(&website_broker_config(url.as_deref())).await?;
+            if json { println!("{}", serde_json::to_string_pretty(&accounts)?); }
+            else {
+                for account in accounts {
+                    println!("  {}  {}  {}  {}", if account.available { green(CHECK) } else { dim("·") }, account.label, dim(&account.provider), dim(account.plan_type.as_deref().unwrap_or("")));
+                }
+            }
+            Ok(())
+        }
+        WebsiteAction::AddKey { url, config, provider, label, space } => {
+            print!("  {} API key: ", dim("·"));
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            let key = read_secret_line()?;
+            if key.is_empty() { bail!("API key cannot be empty"); }
+            let broker = website_broker_config(url.as_deref());
+            let account = crate::website::add_api_key(
+                &broker, &provider, &label, &key, space.as_deref(),
+            ).await?;
+            attach_website_account(config, &broker, &account)?;
+            println!("  {} Added '{}' to the Website3 user vault and attached it locally.", green(CHECK), label);
+            Ok(())
+        }
+    }
+}
+
+fn attach_website_account(
+    config_override: Option<PathBuf>,
+    broker: &crate::website::BrokerConfig,
+    account: &crate::website::InventoryAccount,
+) -> Result<()> {
+    let path = config_override.unwrap_or_else(config_path);
+    if !path.exists() { bail!("No config found; run `shunt setup --mode website` first"); }
+    let mut text = std::fs::read_to_string(&path)?;
+    if crate::config::attachment_inventory(&path)?.iter().any(|item| item.credential_id == account.id) {
+        return Ok(());
+    }
+    let provider = account.provider.to_ascii_lowercase();
+    let (table, canonical_provider) = match provider.as_str() {
+        "anthropic" | "claude" => ("pools.claude.accounts", "anthropic-api"),
+        "openai" | "codex" => ("pools.codex.accounts", "openai-api"),
+        _ => ("accounts", provider.as_str()),
+    };
+    let name = sanitize_account_name(&account.label, &account.id);
+    text.push_str(&format!(
+        "\n[[{table}]]\nname = {:?}\nprovider = {:?}\nplan_type = {:?}\ncredential_source = \"website-broker\"\ncredential_id = {:?}\n",
+        name, canonical_provider, account.plan_type.as_deref().unwrap_or("website"), account.id,
+    ));
+    // Ensure a manually-created local config knows which Website3 broker owns
+    // the reference. Existing [website] configuration remains authoritative.
+    if !text.contains("[website]") {
+        text.push_str(&format!("\n[website]\nbase_url = {:?}\ncache_max_secs = 3600\n", broker.base_url));
+    }
+    std::fs::write(path, text)?;
     Ok(())
 }
 
@@ -766,7 +991,7 @@ async fn cmd_migrate(config: Option<PathBuf>, apply: bool, env_file: Option<Path
     let path = config.unwrap_or_else(config_path);
     let migrated = crate::config::migrate_config_file(&path, apply, env_file.as_deref())?;
     if apply {
-        println!("Migrated {} to schema v2; backup retained beside the original.", path.display());
+        println!("Migrated {} to schema v{}; backup retained beside the original.", path.display(), crate::config::CONFIG_SCHEMA_VERSION);
     } else {
         print!("{migrated}");
     }
@@ -867,7 +1092,7 @@ async fn cmd_manage_account(config_override: Option<PathBuf>) -> Result<()> {
             actions.push(term::SelectItem { label: format!("{}  {}", bold("Update model"),        dim("set default model for this account")), value: "model".into() });
         }
     }
-    actions.push(term::SelectItem { label: format!("{}  {}", bold("Remove account"), dim("delete from pool permanently")),                value: "remove".into() });
+    actions.push(term::SelectItem { label: format!("{}  {}", bold("Detach account"), dim("remove from routing; keep the credential")),      value: "remove".into() });
 
     println!();
     let action = match term::select(&format!("Manage  '{name}'"), &actions, 0) {
@@ -1190,8 +1415,10 @@ async fn cmd_add_account(
     // ── Step 4: persist ──────────────────────────────────────────────────────
     if !already_in_config {
         let mut config_text = existing_config;
-        let schema_v2 = config_text.contains("schema_version = 2");
-        let table = if schema_v2 {
+        let native_pools = config_text.parse::<toml::Value>().ok()
+            .and_then(|value| value.get("schema_version").and_then(toml::Value::as_integer))
+            .unwrap_or(1) >= crate::config::NATIVE_POOLS_SCHEMA_VERSION as i64;
+        let table = if native_pools {
             match pool {
                 crate::config::PoolKind::Claude => "pools.claude.accounts",
                 crate::config::PoolKind::Codex => "pools.codex.accounts",
@@ -1199,7 +1426,12 @@ async fn cmd_add_account(
             }
         } else { "accounts" };
         let mut block = format!("\n[[{table}]]\nname = \"{name}\"\nprovider = \"{provider}\"\n");
-        if provider.auth_kind() == AuthKind::OAuth { block.push_str("credential_source = \"shunt_store\"\n"); }
+        if provider.auth_kind() == AuthKind::None {
+            block.push_str(&format!("credential_source = \"none\"\ncredential_id = \"none:{name}\"\n"));
+        } else {
+            let credential_id = if pool == crate::config::PoolKind::Legacy { name.clone() } else { format!("{}/{name}", pool.as_str()) };
+            block.push_str(&format!("credential_source = \"local-store\"\ncredential_id = {:?}\n", credential_id));
+        }
         if let Some(owner) = owner { block.push_str(&format!("owner = {:?}\n", owner)); }
         if let Some(ref url) = upstream_url {
             block.push_str(&format!("upstream_url = \"{url}\"\n"));
@@ -1268,7 +1500,7 @@ fn read_secret_line() -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// remove-account
+// detach account / explicit credential deletion
 // ---------------------------------------------------------------------------
 
 async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<String>) -> Result<()> {
@@ -1290,7 +1522,7 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
         let config = crate::config::load_config(config_override.as_deref())?;
         let removable: Vec<_> = config.accounts.iter().collect();
         if removable.is_empty() {
-            bail!("No accounts to remove.");
+            bail!("No accounts to detach.");
         }
         let items: Vec<term::SelectItem> = removable.iter().map(|a| {
             let email = a.credential.as_ref().and_then(|c| c.email()).unwrap_or("");
@@ -1299,7 +1531,7 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
                 value: a.name.clone(),
             }
         }).collect();
-        match term::select("Remove account:", &items, 0) {
+        match term::select("Detach account:", &items, 0) {
             Some(v) => v,
             None => return Ok(()),
         }
@@ -1311,7 +1543,7 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
         bail!("Account '{name}' not found.");
     }
 
-    if !term::confirm(&format!("Remove account '{name}'? This cannot be undone.")) {
+    if !term::confirm(&format!("Detach account '{name}' from routing? Its source credential will be kept.")) {
         println!("  {} Cancelled.", dim("·"));
         println!();
         return Ok(());
@@ -1319,29 +1551,70 @@ async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<Strin
 
     print_splash(&[
         format!("{}  {}", brand_green("shunt"), dim(&format!("v{}", env!("CARGO_PKG_VERSION")))),
-        format!("Removing account {}", bold(&format!("'{name}'"))),
+        format!("Detaching account {}", bold(&format!("'{name}'"))),
         String::new(),
     ]);
 
     // Strip the [[accounts]] block for this name from config
     let new_config = remove_account_block(&config_text, &name);
     std::fs::write(&config_p, &new_config)?;
-    println!("  {} Removed from config", green(CHECK));
-
-    // Remove credential from store
-    let mut store = CredentialsStore::load();
-    let removed = if let Some((pool, raw_name)) = name.split_once('/') {
-        store.pools.get_mut(pool).and_then(|m| m.remove(raw_name)).is_some()
-    } else { store.accounts.remove(&name).is_some() };
-    if removed {
-        store.save()?;
-        println!("  {} Credential removed", green(CHECK));
-    }
+    println!("  {} Detached from routing", green(CHECK));
+    println!("  {} Source credential kept; delete it explicitly with {}.", dim("·"), cyan(&format!("shunt delete-credential {name}")));
 
     println!();
-    println!("  {} Account {} removed.", green(CHECK), bold(&format!("'{name}'")));
+    println!("  {} Account {} detached.", green(CHECK), bold(&format!("'{name}'")));
     offer_restart(config_override).await;
     println!();
+    Ok(())
+}
+
+fn cmd_inventory(config_override: Option<PathBuf>, json_output: bool) -> Result<()> {
+    let config_p = config_override.unwrap_or_else(config_path);
+    let attachments = if config_p.exists() {
+        crate::config::attachment_inventory(&config_p)?
+    } else {
+        Vec::new()
+    };
+    let stored = CredentialsStore::load().resolved_names();
+    let attached_names: std::collections::HashSet<&str> = attachments.iter().map(|a| a.name.as_str()).collect();
+    if json_output {
+        let local_credentials: Vec<_> = stored.iter().map(|name| serde_json::json!({
+            "name": name,
+            "attached": attached_names.contains(name.as_str()),
+        })).collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "attachments": attachments,
+            "local_credentials": local_credentials,
+        }))?);
+        return Ok(());
+    }
+    println!("Attachments");
+    if attachments.is_empty() { println!("  {} none", dim("·")); }
+    for item in &attachments {
+        println!("  {}  {}  {}  {}", green(CHECK), item.name, dim(&item.provider), dim(&format!("{}:{}", item.credential_source, item.credential_id)));
+    }
+    println!();
+    println!("Local credential store (values redacted)");
+    if stored.is_empty() { println!("  {} none", dim("·")); }
+    for name in stored {
+        let state = if attached_names.contains(name.as_str()) { "attached" } else { "detached" };
+        println!("  {}  {}", name, dim(state));
+    }
+    Ok(())
+}
+
+fn cmd_delete_credential(config_override: Option<PathBuf>, name: &str) -> Result<()> {
+    let config_p = config_override.unwrap_or_else(config_path);
+    if config_p.exists() {
+        let attachments = crate::config::attachment_inventory(&config_p)?;
+        if attachments.iter().any(|attachment| attachment.name == name) {
+            bail!("Credential '{name}' is still attached; run `shunt remove-account {name}` first");
+        }
+    }
+    let mut store = CredentialsStore::load();
+    if !store.remove_resolved(name) { bail!("Credential '{name}' not found in the local store"); }
+    store.save()?;
+    println!("  {} Deleted detached local credential '{}'.", green(CHECK), name);
     Ok(())
 }
 
@@ -1614,7 +1887,7 @@ async fn cmd_start(
     let config_p = config_override.clone().unwrap_or_else(config_path);
     if config_p.exists() && crate::config::config_needs_migration(&config_p)? {
         crate::config::migrate_config_file(&config_p, true, None)?;
-        tracing::info!(config = %config_p.display(), "automatically migrated config to schema v2");
+        tracing::info!(config = %config_p.display(), schema = crate::config::CONFIG_SCHEMA_VERSION, "automatically migrated config");
     }
 
     // ── Daemon mode: internal re-exec, no user output ────────────────────────

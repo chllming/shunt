@@ -37,7 +37,7 @@ Shunt is a local proxy that combines subscription accounts into two isolated nat
 npx vibe-shunt
 ```
 
-Choose the release, install directory, client integration, and login service interactively. For an unattended install with recommended defaults, run `npx vibe-shunt --yes`. See all automation options with `npx vibe-shunt --help`.
+Choose the release, install directory, credential mode, client integration, and login service interactively. Website3 user-vault mode is recommended; local-only mode remains available. For an unattended install with recommended defaults, run `npx vibe-shunt --yes`. See all automation options with `npx vibe-shunt --help`.
 
 **shell installer:**
 
@@ -56,13 +56,14 @@ cargo install shunt-proxy
 ## Quick start
 
 ```bash
-shunt setup --install-clients  # import Claude + install managed client entries
+shunt setup --mode website --install-clients # Website3 login + user vault
+# or: shunt setup --mode local --install-clients
 shunt start      # start the proxy
 ```
 
 That's it. Claude Code and your other tools route through shunt automatically.
 
-Existing flat configs migrate automatically on start. Preview the backup-first migration with `shunt migrate --dry-run`. See [Native pools and bridge operations](docs/native-pools-and-bridge.md) for schema-v2 configuration, API-overflow budgets, stock Codex setup, and bridge security.
+Existing flat and schema-v2 configs migrate automatically on start. Preview the backup-first schema-v3 attachment migration with `shunt migrate --dry-run`. See [Native pools and bridge operations](docs/native-pools-and-bridge.md) for configuration, Website3 leases, API-overflow budgets, stock Codex setup, and bridge security.
 
 Add more accounts to grow your pool:
 
@@ -123,7 +124,11 @@ shunt share <code>       # on another machine — configures everything
 
 ```bash
 shunt setup --install-clients # first-time setup + stock client/MCP entries
-shunt migrate --dry-run  # preview schema-v2 migration
+shunt setup --mode website    # Website3 device login and user inventory
+shunt website inventory       # redacted remote inventory
+shunt website add-key --provider groq --label personal # vault + attach
+shunt inventory               # attachments + redacted local store
+shunt migrate --dry-run       # preview schema-v3 migration
 shunt migrate --apply    # back up and migrate now
 shunt start              # start the proxy
 shunt stop               # stop the proxy
@@ -136,7 +141,8 @@ shunt logs -f            # follow logs
 shunt config             # manage accounts interactively
 shunt add-account <name> # add an account or provider
 shunt add-account work --provider openai --pool codex
-shunt remove-account <name>
+shunt remove-account <name>   # detach only; source credential is retained
+shunt delete-credential <name># explicitly delete a detached local credential
 shunt logout [name]      # log out of an account
 shunt use [account]      # pin routing to a specific account
 shunt use --pool codex [account]

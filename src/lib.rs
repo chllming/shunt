@@ -20,3 +20,4 @@ pub mod sync;
 pub mod telemetry;
 pub mod term;
 pub mod tunnel;
+pub mod website;
