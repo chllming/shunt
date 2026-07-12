@@ -6,7 +6,7 @@ use std::time::Instant;
 use parking_lot::Mutex as ParkingMutex;
 
 use axum::extract::{Path as AxumPath, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -19,6 +19,7 @@ use tracing::{error, info, warn};
 use crate::config::{state_path, Config, CredentialsStore};
 use crate::credential::Credential;
 use crate::forwarder::Forwarder;
+use crate::manual_swarm_gateway::{ManualGrantScope, ManualGrantVerifier};
 use crate::provider::Provider;
 use crate::quota;
 use crate::router;
@@ -106,6 +107,34 @@ struct AppState {
     /// session/thread/prompt-cache entries are soft hints.
     codex_affinity: Arc<ParkingMutex<HashMap<String, (String, u64)>>>,
     codex_models_cache: Arc<ParkingMutex<Option<(Bytes, String, u64)>>>,
+    attachment_credential_ids: Arc<HashMap<String, String>>,
+    manual_grant_verifier: Option<Arc<ManualGrantVerifier>>,
+}
+
+fn manual_grant_token(headers: &HeaderMap) -> Option<&str> {
+    let api_key = headers.get("x-api-key").and_then(|value| value.to_str().ok());
+    let bearer = headers.get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok()).and_then(|value| value.strip_prefix("Bearer "));
+    api_key.into_iter().chain(bearer)
+        .find(|token| token.starts_with("eyJ") && token.matches('.').count() == 1)
+}
+
+fn manual_scope_for_request(state: &AppState, headers: &HeaderMap, provider: &str) -> Result<Option<ManualGrantScope>, ProxyError> {
+    let Some(token) = manual_grant_token(headers) else { return Ok(None) };
+    let verifier = state.manual_grant_verifier.as_deref().ok_or(ProxyError::Unauthorized)?;
+    let scope = verifier.verify(token).map_err(|_| ProxyError::Unauthorized)?;
+    if !scope.allows_provider(provider) { return Err(ProxyError::Unauthorized); }
+    Ok(Some(scope))
+}
+
+fn account_allowed_for_scope(state: &AppState, scope: Option<&ManualGrantScope>, account_name: &str) -> bool {
+    credential_allowed_for_scope(&state.attachment_credential_ids, scope, account_name)
+}
+
+fn credential_allowed_for_scope(attachment_credential_ids: &HashMap<String, String>, scope: Option<&ManualGrantScope>, account_name: &str) -> bool {
+    let Some(scope) = scope else { return true };
+    attachment_credential_ids.get(account_name)
+        .is_some_and(|credential_id| scope.allows_subscription(credential_id))
 }
 
 /// Simple token-bucket for per-IP rate limiting.
@@ -206,6 +235,10 @@ fn build_app_state_with(
     warm_start: Arc<ParkingMutex<HashMap<String, (u64, u64)>>>,
 ) -> anyhow::Result<(AppState, LiveCredentials)> {
     let forwarder = Forwarder::new(config.server.request_timeout_secs)?;
+    let attachment_credential_ids = crate::config::attachment_inventory(&config.config_file)
+        .unwrap_or_default().into_iter()
+        .map(|attachment| (attachment.name, attachment.credential_id)).collect::<HashMap<_, _>>();
+    let manual_grant_verifier = ManualGrantVerifier::from_environment()?.map(Arc::new);
 
     for a in &config.accounts {
         if a.provider.auth_kind() == crate::provider::AuthKind::None {
@@ -247,6 +280,8 @@ fn build_app_state_with(
         warm_start,
         codex_affinity: Arc::new(ParkingMutex::new(HashMap::new())),
         codex_models_cache: Arc::new(ParkingMutex::new(None)),
+        attachment_credential_ids: Arc::new(attachment_credential_ids),
+        manual_grant_verifier,
     };
 
     Ok((app_state, credentials))
@@ -1005,13 +1040,14 @@ async fn claude_classifier_response(s: &AppState, request_body: &[u8]) -> Option
 /// Stock Codex Responses transport. Subscription traffic is forwarded without
 /// JSON/SSE translation; only API-overflow output caps may rewrite the body.
 async fn codex_handler(State(s): State<AppState>, req: Request) -> Result<Response, ProxyError> {
+    let manual_scope = manual_scope_for_request(&s, req.headers(), "codex")?;
     if let Some(ref expected) = s.config.server.remote_key {
         let api_key = req.headers().get("x-api-key").and_then(|v| v.to_str().ok()).unwrap_or("");
         let bearer = req.headers().get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         let managed_matches = bearer.starts_with("shunt_")
             && crate::config::local_client_token("codex").ok().as_deref() == Some(bearer);
-        if api_key != expected && bearer != expected && !managed_matches {
+        if manual_scope.is_none() && api_key != expected && bearer != expected && !managed_matches {
             return Err(ProxyError::Unauthorized);
         }
     }
@@ -1073,11 +1109,15 @@ async fn codex_handler(State(s): State<AppState>, req: Request) -> Result<Respon
         let bound_account = affinity_account.as_deref().and_then(|bound| {
             s.config.accounts.iter().find(|a| a.name == bound && !tried.contains(&a.name)
                 && s.state.is_available(&a.name)
+                && account_allowed_for_scope(&s, manual_scope.as_ref(), &a.name)
                 && (!backend_only || a.provider == Provider::OpenAI))
         });
         let selected = bound_account.or_else(|| {
             if strict_bound { return None; }
             let mut excluded = tried.clone();
+            for account in &s.config.accounts {
+                if !account_allowed_for_scope(&s, manual_scope.as_ref(), &account.name) { excluded.insert(account.name.clone()); }
+            }
             if let Some(name) = overflow_name { excluded.insert(name.to_owned()); }
             let snapshot = s.state.routing_snapshot();
             let soft_fp = soft_keys.first().map(String::as_str);
@@ -1090,8 +1130,9 @@ async fn codex_handler(State(s): State<AppState>, req: Request) -> Result<Respon
                 .or_else(|| {
                     if backend_only { return None; }
                     let name = overflow_name?;
-                    s.config.accounts.iter().find(|a| a.name == name && !tried.contains(&a.name)
-                        && a.provider == Provider::OpenAIApi && s.state.is_available(&a.name))
+                s.config.accounts.iter().find(|a| a.name == name && !tried.contains(&a.name)
+                    && account_allowed_for_scope(&s, manual_scope.as_ref(), &a.name)
+                    && a.provider == Provider::OpenAIApi && s.state.is_available(&a.name))
                 })
         });
         let Some(account) = selected else {
@@ -1220,6 +1261,7 @@ async fn proxy_handler(
     State(s): State<AppState>,
     req: Request,
 ) -> Result<Response, ProxyError> {
+    let manual_scope = manual_scope_for_request(&s, req.headers(), "claude")?;
     // Remote auth: if a remote_key is configured, the client must supply it as x-api-key.
     if let Some(ref expected) = s.config.server.remote_key {
         let provided = req.headers()
@@ -1228,7 +1270,7 @@ async fn proxy_handler(
             .unwrap_or("");
         let managed_matches = provided.starts_with("shunt_")
             && crate::config::local_client_token("claude").ok().as_deref() == Some(provided);
-        if provided != expected && !managed_matches {
+        if manual_scope.is_none() && provided != expected && !managed_matches {
             return Err(ProxyError::Unauthorized);
         }
     }
@@ -1406,6 +1448,7 @@ async fn proxy_handler(
     let api_lane_usable = |tried: &HashSet<String>| -> bool {
         let Some(name) = api_lane_name.as_deref() else { return false };
         if tried.contains(name) { return false; }
+        if !account_allowed_for_scope(&s, manual_scope.as_ref(), name) { return false; }
         if s.state.account_spend_today_usd(name) + s.state.reserved_today_usd(name) >= ov.daily_budget_usd { return false; }
         s.config.accounts.iter().any(|a| a.name == name && a.credential.is_some())
             && s.state.is_available(name)
@@ -1456,10 +1499,12 @@ async fn proxy_handler(
             // a single blip on the primary lane doesn't force Claude Code to
             // block. Both are matched against `tried` so we never loop forever.
             s.config.accounts.iter()
-                .find(|a| a.name == lane && !tried.contains(&a.name))
+                .find(|a| a.name == lane && !tried.contains(&a.name)
+                    && account_allowed_for_scope(&s, manual_scope.as_ref(), &a.name))
                 .or_else(|| {
                     s.config.server.classifier_fallback_account.as_deref().and_then(|fb| {
-                        s.config.accounts.iter().find(|a| a.name == fb && !tried.contains(&a.name))
+                        s.config.accounts.iter().find(|a| a.name == fb && !tried.contains(&a.name)
+                            && account_allowed_for_scope(&s, manual_scope.as_ref(), &a.name))
                     })
                 })
         } else {
@@ -1468,6 +1513,9 @@ async fn proxy_handler(
             // ~1.0 and monopolize routing, blowing budget). It is reachable only
             // via the warm-start / overflow gates below.
             let mut excluded: HashSet<String> = tried.union(&saturated).cloned().collect();
+            for account in &s.config.accounts {
+                if !account_allowed_for_scope(&s, manual_scope.as_ref(), &account.name) { excluded.insert(account.name.clone()); }
+            }
             if let Some(name) = api_lane_name.as_deref() { excluded.insert(name.to_owned()); }
             let pick_sub = router::pick_account(
                 &s.config.accounts, &s.state, &snap, fp_ref, &excluded,
@@ -1549,6 +1597,7 @@ async fn proxy_handler(
                 let now = now_ms();
                 let soonest_ms = s.config.accounts.iter()
                     .filter_map(|a| {
+                        if !account_allowed_for_scope(&s, manual_scope.as_ref(), &a.name) { return None; }
                         let st = account_states.get(&a.name)?;
                         if st.disabled { return None; } // auth_failed or permanently off
                         if st.cooldown_until_ms > now { Some(st.cooldown_until_ms) } else { None }
@@ -2405,8 +2454,8 @@ async fn do_proactive_refresh(
 }
 
 
-/// Refreshes Codex credentials without collapsing multiple schema-v2 accounts.
-/// Legacy configs retain the historical auth.json sync; v2 treats auth.json as
+/// Refreshes Codex credentials without collapsing multiple native-pool accounts.
+/// Legacy configs retain the historical auth.json sync; v2+ treats auth.json as
 /// an import-only source and thereafter updates Shunt's own credential store.
 pub async fn openai_token_refresh_loop(
     config: Arc<Config>,
@@ -2420,7 +2469,7 @@ pub async fn openai_token_refresh_loop(
         if state.account_states().get(&account.name).map(|s| s.auth_failed).unwrap_or(false) {
             continue;
         }
-        if config.schema_version < crate::config::CONFIG_SCHEMA_VERSION {
+        if config.schema_version < crate::config::NATIVE_POOLS_SCHEMA_VERSION {
             sync_live_creds_from_auth_json(&account.name, &live_creds).await;
         }
 
@@ -2445,7 +2494,7 @@ pub async fn openai_token_refresh_loop(
         for account in config.accounts.iter()
             .filter(|a| a.provider == crate::provider::Provider::OpenAI)
         {
-            if config.schema_version < crate::config::CONFIG_SCHEMA_VERSION {
+            if config.schema_version < crate::config::NATIVE_POOLS_SCHEMA_VERSION {
                 sync_live_creds_from_auth_json(&account.name, &live_creds).await;
                 continue;
             }
@@ -3574,6 +3623,22 @@ fn resolve_model(
 mod tests {
     use super::*;
 
+    #[test]
+    fn manual_scope_filters_by_opaque_credential_id_and_fails_closed() {
+        let attachments = HashMap::from([
+            ("codex/allowed".to_owned(), "subscription-allowed".to_owned()),
+            ("codex/other".to_owned(), "subscription-other".to_owned()),
+        ]);
+        let scope = ManualGrantScope {
+            session_id: "msw-test".into(), providers: ["codex".to_owned()].into_iter().collect(),
+            subscriptions: ["subscription-allowed".to_owned()].into_iter().collect(), expires_at: u64::MAX,
+        };
+        assert!(credential_allowed_for_scope(&attachments, Some(&scope), "codex/allowed"));
+        assert!(!credential_allowed_for_scope(&attachments, Some(&scope), "codex/other"));
+        assert!(!credential_allowed_for_scope(&attachments, Some(&scope), "codex/missing"));
+        assert!(credential_allowed_for_scope(&attachments, None, "codex/other"));
+    }
+
     #[tokio::test]
     async fn anthropic_prefetch_uses_the_account_upstream_override() {
         use axum::{routing::post, Json, Router};
@@ -3623,6 +3688,7 @@ mod tests {
             secrets: Default::default(),
             classifier: Default::default(),
             bridge: Default::default(),
+            manual_swarm: Default::default(),
         };
         let state = StateStore::new_empty();
         let live_credentials = Arc::new(tokio::sync::RwLock::new(HashMap::new()));

@@ -1,6 +1,6 @@
 # Native pools and bridge operations
 
-Shunt schema v2 runs one daemon with two independent native runtimes:
+Shunt schema v3 retains schema v2's two independent native runtimes and adds explicit credential attachments:
 
 - `claude` listens on `127.0.0.1:8082` and serves Anthropic Messages traffic from Anthropic subscription accounts, with an optional Anthropic API overflow lane.
 - `codex` listens on `127.0.0.1:8083` and serves stock OpenAI Responses traffic from ChatGPT/Codex subscription accounts, with an optional OpenAI API overflow lane.
@@ -11,7 +11,7 @@ There is no automatic Claude-to-Codex wire translation in native pools. Cross-pr
 ## Configuration
 
 ```toml
-schema_version = 2
+schema_version = 3
 
 [server]
 host = "127.0.0.1"
@@ -29,7 +29,8 @@ fallback_models = ["claude-sonnet-4-6"]
 [[pools.claude.accounts]]
 name = "personal"
 provider = "anthropic"
-credential_source = "claude_credentials_file"
+credential_source = "provider-cli"
+credential_id = "claude/personal"
 
 [pools.claude.overflow]
 enabled = true
@@ -45,7 +46,8 @@ fallback_models = ["gpt-5.4"]
 [[pools.codex.accounts]]
 name = "personal"
 provider = "openai"
-credential_source = "codex_auth_file"
+credential_source = "provider-cli"
+credential_id = "codex/personal"
 
 [pools.codex.overflow]
 enabled = true
@@ -72,7 +74,18 @@ codex_fallback_models = ["gpt-5.4"]
 claude_fallback_models = ["sonnet"]
 ```
 
-The env-file path must be absolute. On Unix it must not be readable or writable by group or other users (`chmod 600`). Existing process environment values override file values. API key values are loaded into Shunt only; config and the credential store retain references, not the key values.
+The env-file path must be absolute. On Unix it must not be readable or writable by group or other users (`chmod 600`). Existing process environment values override file values. Shunt reads only keys explicitly selected by `api_key_env` or an overflow `key_env`; it does not inject the file into the process environment. `NPMJS`, `NPM_TOKEN`, and `NODE_AUTH_TOKEN` are never eligible runtime keys.
+
+Credential sources are `local-store`, `provider-cli`, `env-file`, `website-broker`, and `none`. An account block is a routing attachment. `shunt remove-account` detaches it without deleting the source; `shunt delete-credential` deletes only a detached local-store entry.
+
+Website3 mode uses a browser device flow and user-scoped Fabric inventory:
+
+```bash
+shunt setup --mode website --install-clients
+shunt website inventory
+```
+
+Website3 and Fabric return short-lived access material only. Provider refresh tokens and Doppler credentials never reach Shunt. Successful leases are encrypted locally and may be used during an outage for at most one hour, never beyond provider expiry. Authorization denials fail closed and do not use the grace cache.
 
 Overflow budgets are hard pre-dispatch gates. Shunt atomically reserves a conservative worst-case amount from body size, the configured output cap, and the model price before sending an API request. Actual usage reconciles a reservation. Unknown-price models are rejected, and reservations left unresolved by a crash remain charged for that UTC day.
 
@@ -84,7 +97,7 @@ shunt migrate --apply --env-file /absolute/path/to/.env.local
 shunt setup --env-file /absolute/path/to/.env.local --install-clients
 ```
 
-Migration is idempotent and backup-first. It partitions Anthropic and OpenAI accounts into their native pools, leaves other providers under legacy accounts, scopes credentials by pool, and retains `*.bak-v1` copies of config, credentials, and state. `shunt start` applies the same migration automatically when it sees a legacy file.
+Migration is idempotent and backup-first. Legacy files are partitioned into native pools and upgraded directly to v3; schema-v2 files retain their pool topology and gain credential references. Legacy backups use `*.bak-v1`; v2-to-v3 config backups use `*.bak-v2`. `shunt start` applies the same migration automatically.
 
 `--install-clients` backs up and minimally patches user client files. It installs a stock Codex Responses provider and registers the Shunt MCP bridge for Codex and Claude. Uninstall removes the managed `shunt-codex` and `shunt` MCP entries while preserving unrelated client configuration.
 
@@ -157,7 +170,7 @@ If any gate fails, the parent is untouched and the patch remains in the job arti
 Before landing a bridge or native-transport change, run an isolated smoke test with both stock clients:
 
 1. Confirm `codex login status` and `claude auth status` report authenticated sessions, and ensure `SHUNT_CODEX_BIN` resolves to a genuine Codex executable.
-2. Build Shunt and start the branch binary with temporary `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_CACHE_HOME` directories, three unused loopback ports, and a temporary schema-v2 config. Use `codex_auth_file` and `claude_credentials_file` account sources, disable the classifier and API overflow lanes, and keep the real `HOME` only for read-only credential import.
+2. Build Shunt and start the branch binary with temporary `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_CACHE_HOME` directories, three unused loopback ports, and a temporary schema-v3 config. Use pool-qualified credential references, disable the classifier and API overflow lanes, and keep the real `HOME` only for read-only provider-CLI imports when that source is explicitly selected.
 3. Run a real `consult_codex` job against a disposable clean Git fixture. Verify the captured Codex session uses full-access execution without bubblewrap; treat `allowedDomains` as recorded admission metadata for this worker.
 4. Run a real `consult_claude` job with `network = "none"` against the same fixture and require its expected sentinel response.
 5. Verify both jobs completed, outputs contain no credential material, detached worktrees were removed, and the fixture's `HEAD` and working tree are unchanged. Stop the temporary daemon and remove its isolated directories.

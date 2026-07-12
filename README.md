@@ -37,7 +37,7 @@ Shunt is a local proxy that combines subscription accounts into two isolated nat
 npx vibe-shunt
 ```
 
-Choose the release, install directory, client integration, and login service interactively. For an unattended install with recommended defaults, run `npx vibe-shunt --yes`. See all automation options with `npx vibe-shunt --help`.
+Choose the release, install directory, credential mode, client integration, and login service interactively. Website3 user-vault mode is recommended; local-only mode remains available. For an unattended install with recommended defaults, run `npx vibe-shunt --yes`. See all automation options with `npx vibe-shunt --help`.
 
 **shell installer:**
 
@@ -56,13 +56,14 @@ cargo install shunt-proxy
 ## Quick start
 
 ```bash
-shunt setup --install-clients  # import Claude + install managed client entries
+shunt setup --mode website --install-clients # Website3 login + user vault
+# or: shunt setup --mode local --install-clients
 shunt start      # start the proxy
 ```
 
 That's it. Claude Code and your other tools route through shunt automatically.
 
-Existing flat configs migrate automatically on start. Preview the backup-first migration with `shunt migrate --dry-run`. See [Native pools and bridge operations](docs/native-pools-and-bridge.md) for schema-v2 configuration, API-overflow budgets, stock Codex setup, and bridge security.
+Existing flat and schema-v2 configs migrate automatically on start. Preview the backup-first schema-v3 attachment migration with `shunt migrate --dry-run`. See [Native pools and bridge operations](docs/native-pools-and-bridge.md) for configuration, Website3 leases, API-overflow budgets, stock Codex setup, and bridge security.
 
 Add more accounts to grow your pool:
 
@@ -123,7 +124,13 @@ shunt share <code>       # on another machine — configures everything
 
 ```bash
 shunt setup --install-clients # first-time setup + stock client/MCP entries
-shunt migrate --dry-run  # preview schema-v2 migration
+shunt setup --mode website    # Website3 device login and user inventory
+shunt setup --mode website --install-clients --manual-swarm \
+  --manual-swarm-max-agents 8 --manual-swarm-default-target auto
+shunt website inventory       # redacted remote inventory
+shunt website add-key --provider groq --label personal # vault + attach
+shunt inventory               # attachments + redacted local store
+shunt migrate --dry-run       # preview schema-v3 migration
 shunt migrate --apply    # back up and migrate now
 shunt start              # start the proxy
 shunt stop               # stop the proxy
@@ -136,7 +143,8 @@ shunt logs -f            # follow logs
 shunt config             # manage accounts interactively
 shunt add-account <name> # add an account or provider
 shunt add-account work --provider openai --pool codex
-shunt remove-account <name>
+shunt remove-account <name>   # detach only; source credential is retained
+shunt delete-credential <name># explicitly delete a detached local credential
 shunt logout [name]      # log out of an account
 shunt use [account]      # pin routing to a specific account
 shunt use --pool codex [account]
@@ -152,6 +160,10 @@ shunt disconnect         # revert to localhost-only
 shunt live               # persistent tunnel via relay
 shunt update             # update to latest
 ```
+
+The `vibe-shunt` installer can install and enable the bounded Manual Swarm workflow. Claude exposes it as `/auto-swarm`; Codex installs the `auto-swarm@shunt` plugin and invokes its skill as `$auto-swarm` or through `/skills`. A plan requires an explicit user-authorized Space, Swarm, and subscription list—Shunt never guesses an account or widens inventory. Launch approval never authorizes apply: workers produce isolated SwarmFS changes and the parent checkout changes only after a separate reviewed `manual_swarm_apply` confirmation.
+
+The local production path requires a digest-pinned Auto Swarm worker container and Website3's Ed25519 public verifier key (`SHUNT_MANUAL_SWARM_PUBLIC_KEY`). The private signing key never leaves Website3. Shunt verifies the transient signed grant on every Claude or Codex request and maps its opaque subscription ids to the installation's schema-v3 attachment inventory before routing; missing mappings, expired grants, and ungranted lanes fail closed. The legacy host process runner remains unavailable. DigitalOcean and Hetzner also remain unavailable until their hosted worker/gateway lifecycle passes the documented live gates. See `docs/manual-swarm-plan.md` for the exact readiness boundary.
 
 Allowlisted bridge jobs validate and record normalized hostname/IP patterns; Claude enforces them in its sandbox, while Codex bridge workers intentionally run with full local permissions and no bubblewrap. See the operations guide for policy syntax and the authenticated release smoke gate.
 

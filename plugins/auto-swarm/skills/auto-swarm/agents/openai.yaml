@@ -1,0 +1,4 @@
+interface:
+  display_name: "Auto Swarm"
+  short_description: "Launch and control bounded parallel coding workers"
+  default_prompt: "Use $auto-swarm to plan and launch a reviewed parallel coding session."

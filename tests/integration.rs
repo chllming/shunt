@@ -200,6 +200,7 @@ async fn setup(streaming: bool, upstream_status: u16) -> (TestServer, TestServer
         secrets: Default::default(),
         classifier: Default::default(),
         bridge: Default::default(),
+        manual_swarm: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -458,6 +459,7 @@ async fn setup_multi() -> (TestServer, TestServer, Captures, Client) {
         secrets: Default::default(),
         classifier: Default::default(),
         bridge: Default::default(),
+        manual_swarm: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -515,6 +517,7 @@ async fn test_stickiness_same_conversation() {
         secrets: Default::default(),
         classifier: Default::default(),
         bridge: Default::default(),
+        manual_swarm: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -574,6 +577,7 @@ async fn test_all_accounts_exhausted_returns_503() {
         secrets: Default::default(),
         classifier: Default::default(),
         bridge: Default::default(),
+        manual_swarm: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -686,6 +690,7 @@ async fn test_remote_key_auth() {
         secrets: Default::default(),
         classifier: Default::default(),
         bridge: Default::default(),
+        manual_swarm: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -898,7 +903,7 @@ async fn test_native_codex_responses_is_byte_transparent_and_injects_identity() 
         }],
         config_file: "/dev/null".into(), model_mapping: Default::default(), api_overflow: Default::default(),
         schema_version: 2, pools: Default::default(), secrets: Default::default(),
-        classifier: Default::default(), bridge: Default::default(),
+        classifier: Default::default(), bridge: Default::default(), manual_swarm: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -973,7 +978,7 @@ async fn test_codex_soft_affinity_fails_over_but_turn_state_is_strict() {
         accounts: vec![account("codex/one", "codex-one"), account("codex/two", "codex-two")],
         config_file: "/dev/null".into(), model_mapping: Default::default(), api_overflow: Default::default(),
         schema_version: 2, pools: Default::default(), secrets: Default::default(),
-        classifier: Default::default(), bridge: Default::default(),
+        classifier: Default::default(), bridge: Default::default(), manual_swarm: Default::default(),
     };
     let state = StateStore::new_empty().scoped("codex");
     state.set_pinned(Some("codex/one".into()));
@@ -1025,7 +1030,7 @@ async fn test_codex_api_overflow_reserves_budget_before_dispatch() {
             credential: Some(Credential::Apikey { key: "sk-test".into() }), upstream_url: Some(upstream.url()), model: None,
         }],
         config_file: "/dev/null".into(), model_mapping: Default::default(), api_overflow: overflow,
-        schema_version: 2, pools, secrets: Default::default(), classifier: Default::default(), bridge: Default::default(),
+        schema_version: 2, pools, secrets: Default::default(), classifier: Default::default(), bridge: Default::default(), manual_swarm: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -1059,6 +1064,7 @@ async fn test_interop_anthropic_request_to_openai_account() {
         secrets: Default::default(),
         classifier: Default::default(),
         bridge: Default::default(),
+        manual_swarm: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -1123,6 +1129,7 @@ async fn test_interop_anthropic_streaming_to_openai_account() {
         secrets: Default::default(),
         classifier: Default::default(),
         bridge: Default::default(),
+        manual_swarm: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -1183,6 +1190,7 @@ async fn test_interop_openai_request_to_anthropic_account() {
         secrets: Default::default(),
         classifier: Default::default(),
         bridge: Default::default(),
+        manual_swarm: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -1257,6 +1265,7 @@ async fn test_interop_failover_anthropic_to_openai() {
         secrets: Default::default(),
         classifier: Default::default(),
         bridge: Default::default(),
+        manual_swarm: Default::default(),
     };
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();
     let proxy = TestServer::start(app).await;
@@ -1329,6 +1338,7 @@ async fn test_live_api() {
         secrets: Default::default(),
         classifier: Default::default(),
         bridge: Default::default(),
+        manual_swarm: Default::default(),
     };
 
     let (app, _, _) = create_app_with_state(cfg, StateStore::new_empty(), None).unwrap();

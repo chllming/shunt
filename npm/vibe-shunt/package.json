@@ -1,12 +1,13 @@
 {
   "name": "vibe-shunt",
-  "version": "0.1.149",
+  "version": "0.2.0",
   "description": "Interactive, verified installer for the Shunt native Claude and Codex proxy",
   "type": "module",
   "bin": {
     "vibe-shunt": "bin/vibe-shunt.mjs"
   },
   "files": [
+    "assets/",
     "bin/",
     "README.md"
   ],
@@ -21,7 +22,9 @@
     "codex",
     "claude",
     "installer",
-    "proxy"
+    "proxy",
+    "auto-swarm",
+    "swarmfs"
   ],
   "license": "MIT",
   "repository": {

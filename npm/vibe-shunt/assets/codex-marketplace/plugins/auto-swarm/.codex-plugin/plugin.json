@@ -1,0 +1,25 @@
+{
+  "name": "auto-swarm",
+  "version": "0.2.0",
+  "description": "Launch and control bounded parallel Auto Swarm coding sessions through Shunt.",
+  "author": {
+    "name": "Shunt contributors",
+    "url": "https://github.com/chllming/shunt"
+  },
+  "homepage": "https://github.com/chllming/shunt",
+  "repository": "https://github.com/chllming/shunt",
+  "license": "MIT",
+  "keywords": ["auto-swarm", "coding-agents", "parallel", "shunt", "swarmfs"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Auto Swarm",
+    "shortDescription": "Run reviewed parallel coding sessions through Shunt",
+    "longDescription": "Plan, launch, steer, inspect, review, and explicitly apply bounded Auto Swarm coding sessions while the parent Codex task remains in control.",
+    "developerName": "Shunt contributors",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Write"],
+    "websiteURL": "https://github.com/chllming/shunt",
+    "defaultPrompt": ["Plan and launch a reviewed parallel coding session with Auto Swarm"]
+  },
+  "mcpServers": "./.mcp.json"
+}

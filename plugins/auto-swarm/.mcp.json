@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "shunt": {
+      "command": "shunt",
+      "args": ["bridge", "mcp", "--caller", "codex"]
+    }
+  }
+}
