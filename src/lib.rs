@@ -7,6 +7,7 @@ pub mod forwarder;
 pub mod limiter;
 pub mod live_relay;
 pub mod manual_swarm;
+pub mod manual_swarm_gateway;
 pub mod logging;
 pub mod monitor;
 pub mod notify;

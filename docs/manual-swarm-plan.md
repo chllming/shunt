@@ -1,12 +1,12 @@
 # Manual Swarm plan
 
-Status: control-plane and local fixture slice implemented; production execution gated
+Status: local container execution production-ready; hosted execution gated
 
-Date: 2026-07-11
+Date: 2026-07-12
 
 Owners: Shunt, Auto Swarm, Website3/Fabric, and Steward
 
-Implementation note (2026-07-11): the versioned grants, Website3/Fabric authorization boundary, Auto Swarm manual-session state machine, independent review contract, hardened Shunt MCP/apply client, Steward projections, Codex/Claude extensions, worker package, and `vibe-shunt` installer lifecycle are implemented and covered by contract/adversarial tests. Production execution remains deliberately unavailable: the direct local command executor cannot prove host-filesystem confinement or exact subscription-scoped Shunt routing, and the DigitalOcean/Hetzner Kubernetes adapter plus session-scoped worker gateway in phases 3–4 are not yet installed. Capability discovery reports those targets unavailable; it never silently falls back.
+Implementation note (2026-07-12): the versioned grants, Website3/Fabric authorization boundary, Auto Swarm manual-session state machine, independent review contract, hardened Shunt MCP/apply client, Steward projections, Codex/Claude extensions, worker package, and `vibe-shunt` installer lifecycle are implemented and covered by contract/adversarial tests. Local execution is production-ready only through Auto Swarm's digest-pinned container executor: it mounts one SwarmFS fork plus bounded artifacts, drops privileges/capabilities, keeps the signed grant transient, and sends it to Shunt as request-scoped routing authority. Shunt verifies the grant on every model request and filters accounts by the exact schema-v3 attachment credential ids. The direct host command executor remains unavailable. The DigitalOcean/Hetzner adapter and cluster-local gateway in phases 3–4 are not yet installed; those targets fail closed without silent fallback.
 
 ## 1. Outcome
 
@@ -43,7 +43,7 @@ Manual Swarm does not:
 
 | Mode | Compute | Workspace | Lifecycle | Best use |
 | --- | --- | --- | --- | --- |
-| `local` | Local Go worker processes | Local BuildSwarmFS forks | Synchronous and bounded | Small tasks and offline development |
+| `local` | Digest-pinned Go worker containers | Local BuildSwarmFS forks | Synchronous and bounded | Small tasks and operator-driven development |
 | `remote` | Kubernetes Jobs | Production SwarmFS snapshot/fork | Bounded session coordinator | Parallel implementation and integration |
 | `managed` | Existing Auto Swarm runtime | Controller-selected SwarmFS | Full reconciled lifecycle | Autonomous governed work; outside this plan |
 
@@ -502,8 +502,14 @@ Exit gate: schema tests, invalid-transition tests, scope tests, and a no-runtime
 - Run two local Go workers through Shunt's Claude/Codex endpoints.
 - Freeze forks, create ChangeRefs, and return an integration proposal.
 - Add Shunt MCP plan/start/status/wait/cancel/inspect tools.
+- Run production workers only in a digest-pinned, read-only, non-root container
+  with the fork and artifacts as its sole host mounts.
+- Verify the Fabric grant at Shunt on every request and restrict selection to
+  the grant's exact provider and attachment credential ids.
 
-Exit gate: two parallel workers produce independent changes while the parent checkout remains unchanged.
+Exit gate: two parallel workers produce independent changes while the parent
+checkout remains unchanged, and container/routing adversarial tests pass. This
+gate is implemented for `local`; the legacy host runner is not part of it.
 
 ### Phase 2: Website3/Fabric grants
 
@@ -617,11 +623,11 @@ Run on both DigitalOcean and Hetzner:
 
 ## 17. Acceptance criteria
 
-Manual Swarm is complete only when:
+The complete local Manual Swarm release is ready when:
 
 - Claude and Codex can both launch and control it through supported extension surfaces;
 - the parent session remains responsive while workers run;
-- at least four workers run concurrently on a hosted substrate;
+- multiple digest-pinned local workers run concurrently;
 - every worker receives a distinct SwarmFS fork from one immutable source snapshot;
 - mixed Claude/Codex subscription routing works without raw user credentials on the worker substrate;
 - Steward shows the complete session and exception state;
@@ -630,7 +636,12 @@ Manual Swarm is complete only when:
 - failed, cancelled, expired, and interrupted sessions preserve honest state and release capacity;
 - no WorkItem reconciler, automatic integration request, acceptance, or landing occurs;
 - secret scans find no refresh tokens, Website3 sessions, Doppler service tokens, or `.env.local` contents;
-- DigitalOcean and Hetzner live smokes both pass against the same release contracts.
+- the pull-request container smoke passes the hardened runtime contract.
+
+Hosted Manual Swarm is separately complete only when at least four workers run
+concurrently on a hosted substrate and the DigitalOcean and Hetzner live smokes
+both pass against the same release contracts. Until then, hosted capability
+discovery and launch remain unavailable.
 
 ## 18. Release order
 
