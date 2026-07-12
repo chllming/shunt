@@ -293,7 +293,7 @@ fn scrub_configured_secrets(command: &mut Command, config: &crate::config::Confi
     }
 }
 
-fn normalize_allowed_domains(
+pub(crate) fn normalize_allowed_domains(
     network: NetworkPolicy,
     allowed_domains: &[String],
 ) -> Result<Vec<String>> {
@@ -767,6 +767,9 @@ async fn call_tool(
     depth: u8,
     config_path: Option<&Path>,
 ) -> Result<Value> {
+    if crate::manual_swarm::is_manual_tool(name) {
+        return crate::manual_swarm::dispatch(name, arguments, depth, config_path).await;
+    }
     if name == "bridge_wait" {
         let input: ToolInput = serde_json::from_value(arguments)?;
         let id = input.id.context("id is required")?;
@@ -870,13 +873,17 @@ pub async fn serve_mcp(caller: &str, config_path: Option<&Path>) -> Result<()> {
             "initialize" => json!({"jsonrpc":"2.0","id":id,"result":{
                 "protocolVersion":"2024-11-05","capabilities":{"tools":{}},
                 "serverInfo":{"name":"shunt-bridge","version":env!("CARGO_PKG_VERSION")}}}),
-            "tools/list" => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[
-                {"name":"consult_codex","description":"Ask an isolated Codex worker to analyze or patch a repository.","inputSchema":tool_schema()},
-                {"name":"consult_claude","description":"Ask an isolated Claude worker to analyze or patch a repository.","inputSchema":tool_schema()},
-                {"name":"delegate_best","description":"Choose a deterministic opposite-provider worker for the task.","inputSchema":tool_schema()},
-                {"name":"bridge_wait","description":"Wait for an asynchronous bridge job.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"timeout":{"type":"integer"}},"required":["id"]}},
-                {"name":"bridge_cancel","description":"Request cancellation of a bridge job.","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}
-            ]}}),
+            "tools/list" => {
+                let mut tools = vec![
+                    json!({"name":"consult_codex","description":"Ask an isolated Codex worker to analyze or patch a repository.","inputSchema":tool_schema()}),
+                    json!({"name":"consult_claude","description":"Ask an isolated Claude worker to analyze or patch a repository.","inputSchema":tool_schema()}),
+                    json!({"name":"delegate_best","description":"Choose a deterministic opposite-provider worker for the task.","inputSchema":tool_schema()}),
+                    json!({"name":"bridge_wait","description":"Wait for an asynchronous bridge job.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"timeout":{"type":"integer"}},"required":["id"]}}),
+                    json!({"name":"bridge_cancel","description":"Request cancellation of a bridge job.","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}),
+                ];
+                tools.extend(crate::manual_swarm::tool_definitions());
+                json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools}})
+            },
             "tools/call" => {
                 let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");

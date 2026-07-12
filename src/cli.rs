@@ -34,6 +34,15 @@ enum Command {
         /// Website3 base URL (defaults to https://beyondwork.ai).
         #[arg(long)]
         website_url: Option<String>,
+        /// Enable the Website3-authenticated Manual Swarm MCP workflow.
+        #[arg(long)]
+        manual_swarm: bool,
+        /// Maximum parallel Manual Swarm workers (1-32).
+        #[arg(long, requires = "manual_swarm")]
+        manual_swarm_max_agents: Option<usize>,
+        /// Default explicit/auto Manual Swarm substrate target.
+        #[arg(long, requires = "manual_swarm")]
+        manual_swarm_default_target: Option<String>,
     },
     /// Start the proxy (runs setup first if not configured)
     Start {
@@ -542,7 +551,17 @@ pub async fn run() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Setup { config, env_file, install_clients, mode, website_url } => cmd_setup(config, env_file, install_clients, &mode, website_url.as_deref()).await,
+        Command::Setup { config, env_file, install_clients, mode, website_url, manual_swarm,
+            manual_swarm_max_agents, manual_swarm_default_target } => {
+            let configured_path = config.clone().unwrap_or_else(config_path);
+            cmd_setup(config, env_file, install_clients, &mode, website_url.as_deref()).await?;
+            if manual_swarm {
+                configure_manual_swarm(&configured_path, manual_swarm_max_agents,
+                    manual_swarm_default_target.as_deref())?;
+                println!("  {} Manual Swarm enabled.", green(CHECK));
+            }
+            Ok(())
+        },
         Command::Start { config, host, port, foreground, verbose, force, daemon } => cmd_start(config, host, port, foreground, verbose, force, daemon).await,
         Command::Stop => cmd_stop().await,
         Command::Restart { config } => cmd_restart(config).await,
@@ -719,6 +738,56 @@ pub async fn cmd_setup(config_override: Option<PathBuf>, env_file: Option<PathBu
     println!("  {} Run {} to start.", green(CHECK), cyan("shunt start"));
     println!("  {} Then restart any open Claude Code windows.", dim("·"));
 
+    Ok(())
+}
+
+fn configure_manual_swarm(path: &std::path::Path, max_agents: Option<usize>, target: Option<&str>) -> Result<()> {
+    use toml_edit::{value, Array, DocumentMut};
+
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut document: DocumentMut = text.parse().context("failed to edit Shunt config")?;
+    document["manual_swarm"]["enabled"] = value(true);
+    if let Some(max_agents) = max_agents {
+        if !(1..=crate::config::MANUAL_SWARM_MAX_AGENTS).contains(&max_agents) {
+            bail!("manual-swarm-max-agents must be between 1 and {}", crate::config::MANUAL_SWARM_MAX_AGENTS);
+        }
+        document["manual_swarm"]["max_agents"] = value(max_agents as i64);
+        let current_default = document.get("manual_swarm").and_then(|item| item.get("default_agents"))
+            .and_then(|item| item.as_integer()).unwrap_or(4);
+        if current_default > max_agents as i64 {
+            document["manual_swarm"]["default_agents"] = value(max_agents as i64);
+        }
+    }
+    if let Some(target) = target {
+        if target.is_empty() || target.len() > 64 || !target.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+        }) {
+            bail!("manual-swarm-default-target is invalid");
+        }
+        document["manual_swarm"]["default_target"] = value(target);
+        let has_allowed_targets = document.get("manual_swarm")
+            .and_then(|item| item.get("allowed_targets")).is_some();
+        if !has_allowed_targets {
+            let mut targets = Array::new();
+            for allowed in ["auto", "local", "build-fra1", "hetzner-backup-substrate"] {
+                targets.push(allowed);
+            }
+            if !targets.iter().any(|item| item.as_str() == Some(target)) { targets.push(target); }
+            document["manual_swarm"]["allowed_targets"] = value(targets);
+        } else if let Some(targets) = document["manual_swarm"]["allowed_targets"].as_array_mut() {
+            if !targets.iter().any(|item| item.as_str() == Some(target)) { targets.push(target); }
+        } else {
+            bail!("manual_swarm.allowed_targets must be an array");
+        }
+    }
+    let tmp = path.with_extension("manual-swarm.tmp");
+    std::fs::write(&tmp, document.to_string())?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(tmp, path)?;
     Ok(())
 }
 
@@ -1864,6 +1933,27 @@ plan_type = "pro"
         let claude = std::fs::read_to_string(home.join(".claude.json")).unwrap();
         assert!(claude.contains("\"custom\": \"keep\""));
         assert!(!claude.contains("mcpServers\": {\n    \"shunt"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manual_swarm_setup_edit_is_idempotent_and_preserves_other_config() {
+        let root = std::env::temp_dir().join(format!("shunt-manual-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let mut text = crate::config::config_template(&[]);
+        text.push_str("\n[custom]\npreserve = \"yes\"\n");
+        std::fs::write(&path, text).unwrap();
+        configure_manual_swarm(&path, Some(6), Some("build-fra1")).unwrap();
+        configure_manual_swarm(&path, Some(6), Some("build-fra1")).unwrap();
+        let edited = std::fs::read_to_string(&path).unwrap();
+        let document: toml::Value = toml::from_str(&edited).unwrap();
+        assert_eq!(document["manual_swarm"]["enabled"].as_bool(), Some(true));
+        assert_eq!(document["manual_swarm"]["max_agents"].as_integer(), Some(6));
+        assert_eq!(document["manual_swarm"]["default_target"].as_str(), Some("build-fra1"));
+        assert_eq!(document["custom"]["preserve"].as_str(), Some("yes"));
+        let targets = document["manual_swarm"]["allowed_targets"].as_array().unwrap();
+        assert_eq!(targets.iter().filter(|target| target.as_str() == Some("build-fra1")).count(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 }
@@ -3994,6 +4084,7 @@ async fn serve_all_providers(
             secrets: config.secrets.clone(),
             classifier: config.classifier.clone(),
             bridge: config.bridge.clone(),
+            manual_swarm: config.manual_swarm.clone(),
         };
 
         let (app, live_creds) = crate::proxy::create_proxy_app(provider_config.clone(), pool_state.clone(), None, supabase.clone())?;
@@ -4032,6 +4123,7 @@ async fn serve_all_providers(
         secrets: config.secrets.clone(),
         classifier: config.classifier.clone(),
         bridge: config.bridge.clone(),
+        manual_swarm: config.manual_swarm.clone(),
     };
     let control_app = crate::proxy::create_control_app(control_config.clone(), state.scoped("claude"))?;
     let control_listener = tokio::net::TcpListener::bind(format!("{host}:{control_port}"))

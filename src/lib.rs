@@ -6,6 +6,7 @@ pub mod pricing;
 pub mod forwarder;
 pub mod limiter;
 pub mod live_relay;
+pub mod manual_swarm;
 pub mod logging;
 pub mod monitor;
 pub mod notify;

@@ -125,6 +125,8 @@ shunt share <code>       # on another machine — configures everything
 ```bash
 shunt setup --install-clients # first-time setup + stock client/MCP entries
 shunt setup --mode website    # Website3 device login and user inventory
+shunt setup --mode website --install-clients --manual-swarm \
+  --manual-swarm-max-agents 8 --manual-swarm-default-target auto
 shunt website inventory       # redacted remote inventory
 shunt website add-key --provider groq --label personal # vault + attach
 shunt inventory               # attachments + redacted local store
@@ -158,6 +160,8 @@ shunt disconnect         # revert to localhost-only
 shunt live               # persistent tunnel via relay
 shunt update             # update to latest
 ```
+
+The `vibe-shunt` installer can install and enable the same bounded Manual Swarm workflow. Claude exposes it as `/auto-swarm`; Codex installs the `auto-swarm@shunt` plugin and invokes its skill as `$auto-swarm` or through `/skills`. A plan requires an explicit user-authorized Space, Swarm, and subscription list—Shunt never guesses an account or widens inventory. Launch approval never authorizes apply: workers produce isolated SwarmFS changes and the parent checkout changes only after a separate reviewed `manual_swarm_apply` confirmation. Target capability checks fail closed until the coordinator proves filesystem confinement, exact grant-scoped provider/subscription routing, and—on hosted targets—current substrate and gateway readiness.
 
 Allowlisted bridge jobs validate and record normalized hostname/IP patterns; Claude enforces them in its sandbox, while Codex bridge workers intentionally run with full local permissions and no bubblewrap. See the operations guide for policy syntax and the authenticated release smoke gate.
 

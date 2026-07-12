@@ -3623,6 +3623,7 @@ mod tests {
             secrets: Default::default(),
             classifier: Default::default(),
             bridge: Default::default(),
+            manual_swarm: Default::default(),
         };
         let state = StateStore::new_empty();
         let live_credentials = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
