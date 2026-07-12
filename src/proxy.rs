@@ -1199,7 +1199,10 @@ async fn codex_guardian_response(s: &AppState, request_body: &[u8]) -> Option<Re
         .ok()?;
     let result = client.post(format!("{}/v1/chat/completions", upstream.trim_end_matches('/')))
         .json(&json!({"model": classifier_model, "messages": [{"role":"user","content":prompt}], "stream":false}))
-        .send().await.ok().and_then(|r| if r.status().is_success() { Some(r) } else { None });
+        .send()
+        .await
+        .ok()
+        .filter(|r| r.status().is_success());
     let content = match result {
         Some(response) => response
             .json::<serde_json::Value>()
