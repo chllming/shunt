@@ -34,10 +34,16 @@ Shunt is a local proxy that combines subscription accounts into two isolated nat
 **macOS / Linux — interactive installer:**
 
 ```bash
-npx vibe-shunt
+npx vibe-shunt@latest
 ```
 
-Choose the release, install directory, credential mode, client integration, and login service interactively. Website3 user-vault mode is recommended; local-only mode remains available. For an unattended install with recommended defaults, run `npx vibe-shunt --yes`. See all automation options with `npx vibe-shunt --help`.
+Choose the release, install directory, credential mode, client integration, and login service interactively. Website3 user-vault mode is recommended; local-only mode remains available. For an unattended install with recommended defaults, run `npx vibe-shunt@latest --yes`. See all automation options with `npx vibe-shunt@latest --help`.
+
+`vibe-shunt` is the npm installer package; `shunt-proxy` is the Rust crate and
+installed binary. A release publishes the same version to GitHub, npm, and
+crates.io only after the installer tests, platform builds, checksums, and
+GitHub release succeed. The installer defaults to the latest matching GitHub
+release and refuses an archive whose checksum is absent or mismatched.
 
 **shell installer:**
 
@@ -164,6 +170,11 @@ shunt update             # update to latest
 The `vibe-shunt` installer can install and enable the bounded Manual Swarm workflow. Claude exposes it as `/auto-swarm`; Codex installs the `auto-swarm@shunt` plugin and invokes its skill as `$auto-swarm` or through `/skills`. A plan requires an explicit user-authorized Space, Swarm, and subscription list—Shunt never guesses an account or widens inventory. Launch approval never authorizes apply: workers produce isolated SwarmFS changes and the parent checkout changes only after a separate reviewed `manual_swarm_apply` confirmation.
 
 The local production path requires a digest-pinned Auto Swarm worker container and Website3's Ed25519 public verifier key (`SHUNT_MANUAL_SWARM_PUBLIC_KEY`). The private signing key never leaves Website3. Shunt verifies the transient signed grant on every Claude or Codex request and maps its opaque subscription ids to the installation's schema-v3 attachment inventory before routing; missing mappings, expired grants, and ungranted lanes fail closed. The legacy host process runner remains unavailable. DigitalOcean and Hetzner also remain unavailable until their hosted worker/gateway lifecycle passes the documented live gates. See `docs/manual-swarm-plan.md` for the exact readiness boundary.
+
+Installing the Manual Swarm skill/plugin configures the client surface only.
+It does not install or start an Auto Swarm coordinator, publish a worker image,
+or make a hosted target available. The coordinator must independently pass its
+capability check and be configured with an immutable worker image digest.
 
 Allowlisted bridge jobs validate and record normalized hostname/IP patterns; Claude enforces them in its sandbox, while Codex bridge workers intentionally run with full local permissions and no bubblewrap. See the operations guide for policy syntax and the authenticated release smoke gate.
 
