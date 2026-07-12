@@ -10,7 +10,7 @@ Implementation note (2026-07-12): the versioned grants, Website3/Fabric authoriz
 
 ## 1. Outcome
 
-Add an explicitly invoked **Manual Swarm** mode to Shunt. A developer remains in a normal Claude Code or Codex session and chooses when to start a bounded group of Auto Swarm Go coding workers. Workers can run locally or on the existing DigitalOcean/Hetzner SwarmFS substrates. The parent coding session remains the operator and integration authority.
+Add an explicitly invoked **Manual Swarm** mode to Shunt. A developer remains in a normal Claude Code or Codex session and chooses when to start a bounded group of Auto Swarm Go coding workers. Workers run locally through the proven container adapter today; DigitalOcean/Hetzner execution remains a future gated adapter. The parent coding session remains the operator and integration authority.
 
 Manual Swarm provides:
 
@@ -21,7 +21,7 @@ Manual Swarm provides:
 - explicit status, steering, cancellation, review, and apply operations;
 - conflict-aware integration proposals returned to the parent coding session;
 - Steward visibility into the session, workers, substrates, resources, and changes;
-- DigitalOcean DOKS as the default hosted target and the registered Hetzner cluster as an explicit backup/fallback target.
+- recognized DigitalOcean and Hetzner target identifiers that remain unavailable until their hosted adapter gates pass.
 
 Manual Swarm does not create unattended automode. It is a user-started, bounded execution session that terminates after producing a reviewed proposal or being cancelled.
 
@@ -44,10 +44,10 @@ Manual Swarm does not:
 | Mode | Compute | Workspace | Lifecycle | Best use |
 | --- | --- | --- | --- | --- |
 | `local` | Digest-pinned Go worker containers | Local BuildSwarmFS forks | Synchronous and bounded | Small tasks and operator-driven development |
-| `remote` | Kubernetes Jobs | Production SwarmFS snapshot/fork | Bounded session coordinator | Parallel implementation and integration |
+| `remote` | Future Kubernetes Jobs (currently unavailable) | Production SwarmFS snapshot/fork | Bounded session coordinator | Hosted execution after live gates pass |
 | `managed` | Existing Auto Swarm runtime | Controller-selected SwarmFS | Full reconciled lifecycle | Autonomous governed work; outside this plan |
 
-`remote` is the recommended Manual Swarm mode when a healthy production substrate is available. `local` uses the same session and result contracts so callers do not need a separate integration path.
+`local` is the only production-ready Manual Swarm mode in this release. A future `remote` adapter will use the same session and result contracts, but capability discovery currently rejects both hosted targets without fallback.
 
 ## 4. User experience
 
@@ -267,7 +267,7 @@ Shunt rechecks the parent `HEAD`, dirty-path overlap, patch applicability, and r
 - the requested worker capacity is available;
 - the target is permitted by the user grant and operator ceiling.
 
-DigitalOcean `build-fra1` is the default target. Hetzner `hetzner-backup-substrate` is selected only when explicitly requested or when the launch preview names it as a permitted fallback and the user approves that preview. No hosted target silently falls back to local.
+The future hosted default is DigitalOcean `build-fra1`. Hetzner `hetzner-backup-substrate` may be selected only when explicitly requested or when the launch preview names it as a permitted fallback and the user approves that preview. In the current release both return `target unavailable`; neither silently falls back to local.
 
 ### 7.2 Workspace topology
 
@@ -453,7 +453,9 @@ Steward sends commands to the same Manual Session API. It must not write session
 
 ## 13. Installation and packaging
 
-Extend `vibe-shunt` setup with:
+The implemented `vibe-shunt` setup configures the Manual Swarm client surface,
+operator ceiling, requested default target, Claude skill, and Codex plugin. It
+does not install a coordinator or worker runtime. Future setup may add:
 
 ```text
 Enable Manual Swarm? [Y/n]
@@ -464,7 +466,14 @@ Install Claude /auto-swarm skill? [Y/n]
 Install Codex auto-swarm plugin/skill? [Y/n]
 ```
 
-Package the Go coding worker separately using the existing platform-specific optional-dependency approach used by `@autoswarm/steward`, for example `@autoswarm/coding-worker` plus platform packages. Shunt may use a verified existing `autoswarm` binary, but must record an absolute path and verify a machine-readable capabilities/version response.
+The Go coding worker source distribution is separately versioned as
+`@autoswarm/coding-worker` plus platform packages, following the optional-
+dependency approach used by `@autoswarm/steward`. Its release workflow must
+publish all platform packages before the resolver package. The production local
+adapter runs the digest-pinned Auto Swarm container image; it does not trust an
+ambient globally installed worker binary. The npm launcher is a separate
+operator/development distribution and must verify the machine-readable
+capabilities/version response.
 
 The installer must be repeatable, back up changed client configuration, and remove only its managed skill/plugin/MCP entries on uninstall.
 
