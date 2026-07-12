@@ -19,6 +19,43 @@
 
 Shunt is a local proxy that combines subscription accounts into two isolated native endpoints: Anthropic Messages for Claude Code on port 8082 and OpenAI Responses for stock Codex on port 8083. It routes within each provider pool, preserves native streaming/tool semantics, and can delegate explicit cross-provider work through an isolated MCP bridge.
 
+## Fork lineage and Beyond Work adaptation
+
+This repository is the Beyond Work fork of
+[`ramc10/shunt`](https://github.com/ramc10/shunt). The original project,
+architecture, and MIT-licensed foundation remain the roots of this work. The
+fork is maintained at [`chllming/shunt`](https://github.com/chllming/shunt) and
+keeps Shunt's local proxy and account-pooling purpose while adapting it for the
+Beyond Work platform in three areas:
+
+- **Website3 identity and user-scoped resources.** Schema-v3 attachments
+  separate routing membership from credential ownership. Website3 authenticates
+  the user, Fabric authorizes inventory and account use, and Shunt receives only
+  redacted metadata or short-lived access material. Provider refresh tokens,
+  Website3 cookies, Doppler authority, and `.env.local` files do not cross the
+  broker boundary.
+- **Sandboxed Auto Swarm and SwarmFS execution.** Shunt supplies the Claude and
+  Codex client surface, verifies Website3's Ed25519 session grants, and limits
+  every worker request to the exact attached subscriptions in that grant. Auto
+  Swarm owns execution: each local production worker gets an isolated SwarmFS
+  fork inside a digest-pinned, read-only, non-root container, and the parent
+  checkout changes only through a separately reviewed apply. Shunt does not
+  turn an unconfined host process into a sandbox; the legacy host runner and
+  unproved DigitalOcean/Hetzner adapters remain unavailable.
+- **Custom classifier lanes.** Claude Code safety-classifier calls can be sent
+  to a dedicated account with a one-shot fallback, or to an operator-selected
+  local classifier endpoint and model. The fork supports a custom classifier
+  system prompt, bounds oversized classifier transcripts around the action
+  under review, preserves the verdict grammar expected by Claude Code, and
+  fails closed when a configured classifier cannot return a valid decision.
+
+The ordinary MCP bridge has a different security posture from Manual Swarm:
+Claude bridge workers use Claude's platform sandbox, while Codex bridge workers
+intentionally run with full local permissions and no bubblewrap. Use Manual
+Swarm when the task requires the SwarmFS/container confinement described above.
+See [Native pools and bridge operations](docs/native-pools-and-bridge.md) and
+the [Manual Swarm plan](docs/manual-swarm-plan.md) for the exact boundaries.
+
 <div align="center">
 <img src="https://raw.githubusercontent.com/ramc10/shunt/main/diagram.svg" width="600">
 </div>
