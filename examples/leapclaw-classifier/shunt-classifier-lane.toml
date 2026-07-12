@@ -1,0 +1,20 @@
+# Example shunt config for a self-hosted classifier lane reached over an SSH
+# tunnel (see tunnel.sh). Merge these into ~/.config/shunt/config.toml.
+#
+# The classifier lane runs a small local model (Ollama) on a remote GPU host,
+# exposed to shunt at 127.0.0.1:11436 by the supervised SSH tunnel. Provider
+# "local" makes shunt allow the loopback upstream and send no auth header
+# (SSH is the auth boundary; Ollama needs no key).
+
+[server]
+# Route Claude Code's auto-mode safety-classifier side-calls to this lane only.
+classifier_account = "classifier"
+# Replace Claude Code's built-in classifier prompt with a custom one.
+classifier_system_prompt_path = "/home/coder/.config/shunt/harness-classifier.txt"
+
+[[accounts]]
+name = "classifier"
+plan_type = "max"
+provider = "local"
+upstream_url = "http://127.0.0.1:11436"
+model = "qwen2.5:7b-instruct"

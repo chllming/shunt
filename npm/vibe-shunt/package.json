@@ -1,0 +1,40 @@
+{
+  "name": "vibe-shunt",
+  "version": "0.2.0",
+  "description": "Interactive, verified installer for the Shunt open-core Claude and Codex proxy",
+  "type": "module",
+  "bin": {
+    "vibe-shunt": "bin/vibe-shunt.mjs"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "shunt",
+    "codex",
+    "claude",
+    "installer",
+    "proxy"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chllming/shunt.git",
+    "directory": "npm/vibe-shunt"
+  },
+  "homepage": "https://github.com/chllming/shunt#readme",
+  "bugs": {
+    "url": "https://github.com/chllming/shunt/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

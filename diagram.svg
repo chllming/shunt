@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 240" width="480" height="240">
+  <style>
+    text { font-family: 'Consolas', 'Monaco', 'Courier New', monospace; fill: #e8e8e8; }
+    .label { font-size: 12px; }
+    .tick { fill: #bcff5e; font-size: 12px; }
+    .dim { fill: #666; font-size: 11px; }
+    line { stroke: #2a3040; stroke-width: 1.5; fill: none; }
+    .arrow { stroke: #bcff5e; stroke-width: 1.5; }
+    .logo { fill: #bcff5e; }
+    .bg { fill: #07090d; }
+    .border { fill: none; stroke: #1a1f27; stroke-width: 1; }
+  </style>
+
+  <!-- background -->
+  <rect class="bg" width="480" height="240" rx="8"/>
+  <rect class="border" width="479" height="239" x="0.5" y="0.5" rx="8"/>
+
+  <!-- ── LEFT: agents ── -->
+  <line x1="145" y1="42" x2="145" y2="196"/>
+
+  <text class="tick"  x="16" y="48">✓</text>
+  <text class="label" x="30" y="48">Claude Code</text>
+  <line x1="128" y1="44" x2="145" y2="44"/>
+
+  <text class="dim" x="16" y="84">  Cursor</text>
+  <line x1="128" y1="80" x2="145" y2="80"/>
+
+  <text class="dim" x="16" y="120">  Codex CLI</text>
+  <line x1="128" y1="116" x2="145" y2="116"/>
+
+  <text class="dim" x="16" y="156">  Windsurf</text>
+  <line x1="128" y1="152" x2="145" y2="152"/>
+
+  <text class="dim" x="16" y="192">  any SDK</text>
+  <line x1="128" y1="188" x2="145" y2="188"/>
+
+  <!-- arrow → logo -->
+  <line class="arrow" x1="145" y1="116" x2="185" y2="116"/>
+  <polygon points="185,111 197,116 185,121" fill="#bcff5e" stroke="none"/>
+
+  <!-- ── CENTER: shunt logo (8px/unit, origin x=205, center x=245, y=112) ── -->
+  <!-- row 0: units 2-7 → x=221, w=48 -->
+  <rect class="logo" x="221" y="112" width="48" height="8"/>
+  <!-- row 1: left units 0-2 → x=205,w=24; right units 7-9 → x=261,w=24 -->
+  <rect class="logo" x="205" y="120" width="24" height="8"/>
+  <rect class="logo" x="261" y="120" width="24" height="8"/>
+  <!-- row 2: same as row 0 -->
+  <rect class="logo" x="221" y="128" width="48" height="8"/>
+  <!-- row 3: unit 3 → x=229,w=8; unit 6 → x=253,w=8 -->
+  <rect class="logo" x="229" y="136" width="8" height="8"/>
+  <rect class="logo" x="253" y="136" width="8" height="8"/>
+
+  <!-- arrow → providers -->
+  <line class="arrow" x1="293" y1="116" x2="318" y2="116"/>
+  <polygon points="318,111 330,116 318,121" fill="#bcff5e" stroke="none"/>
+
+  <!-- ── RIGHT: providers ── -->
+  <line x1="330" y1="20" x2="330" y2="220"/>
+
+  <line x1="330" y1="26"  x2="344" y2="26"/>  <text class="label" x="348" y="30">Anthropic</text>
+  <line x1="330" y1="50"  x2="344" y2="50"/>  <text class="label" x="348" y="54">OpenAI API</text>
+  <line x1="330" y1="74"  x2="344" y2="74"/>  <text class="label" x="348" y="78">Gemini</text>
+  <line x1="330" y1="98"  x2="344" y2="98"/>  <text class="label" x="348" y="102">Groq</text>
+  <line x1="330" y1="122" x2="344" y2="122"/> <text class="label" x="348" y="126">Mistral</text>
+  <line x1="330" y1="146" x2="344" y2="146"/> <text class="label" x="348" y="150">DeepSeek</text>
+  <line x1="330" y1="170" x2="344" y2="170"/> <text class="label" x="348" y="174">OpenRouter</text>
+  <line x1="330" y1="194" x2="344" y2="194"/> <text class="label" x="348" y="198">Together</text>
+
+  <text class="dim" x="348" y="222">+ Fireworks · Ollama · local</text>
+
+</svg>

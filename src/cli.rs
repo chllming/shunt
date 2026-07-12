@@ -1,0 +1,8394 @@
+use anyhow::{bail, Context as _, Result};
+use clap::{Parser, Subcommand};
+use serde_json::json;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::config::{
+    config_path, config_template, credentials_path, log_path, pid_path, CredentialsStore,
+};
+use crate::credential::Credential;
+use crate::oauth::{read_claude_credentials, refresh_token, revoke_token, run_oauth_flow};
+use crate::term::{
+    self, bold, bold_white, brand_green, cyan, dark_green, dim, green, green_bold, red, yellow,
+    CHECK, CROSS, DIAMOND, DOT, EMPTY,
+};
+
+#[derive(Parser)]
+#[command(
+    name = "shunt",
+    about = "Native Claude and Codex account-pooling proxy",
+    version
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Interactive setup — auto-imports your existing Claude Code session
+    Setup {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Absolute path to a chmod-600 env file holding overflow API keys.
+        #[arg(long)]
+        env_file: Option<PathBuf>,
+        /// Back up and install managed Claude, Codex, and MCP client entries.
+        #[arg(long)]
+        install_clients: bool,
+    },
+    /// Start the proxy (runs setup first if not configured)
+    Start {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        /// Keep the process in the foreground instead of daemonizing
+        #[arg(long)]
+        foreground: bool,
+        /// Enable debug-level logging (shows routing decisions and token refresh details)
+        #[arg(long)]
+        verbose: bool,
+        /// Replace an already-running daemon instead of no-op when one is healthy
+        #[arg(long)]
+        force: bool,
+        /// Internal: running as background daemon (do not use directly)
+        #[arg(long, hide = true)]
+        daemon: bool,
+    },
+    /// Stop the running proxy daemon
+    Stop,
+    /// Restart the proxy daemon (stop then start)
+    Restart {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Print current config and proxy status
+    Status {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, value_parser = ["claude", "codex"])]
+        pool: Option<String>,
+    },
+    /// Tail the proxy log file
+    ///
+    /// Examples:
+    ///   shunt logs           — last 50 lines (pretty-printed)
+    ///   shunt logs -f        — follow in real time
+    ///   shunt logs -n 100    — last 100 lines
+    ///   shunt logs --json    — raw JSON output
+    Logs {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Follow log output in real time (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of lines to show
+        #[arg(short = 'n', long, default_value = "50")]
+        lines: usize,
+        /// Raw JSON output instead of pretty-printed
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage accounts — add, remove, or log out (interactive menu)
+    Config {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Add an account to the pool — imports the current Claude Code session
+    #[command(visible_alias = "add")]
+    AddAccount {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Name for this account (e.g. "secondary", "work"). Prompted if omitted.
+        name: Option<String>,
+        /// Provider: "anthropic" or "openai". Prompted interactively if omitted.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Native pool: claude, codex, or legacy. Inferred from provider when omitted.
+        #[arg(long)]
+        pool: Option<String>,
+        /// Optional human-readable owner metadata.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Preview or apply the automatic schema-v2 migration.
+    Migrate {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        env_file: Option<PathBuf>,
+    },
+    /// Print the local client token for a native pool.
+    ClientToken {
+        #[arg(value_parser = ["claude", "codex"])]
+        pool: String,
+    },
+    /// Run or inspect the cross-provider agent bridge.
+    Bridge {
+        #[command(subcommand)]
+        action: BridgeAction,
+    },
+    /// Remove an account from the pool
+    #[command(visible_alias = "remove")]
+    RemoveAccount {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Name of the account to remove (omit to pick interactively)
+        name: Option<String>,
+    },
+    /// Enable remote access — expose the proxy to other devices
+    ///
+    /// With no arguments: interactive menu to choose sharing mode (LAN, tunnel, custom domain).
+    /// With a share code: connect this device to a remote shunt instance.
+    ///
+    /// Examples:
+    ///   shunt share                    — host: choose sharing mode
+    ///   shunt share SC-a3f2b1c4d5e6f7a8b9  — guest: connect with a share code
+    Share {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Create a public tunnel via Cloudflare (works over any network, not just LAN)
+        #[arg(long)]
+        tunnel: bool,
+        /// Disable remote access and revert to localhost-only
+        #[arg(long)]
+        stop: bool,
+        /// Share code from `shunt share` on the host — connects this device to a remote shunt
+        code: Option<String>,
+    },
+    /// Log out of an account — clears stored credentials (keeps account in config)
+    #[command(hide = true)]
+    Logout {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Account name to log out. Omit to pick interactively.
+        name: Option<String>,
+        /// Log out all accounts at once
+        #[arg(long)]
+        all: bool,
+    },
+    /// Live fullscreen TUI dashboard — shows account utilization and request log
+    Monitor {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Connect this device to a remote shunt instance (alias: shunt share <code>)
+    #[command(hide = true)]
+    Connect {
+        /// Share code printed by `shunt share` on the host
+        code: String,
+    },
+    /// Disconnect from a remote shunt instance
+    ///
+    /// Removes ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY written by `shunt connect`
+    /// from your shell profile and ~/.claude/settings.json.
+    ///
+    /// Examples:
+    ///   shunt disconnect
+    Disconnect,
+    /// Update shunt to the latest release
+    Update,
+    /// Completely remove shunt — stops service, deletes config, removes binary
+    Uninstall,
+    /// Manage shunt as a system service (auto-start on login)
+    ///
+    /// Examples:
+    ///   shunt service install    — register + start (called by install.sh)
+    ///   shunt service uninstall  — stop + remove
+    ///   shunt service status     — is service registered/running?
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+    /// Pin routing to a specific account, or restore automatic routing
+    ///
+    /// Examples:
+    ///   shunt use            — interactive picker
+    ///   shunt use work       — force all requests through 'work'
+    ///   shunt use auto       — restore automatic least-utilization routing
+    Use {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, value_parser = ["claude", "codex"])]
+        pool: Option<String>,
+        /// Account name to pin to, or "auto". Omit to pick interactively.
+        account: Option<String>,
+    },
+    /// Print a sanitized debug report for sharing when reporting issues
+    Report {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Override the model for all requests, or clear the override
+    ///
+    /// Examples:
+    ///   shunt model                           — show current model override
+    ///   shunt model set claude-opus-4-6       — force all requests to use this model
+    ///   shunt model clear                     — restore client-supplied model
+    Model {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, value_parser = ["claude", "codex"])]
+        pool: Option<String>,
+        #[command(subcommand)]
+        action: Option<ModelAction>,
+    },
+    /// Override the routing strategy at runtime, or clear the override
+    ///
+    /// Examples:
+    ///   shunt strategy                — show current strategy + source
+    ///   shunt strategy set reaper     — drain expiring accounts first
+    ///   shunt strategy set maximus    — time-weighted dual-window scorer (default)
+    ///   shunt strategy clear          — restore config-file strategy
+    Strategy {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, value_parser = ["claude", "codex"])]
+        pool: Option<String>,
+        #[command(subcommand)]
+        action: Option<StrategyAction>,
+    },
+    /// Set the per-account burst rate limit, or clear the override
+    ///
+    /// Examples:
+    ///   shunt burst-limit              — show current limit
+    ///   shunt burst-limit set 12       — max 12 requests/min per account
+    ///   shunt burst-limit set 0        — disable burst pacing
+    ///   shunt burst-limit clear        — restore default (10/min)
+    BurstLimit {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<BurstLimitAction>,
+    },
+    /// Set the fallback model for when all accounts are on cooldown
+    ///
+    /// Examples:
+    ///   shunt fallback                 — show current fallback (auto by default)
+    ///   shunt fallback set sonnet      — always fall back to sonnet
+    ///   shunt fallback off             — disable fallback entirely
+    ///   shunt fallback clear           — restore auto-detection
+    Fallback {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<FallbackAction>,
+    },
+    /// Set the effort level for all proxied requests
+    ///
+    /// Controls reasoning depth via output_config.effort.
+    /// Default is passthrough (don't modify client requests).
+    ///
+    /// Examples:
+    ///   shunt effort              — show current effort override
+    ///   shunt effort set xhigh    — enable multi-agent / ultracode mode
+    ///   shunt effort set max      — override to maximum reasoning
+    ///   shunt effort set low      — override to fast & cheap
+    ///   shunt effort clear        — restore passthrough (don't modify)
+    Effort {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<EffortAction>,
+    },
+    /// Set the thinking mode for all proxied requests
+    ///
+    /// Controls extended thinking via the thinking parameter.
+    /// Default is passthrough (don't modify client requests).
+    ///
+    /// Examples:
+    ///   shunt thinking               — show current thinking override
+    ///   shunt thinking set adaptive  — force adaptive thinking on all requests
+    ///   shunt thinking set off       — disable thinking on all requests
+    ///   shunt thinking clear         — restore passthrough (don't modify)
+    Thinking {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<ThinkingAction>,
+    },
+    /// Mute or unmute daemon alert notifications
+    ///
+    /// Examples:
+    ///   shunt alerts           — show current mute state
+    ///   shunt alerts mute      — suppress rate-limit / auth-failure notifications
+    ///   shunt alerts unmute    — re-enable notifications
+    Alerts {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<AlertsAction>,
+    },
+    /// Show how much you've saved vs paying for the Claude API
+    ///
+    /// Tracks cumulative token usage and computes what it would have cost
+    /// at public Claude API list prices.
+    ///
+    /// Examples:
+    ///   shunt savings        — show today / this week / all-time savings
+    Savings {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Open a persistent tunnel to the relay (your proxy becomes reachable at subdomain.domain)
+    ///
+    /// Examples:
+    ///   shunt live                       — tunnel using config defaults
+    ///   shunt live --subdomain shunt     — register as shunt.ramcharan.shop
+    Live {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Subdomain to register (e.g. "shunt" → shunt.ramcharan.shop)
+        #[arg(long)]
+        subdomain: Option<String>,
+        /// Override relay WebSocket URL
+        #[arg(long)]
+        relay: Option<String>,
+    },
+    /// Run the tunnel relay server (deploy on your VPS)
+    ///
+    /// Examples:
+    ///   shunt relay serve                — start on default port 8085
+    ///   shunt relay serve --port 9000    — custom port
+    Relay {
+        #[command(subcommand)]
+        action: RelayAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Register shunt as a login service and start it immediately
+    Install,
+    /// Stop and unregister the shunt login service
+    Uninstall,
+    /// Show whether the service is registered and running
+    Status,
+}
+
+#[derive(Subcommand)]
+enum ModelAction {
+    /// Force all requests through a specific model
+    Set {
+        /// Model name, e.g. claude-opus-4-6
+        model: String,
+    },
+    /// Clear the model override and let clients choose the model
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum StrategyAction {
+    /// Override the routing strategy
+    Set {
+        /// Strategy name: maximus, reaper, carousel, cushion
+        strategy: String,
+    },
+    /// Clear the strategy override and fall back to config-file value
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum BurstLimitAction {
+    /// Set per-account burst rate limit (requests per minute)
+    Set {
+        /// Limit value (0 = disable pacing)
+        limit: u32,
+    },
+    /// Clear the override and restore default (10/min)
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum FallbackAction {
+    /// Set an explicit fallback model
+    Set {
+        /// Model name, e.g. claude-sonnet-4-6
+        model: String,
+    },
+    /// Disable fallback entirely (wait for cooldown instead)
+    Off,
+    /// Clear the override and restore auto-detection
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum EffortAction {
+    /// Set effort level (low, medium, high, xhigh, max)
+    Set {
+        /// Effort level: low, medium, high, xhigh (multi-agent/ultracode), or max
+        level: String,
+    },
+    /// Clear the override and restore passthrough
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum ThinkingAction {
+    /// Set thinking mode (adaptive or off)
+    Set {
+        /// Thinking mode: adaptive or off
+        mode: String,
+    },
+    /// Clear the override and restore passthrough
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum AlertsAction {
+    /// Suppress all daemon alert notifications
+    Mute,
+    /// Re-enable daemon alert notifications
+    Unmute,
+}
+
+#[derive(Subcommand)]
+enum RelayAction {
+    /// Start the relay server
+    Serve {
+        /// Port to listen on
+        #[arg(long, default_value = "8085")]
+        port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum BridgeAction {
+    /// Serve Model Context Protocol JSON-RPC on stdin/stdout.
+    Mcp {
+        #[arg(long, default_value = "unknown")]
+        caller: String,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// List retained bridge jobs.
+    Jobs,
+    /// Show one retained bridge job.
+    Status { id: String },
+    /// Request cancellation of a running bridge job.
+    Cancel { id: String },
+    /// Remove expired redacted bridge artifacts.
+    Cleanup,
+}
+
+pub async fn run() -> Result<()> {
+    // Intercept --version / -V before clap to show branded banner
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && (args[1] == "--version" || args[1] == "-V") {
+        print_splash(&[
+            format!(
+                "{}  {}",
+                brand_green("shunt"),
+                dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+            ),
+            String::new(),
+            String::new(),
+        ]);
+        return Ok(());
+    }
+
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Setup {
+            config,
+            env_file,
+            install_clients,
+        } => cmd_setup(config, env_file, install_clients).await,
+        Command::Start {
+            config,
+            host,
+            port,
+            foreground,
+            verbose,
+            force,
+            daemon,
+        } => cmd_start(config, host, port, foreground, verbose, force, daemon).await,
+        Command::Stop => cmd_stop().await,
+        Command::Restart { config } => cmd_restart(config).await,
+        Command::Status { config, pool } => cmd_status(config, pool.as_deref()).await,
+        Command::Logs {
+            config,
+            follow,
+            lines,
+            json,
+        } => cmd_logs(config, follow, lines, json).await,
+        Command::Config { config } => cmd_config(config).await,
+        Command::AddAccount {
+            config,
+            name,
+            provider,
+            pool,
+            owner,
+        } => {
+            cmd_add_account(
+                config,
+                name,
+                provider.as_deref(),
+                pool.as_deref(),
+                owner.as_deref(),
+            )
+            .await
+        }
+        Command::Migrate {
+            config,
+            dry_run: _,
+            apply,
+            env_file,
+        } => cmd_migrate(config, apply, env_file).await,
+        Command::ClientToken { pool } => cmd_client_token(&pool),
+        Command::Bridge { action } => cmd_bridge(action).await,
+        Command::RemoveAccount { config, name } => cmd_remove_account(config, name).await,
+        Command::Logout { config, name, all } => cmd_logout(config, name, all).await,
+        Command::Monitor { config } => cmd_monitor(config).await,
+        Command::Connect { code } => cmd_connect(code).await,
+        Command::Disconnect => cmd_disconnect().await,
+        Command::Update => cmd_update().await,
+        Command::Share {
+            config,
+            tunnel,
+            stop,
+            code,
+        } => {
+            if let Some(code) = code {
+                cmd_connect(code).await
+            } else {
+                cmd_share(config, tunnel, stop).await
+            }
+        }
+        Command::Uninstall => cmd_uninstall().await,
+        Command::Use {
+            config,
+            pool,
+            account,
+        } => cmd_use(config, pool.as_deref(), account).await,
+        Command::Report { config } => cmd_report(config).await,
+        Command::Model {
+            config,
+            pool,
+            action,
+        } => cmd_model(config, pool.as_deref(), action).await,
+        Command::Strategy {
+            config,
+            pool,
+            action,
+        } => cmd_strategy(config, pool.as_deref(), action).await,
+        Command::BurstLimit { config, action } => cmd_burst_limit(config, action).await,
+        Command::Fallback { config, action } => cmd_fallback(config, action).await,
+        Command::Effort { config, action } => cmd_effort(config, action).await,
+        Command::Thinking { config, action } => cmd_thinking(config, action).await,
+        Command::Alerts { config, action } => cmd_alerts(config, action).await,
+        Command::Savings { config } => cmd_savings(config).await,
+        Command::Live {
+            config,
+            subdomain,
+            relay,
+        } => cmd_live(config, subdomain, relay).await,
+        Command::Relay { action } => match action {
+            RelayAction::Serve { port } => cmd_relay_serve(port).await,
+        },
+        Command::Service { action } => match action {
+            ServiceAction::Install => cmd_service_install().await,
+            ServiceAction::Uninstall => cmd_service_uninstall().await,
+            ServiceAction::Status => cmd_service_status().await,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// setup
+// ---------------------------------------------------------------------------
+
+pub async fn cmd_setup(
+    config_override: Option<PathBuf>,
+    env_file: Option<PathBuf>,
+    install_clients: bool,
+) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+
+    print_splash(&[
+        format!(
+            "{}  {}",
+            brand_green("shunt"),
+            dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        ),
+        dim("Setup"),
+        String::new(),
+    ]);
+
+    if config_p.exists() {
+        if crate::config::config_needs_migration(&config_p)? {
+            crate::config::migrate_config_file(&config_p, true, env_file.as_deref())?;
+            println!("  {} Migrated config to schema v2.", green(CHECK));
+        } else if let Some(ref env_file) = env_file {
+            set_env_file_in_config(&config_p, env_file)?;
+        }
+        println!("  {} Already configured.", green(CHECK));
+        println!(
+            "  {} Use {} to add more accounts.",
+            dim("·"),
+            cyan("shunt add")
+        );
+        // Ensure settings.json is pointing at the local proxy even if setup ran
+        // before this feature was added (e.g. after an update).
+        let port = crate::config::load_config(config_override.as_deref())
+            .map(|c| c.server.port)
+            .unwrap_or(8082);
+        write_local_claude_settings(port); // verbose: prints what it wrote
+        apply_local_routing_silent(port); // also writes managed_settings (silent, skips if correct)
+        if install_clients {
+            install_client_configs(&config_p)?;
+        }
+        println!();
+        return Ok(());
+    }
+
+    // Auto-detect existing Claude Code session — no user action needed
+    let cred = match read_claude_credentials() {
+        Some(mut c) => {
+            if c.needs_refresh() {
+                print!("  {} Token expired, refreshing… ", yellow("↻"));
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                match refresh_token(&c).await {
+                    Ok(fresh) => {
+                        println!("{}", green("done"));
+                        c = fresh;
+                    }
+                    Err(_) => {
+                        // Refresh token is also invalid — run a fresh OAuth flow
+                        // so setup completes with a working credential.
+                        println!("{}", yellow("failed"));
+                        println!(
+                            "  {} Session fully expired — opening browser for fresh login…",
+                            dim("·")
+                        );
+                        println!();
+                        c = run_oauth_flow().await?;
+                    }
+                }
+            } else {
+                println!("  {} Claude Code session found", green(CHECK));
+            }
+            c
+        }
+        None => {
+            // No local Claude Code session — run OAuth directly so setup is self-contained.
+            println!(
+                "  {} No existing Claude Code session found — opening browser for login…",
+                dim("·")
+            );
+            println!();
+            run_oauth_flow().await?
+        }
+    };
+
+    let plan = crate::oauth::read_claude_session_info()
+        .map(|s| s.plan)
+        .unwrap_or_else(|| "pro".to_string());
+    println!("  {} Plan: {}", green(CHECK), bold(&plan));
+
+    // Fetch account email (non-fatal)
+    let email = crate::oauth::fetch_account_email(&cred.access_token).await;
+    if let Some(ref e) = email {
+        println!("  {} Account: {}", green(CHECK), bold(e));
+    }
+    let mut cred = cred;
+    cred.email = email;
+
+    // Write config
+    if let Some(parent) = config_p.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&config_p, config_template(&[("main", &plan)]))?;
+    if let Some(ref env_file) = env_file {
+        set_env_file_in_config(&config_p, env_file)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_p, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    // Store credential
+    let mut store = CredentialsStore::default();
+    store.insert(
+        crate::config::PoolKind::Claude,
+        "main".into(),
+        Credential::Oauth(cred),
+    );
+    if let Some(codex_credential) = crate::oauth::read_codex_credentials() {
+        let mut text = std::fs::read_to_string(&config_p)?;
+        text.push_str("\n[[pools.codex.accounts]]\nname = \"main\"\nprovider = \"openai\"\ncredential_source = \"codex_auth_file\"\n");
+        std::fs::write(&config_p, text)?;
+        store.insert(
+            crate::config::PoolKind::Codex,
+            "main".into(),
+            Credential::Oauth(codex_credential),
+        );
+        println!("  {} Codex session found", green(CHECK));
+    }
+    store.save()?;
+
+    // Derive port from the config we just wrote (always 8082 from template, but be explicit).
+    let setup_port = crate::config::load_config(config_override.as_deref())
+        .map(|c| c.server.port)
+        .unwrap_or(8082);
+
+    println!();
+    println!(
+        "  {} Config      {}",
+        green("→"),
+        dim(&config_p.display().to_string())
+    );
+    println!(
+        "  {} Credentials {}",
+        green("→"),
+        dim(&credentials_path().display().to_string())
+    );
+
+    // Write ANTHROPIC_BASE_URL to ~/.claude/settings.json so Claude Code picks up
+    // the proxy immediately — no shell restart required.
+    write_local_claude_settings(setup_port);
+    if install_clients {
+        install_client_configs(&config_p)?;
+    }
+
+    // For non-Claude-Code tools (curl, Python SDK, etc.) that read the env var.
+    offer_shell_export(setup_port)?;
+
+    println!();
+    println!("  {} Run {} to start.", green(CHECK), cyan("shunt start"));
+    println!("  {} Then restart any open Claude Code windows.", dim("·"));
+
+    Ok(())
+}
+
+fn set_env_file_in_config(config_path: &std::path::Path, env_file: &std::path::Path) -> Result<()> {
+    if !env_file.is_absolute() {
+        bail!("--env-file must be an absolute path");
+    }
+    let metadata = std::fs::metadata(env_file)
+        .with_context(|| format!("cannot read env file {}", env_file.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("env file must be chmod 600: {}", env_file.display());
+        }
+    }
+    let text = std::fs::read_to_string(config_path)?;
+    let mut doc = text.parse::<toml_edit::DocumentMut>()?;
+    if !doc.contains_key("secrets") {
+        doc["secrets"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["secrets"]["env_file"] = toml_edit::value(env_file.to_string_lossy().as_ref());
+    std::fs::write(config_path, doc.to_string())?;
+    Ok(())
+}
+
+fn backup_once(path: &std::path::Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let backup = path.with_extension(format!(
+        "{}.shunt-backup",
+        path.extension().and_then(|s| s.to_str()).unwrap_or("bak")
+    ));
+    if !backup.exists() {
+        std::fs::copy(path, backup)?;
+    }
+    Ok(())
+}
+
+fn install_client_configs(config_path: &std::path::Path) -> Result<()> {
+    let config = crate::config::load_config(Some(config_path))?;
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("shunt"));
+    install_client_configs_into(&config, &home, &executable)?;
+    println!(
+        "  {} Installed managed Codex and Claude client entries.",
+        green(CHECK)
+    );
+    Ok(())
+}
+
+fn install_client_configs_into(
+    config: &crate::config::Config,
+    home: &std::path::Path,
+    executable: &std::path::Path,
+) -> Result<()> {
+    let command = executable.to_string_lossy();
+
+    let codex_path = home.join(".codex/config.toml");
+    if let Some(parent) = codex_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    backup_once(&codex_path)?;
+    let codex_text = std::fs::read_to_string(&codex_path).unwrap_or_default();
+    let mut codex = codex_text
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap_or_default();
+    codex["model_provider"] = toml_edit::value("shunt-codex");
+    codex["model_providers"]["shunt-codex"]["base_url"] = toml_edit::value(format!(
+        "http://{}:{}/backend-api/codex",
+        config.server.host, config.pools.codex.port
+    ));
+    codex["model_providers"]["shunt-codex"]["name"] = toml_edit::value("Shunt Codex");
+    codex["model_providers"]["shunt-codex"]["wire_api"] = toml_edit::value("responses");
+    codex["model_providers"]["shunt-codex"]["supports_websockets"] = toml_edit::value(false);
+    codex["model_providers"]["shunt-codex"]["auth"]["command"] = toml_edit::value(command.as_ref());
+    codex["model_providers"]["shunt-codex"]["auth"]["args"] =
+        toml_edit::value(toml_edit::Array::from_iter(["client-token", "codex"]));
+    codex["model_providers"]["shunt-codex"]["auth"]["refresh_interval_ms"] =
+        toml_edit::value(300_000);
+    codex["mcp_servers"]["shunt"]["command"] = toml_edit::value(command.as_ref());
+    codex["mcp_servers"]["shunt"]["args"] = toml_edit::value(toml_edit::Array::from_iter([
+        "bridge", "mcp", "--caller", "codex",
+    ]));
+    std::fs::write(&codex_path, codex.to_string())?;
+
+    let claude_path = home.join(".claude.json");
+    backup_once(&claude_path)?;
+    let mut claude: serde_json::Value = std::fs::read_to_string(&claude_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    claude["mcpServers"]["shunt"] = json!({
+        "command": command,
+        "args": ["bridge", "mcp", "--caller", "claude"]
+    });
+    std::fs::write(&claude_path, serde_json::to_string_pretty(&claude)?)?;
+    Ok(())
+}
+
+fn remove_managed_client_configs(home: &std::path::Path) {
+    let codex_path = home.join(".codex/config.toml");
+    if let Ok(text) = std::fs::read_to_string(&codex_path) {
+        if let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() {
+            if doc.get("model_provider").and_then(|v| v.as_str()) == Some("shunt-codex") {
+                doc.remove("model_provider");
+            }
+            if let Some(table) = doc
+                .get_mut("model_providers")
+                .and_then(toml_edit::Item::as_table_mut)
+            {
+                table.remove("shunt-codex");
+            } else if let Some(table) = doc
+                .get_mut("model_providers")
+                .and_then(toml_edit::Item::as_inline_table_mut)
+            {
+                table.remove("shunt-codex");
+            }
+            if let Some(table) = doc
+                .get_mut("mcp_servers")
+                .and_then(toml_edit::Item::as_table_mut)
+            {
+                table.remove("shunt");
+            } else if let Some(table) = doc
+                .get_mut("mcp_servers")
+                .and_then(toml_edit::Item::as_inline_table_mut)
+            {
+                table.remove("shunt");
+            }
+            let _ = std::fs::write(&codex_path, doc.to_string());
+        }
+    }
+    let claude_path = home.join(".claude.json");
+    if let Ok(text) = std::fs::read_to_string(&claude_path) {
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(servers) = value
+                .get_mut("mcpServers")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                let managed = servers
+                    .get("shunt")
+                    .and_then(|v| v.get("args"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|args| args.iter().any(|v| v.as_str() == Some("bridge")));
+                if managed {
+                    servers.remove("shunt");
+                }
+            }
+            let _ = std::fs::write(
+                &claude_path,
+                serde_json::to_string_pretty(&value).unwrap_or(text),
+            );
+        }
+    }
+}
+
+async fn cmd_migrate(
+    config: Option<PathBuf>,
+    apply: bool,
+    env_file: Option<PathBuf>,
+) -> Result<()> {
+    let path = config.unwrap_or_else(config_path);
+    let migrated = crate::config::migrate_config_file(&path, apply, env_file.as_deref())?;
+    if apply {
+        println!(
+            "Migrated {} to schema v2; backup retained beside the original.",
+            path.display()
+        );
+    } else {
+        print!("{migrated}");
+    }
+    Ok(())
+}
+
+fn cmd_client_token(pool: &str) -> Result<()> {
+    println!("{}", crate::config::local_client_token(pool)?);
+    Ok(())
+}
+
+async fn cmd_bridge(action: BridgeAction) -> Result<()> {
+    match action {
+        BridgeAction::Mcp { caller, config } => {
+            crate::bridge::serve_mcp(&caller, config.as_deref()).await
+        }
+        BridgeAction::Jobs => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::bridge::list_jobs()?)?
+            );
+            Ok(())
+        }
+        BridgeAction::Status { id } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::bridge::get_job(&id)?)?
+            );
+            Ok(())
+        }
+        BridgeAction::Cancel { id } => crate::bridge::cancel_job(&id),
+        BridgeAction::Cleanup => {
+            crate::bridge::cleanup_jobs(24)?;
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// config  (unified account management)
+// ---------------------------------------------------------------------------
+
+async fn cmd_config(config_override: Option<PathBuf>) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+    if !config_p.exists() {
+        bail!("No config found. Run `shunt setup` first.");
+    }
+
+    let items = vec![
+        term::SelectItem {
+            label: format!(
+                "{}  {}",
+                bold("Add account"),
+                dim("connect a new account to the pool")
+            ),
+            value: "add".into(),
+        },
+        term::SelectItem {
+            label: format!(
+                "{}  {}",
+                bold("Manage accounts"),
+                dim("reauth, update config, or fix issues")
+            ),
+            value: "manage".into(),
+        },
+        term::SelectItem {
+            label: format!(
+                "{}  {}",
+                bold("Remove account"),
+                dim("delete an account from the pool")
+            ),
+            value: "remove".into(),
+        },
+        term::SelectItem {
+            label: format!(
+                "{}  {}",
+                bold("Log out"),
+                dim("clear credentials for an account")
+            ),
+            value: "logout".into(),
+        },
+    ];
+
+    println!();
+    match term::select("Account management", &items, 0) {
+        Some(v) if v == "add" => cmd_add_account(config_override, None, None, None, None).await,
+        Some(v) if v == "manage" => cmd_manage_account(config_override).await,
+        Some(v) if v == "remove" => cmd_remove_account(config_override, None).await,
+        Some(v) if v == "logout" => cmd_logout(config_override, None, false).await,
+        _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// manage-account  (per-account edit / reauth)
+// ---------------------------------------------------------------------------
+
+async fn cmd_manage_account(config_override: Option<PathBuf>) -> Result<()> {
+    use crate::provider::AuthKind;
+
+    let config = crate::config::load_config(config_override.as_deref())?;
+    if config.accounts.is_empty() {
+        bail!("No accounts configured. Run `shunt add` to connect an account.");
+    }
+
+    // ── Step 1: pick account ─────────────────────────────────────────────────
+    let items: Vec<term::SelectItem> = config
+        .accounts
+        .iter()
+        .map(|a| {
+            let tag = match a.provider.auth_kind() {
+                AuthKind::OAuth => {
+                    let ok = a
+                        .credential
+                        .as_ref()
+                        .map(|c| !c.needs_refresh())
+                        .unwrap_or(false);
+                    if ok {
+                        dim("  oauth  ✓")
+                    } else {
+                        yellow("  oauth  !")
+                    }
+                }
+                AuthKind::ApiKey => dim("  api-key"),
+                AuthKind::None => dim("  local"),
+            };
+            term::SelectItem {
+                label: format!(
+                    "{}  {}{}",
+                    bold(&pad(&a.name, 14)),
+                    dim(&pad(
+                        a.credential.as_ref().and_then(|c| c.email()).unwrap_or(""),
+                        32
+                    )),
+                    tag
+                ),
+                value: a.name.clone(),
+            }
+        })
+        .collect();
+
+    println!();
+    let name = match term::select("Which account?", &items, 0) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    let account = config.accounts.iter().find(|a| a.name == name).unwrap();
+    let provider = account.provider.clone();
+
+    // ── Step 2: pick action ──────────────────────────────────────────────────
+    let mut actions: Vec<term::SelectItem> = Vec::new();
+    match provider.auth_kind() {
+        AuthKind::OAuth => {
+            actions.push(term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("Re-authenticate"),
+                    dim("start a new OAuth session")
+                ),
+                value: "reauth".into(),
+            });
+            actions.push(term::SelectItem {
+                label: format!("{}  {}", bold("Log out"), dim("clear stored credentials")),
+                value: "logout".into(),
+            });
+        }
+        AuthKind::ApiKey => {
+            actions.push(term::SelectItem {
+                label: format!("{}  {}", bold("Update API key"), dim("replace stored key")),
+                value: "apikey".into(),
+            });
+        }
+        AuthKind::None => {
+            actions.push(term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("Update upstream URL"),
+                    dim("change the local endpoint")
+                ),
+                value: "upstream".into(),
+            });
+            actions.push(term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("Update model"),
+                    dim("set default model for this account")
+                ),
+                value: "model".into(),
+            });
+        }
+    }
+    actions.push(term::SelectItem {
+        label: format!(
+            "{}  {}",
+            bold("Remove account"),
+            dim("delete from pool permanently")
+        ),
+        value: "remove".into(),
+    });
+
+    println!();
+    let action = match term::select(&format!("Manage  '{name}'"), &actions, 0) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    println!();
+
+    match action.as_str() {
+        // ── Re-authenticate (OAuth) ──────────────────────────────────────────
+        "reauth" => {
+            print_splash(&[
+                format!(
+                    "{}  {}",
+                    brand_green("shunt"),
+                    dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+                ),
+                format!("Re-authenticating  '{name}'"),
+                String::new(),
+            ]);
+            use crate::oauth::{
+                fetch_account_email, fetch_openai_account_email, run_oauth_flow,
+                run_openai_oauth_flow,
+            };
+            use crate::provider::Provider;
+            let mut cred = match provider {
+                Provider::Anthropic => run_oauth_flow().await?,
+                Provider::OpenAI => run_openai_oauth_flow().await?,
+                _ => unreachable!(),
+            };
+            let email = match provider {
+                Provider::Anthropic => fetch_account_email(&cred.access_token).await,
+                Provider::OpenAI => fetch_openai_account_email(&cred.access_token).await,
+                _ => None,
+            };
+            if let Some(ref e) = email {
+                println!("  {} Signed in as {}", green(CHECK), bold(e));
+            }
+            cred.email = email;
+            // Clear auth_failed state
+            let state_p = crate::config::state_path();
+            let state = crate::state::StateStore::load(&state_p);
+            state.clear_auth_failed(&name);
+            // Save credential
+            let mut store = CredentialsStore::load();
+            store.insert_resolved(name.clone(), Credential::Oauth(cred));
+            store.save()?;
+            println!();
+            println!(
+                "  {} Account '{}' re-authenticated.",
+                green(CHECK),
+                bold(&name)
+            );
+            offer_restart(config_override).await;
+        }
+
+        // ── Update API key ───────────────────────────────────────────────────
+        "apikey" => {
+            let env_hint = provider
+                .api_key_env_var()
+                .map(|v| format!(" (or set {} in your environment)", v))
+                .unwrap_or_default();
+            print!("  {} New API key{}: ", dim("·"), dim(&env_hint));
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            let key = read_secret_line()?;
+            if key.is_empty() {
+                bail!("API key cannot be empty.");
+            }
+            let mut store = CredentialsStore::load();
+            store.insert_resolved(name.clone(), Credential::Apikey { key });
+            store.save()?;
+            // Clear any auth_failed state
+            let state_p = crate::config::state_path();
+            let state = crate::state::StateStore::load(&state_p);
+            state.clear_auth_failed(&name);
+            println!("  {} API key updated for '{}'.", green(CHECK), bold(&name));
+            offer_restart(config_override).await;
+        }
+
+        // ── Update upstream URL (Local) ──────────────────────────────────────
+        "upstream" => {
+            let current = account.upstream_url.as_deref().unwrap_or("(not set)");
+            print!("  {} Upstream URL [{}]: ", dim("·"), dim(current));
+            use std::io::{BufRead, Write};
+            std::io::stdout().flush().ok();
+            let mut input = String::new();
+            std::io::stdin().lock().read_line(&mut input)?;
+            let url = input.trim().to_string();
+            if url.is_empty() {
+                bail!("URL cannot be empty.");
+            }
+            update_account_toml_field(config_override.as_deref(), &name, "upstream_url", &url)?;
+            println!(
+                "  {} Upstream URL updated for '{}'.",
+                green(CHECK),
+                bold(&name)
+            );
+            offer_restart(config_override).await;
+        }
+
+        // ── Update model (Local / any) ───────────────────────────────────────
+        "model" => {
+            let current = account.model.as_deref().unwrap_or("(not set)");
+            print!("  {} Model [{}]: ", dim("·"), dim(current));
+            use std::io::{BufRead, Write};
+            std::io::stdout().flush().ok();
+            let mut input = String::new();
+            std::io::stdin().lock().read_line(&mut input)?;
+            let model = input.trim().to_string();
+            if model.is_empty() {
+                bail!("Model cannot be empty.");
+            }
+            update_account_toml_field(config_override.as_deref(), &name, "model", &model)?;
+            println!("  {} Model updated for '{}'.", green(CHECK), bold(&name));
+            offer_restart(config_override).await;
+        }
+
+        // ── Log out (OAuth) ──────────────────────────────────────────────────
+        "logout" => {
+            return cmd_logout(config_override, Some(name), false).await;
+        }
+
+        // ── Remove account ───────────────────────────────────────────────────
+        "remove" => {
+            return cmd_remove_account(config_override, Some(name)).await;
+        }
+
+        _ => {}
+    }
+
+    println!();
+    Ok(())
+}
+
+/// Update a single string field inside the `[[accounts]]` block for `account_name`
+/// in the TOML config file (using toml_edit for safe structured editing).
+fn update_account_toml_field(
+    config_override: Option<&std::path::Path>,
+    account_name: &str,
+    field: &str,
+    value: &str,
+) -> Result<()> {
+    let config_p = config_override
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(config_path);
+    let text = std::fs::read_to_string(&config_p)?;
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .context("Failed to parse config TOML")?;
+    if let Some(item) = doc.get_mut("accounts") {
+        if let Some(arr) = item.as_array_of_tables_mut() {
+            for table in arr.iter_mut() {
+                if table.get("name").and_then(|v| v.as_str()) == Some(account_name) {
+                    table.insert(field, toml_edit::value(value));
+                }
+            }
+        }
+    }
+    std::fs::write(&config_p, doc.to_string())?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// add-account
+// ---------------------------------------------------------------------------
+
+async fn cmd_add_account(
+    config_override: Option<PathBuf>,
+    name_arg: Option<String>,
+    provider_arg: Option<&str>,
+    pool_arg: Option<&str>,
+    owner: Option<&str>,
+) -> Result<()> {
+    use crate::provider::Provider;
+
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+    if !config_p.exists() {
+        bail!("No config found. Run `shunt setup` first.");
+    }
+
+    print_splash(&[
+        format!(
+            "{}  {}",
+            brand_green("shunt"),
+            dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        ),
+        "Add account".to_string(),
+        String::new(),
+    ]);
+
+    // ── Step 1: choose provider ──────────────────────────────────────────────
+    let provider = if let Some(p) = provider_arg {
+        Provider::from_str(p)
+    } else {
+        let items = vec![
+            term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("Claude Code"),
+                    dim("(claude.ai — Anthropic)")
+                ),
+                value: "anthropic".into(),
+            },
+            term::SelectItem {
+                label: format!(
+                    "{}  {}  {}",
+                    bold("Codex"),
+                    yellow("[beta]"),
+                    dim("(chatgpt.com — OpenAI)")
+                ),
+                value: "openai".into(),
+            },
+            term::SelectItem {
+                label: format!("{}  {}", bold("Groq"), dim("(api.groq.com — API key)")),
+                value: "groq".into(),
+            },
+            term::SelectItem {
+                label: format!("{}  {}", bold("Mistral"), dim("(api.mistral.ai — API key)")),
+                value: "mistral".into(),
+            },
+            term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("Together AI"),
+                    dim("(api.together.xyz — API key)")
+                ),
+                value: "together".into(),
+            },
+            term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("OpenRouter"),
+                    dim("(openrouter.ai — API key)")
+                ),
+                value: "openrouter".into(),
+            },
+            term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("DeepSeek"),
+                    dim("(api.deepseek.com — API key)")
+                ),
+                value: "deepseek".into(),
+            },
+            term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("Fireworks"),
+                    dim("(api.fireworks.ai — API key)")
+                ),
+                value: "fireworks".into(),
+            },
+            term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("Gemini"),
+                    dim("(generativelanguage.googleapis.com — API key)")
+                ),
+                value: "gemini".into(),
+            },
+            term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("OpenAI API"),
+                    dim("(api.openai.com — API key)")
+                ),
+                value: "openai-api".into(),
+            },
+            term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("Local"),
+                    dim("(Ollama, LM Studio, etc. — no auth)")
+                ),
+                value: "local".into(),
+            },
+        ];
+        match term::select("Which provider?", &items, 0) {
+            Some(v) => Provider::from_str(&v),
+            None => return Ok(()),
+        }
+    };
+
+    let inferred_pool = match &provider {
+        Provider::Anthropic | Provider::AnthropicApi => crate::config::PoolKind::Claude,
+        Provider::OpenAI | Provider::OpenAIApi => crate::config::PoolKind::Codex,
+        _ => crate::config::PoolKind::Legacy,
+    };
+    let pool = match pool_arg {
+        Some("claude") => crate::config::PoolKind::Claude,
+        Some("codex") => crate::config::PoolKind::Codex,
+        Some("legacy") => crate::config::PoolKind::Legacy,
+        Some(other) => bail!("Unknown pool '{other}'; expected claude, codex, or legacy"),
+        None => inferred_pool,
+    };
+    if pool != inferred_pool {
+        bail!(
+            "Provider {provider} belongs to the {} pool, not {}",
+            inferred_pool.as_str(),
+            pool.as_str()
+        );
+    }
+
+    println!();
+
+    // ── Step 2: choose name ──────────────────────────────────────────────────
+    let existing_config = std::fs::read_to_string(&config_p)?;
+    let store = CredentialsStore::load();
+
+    let (name, already_in_config) = if let Some(n) = name_arg {
+        let in_config = existing_config.contains(&format!("name = \"{n}\""));
+        let existing_cred = store.get(pool, &n);
+        let has_cred = existing_cred.is_some();
+        let is_expired = existing_cred
+            .as_ref()
+            .map(|c| c.needs_refresh())
+            .unwrap_or(false);
+        let is_auth_failed = crate::state::StateStore::load(&crate::config::state_path())
+            .account_states()
+            .get(&n)
+            .map(|s| s.auth_failed)
+            .unwrap_or(false);
+        if in_config && has_cred && !is_expired && !is_auth_failed {
+            bail!("Account '{}' already has a valid credential.", n);
+        }
+        (n, in_config)
+    } else {
+        use crate::provider::AuthKind;
+        // For OAuth providers: offer to re-auth existing uncredentialed accounts.
+        // For API-key / Local: always prompt for a new name (credentials don't expire the same way).
+        let missing_oauth: Vec<_> = if provider.auth_kind() == AuthKind::OAuth {
+            let config = crate::config::load_config(config_override.as_deref())?;
+            config
+                .accounts
+                .iter()
+                .filter(|a| a.provider == provider && a.credential.is_none())
+                .map(|a| a.name.clone())
+                .collect()
+        } else {
+            vec![]
+        };
+
+        match missing_oauth.len() {
+            1 => {
+                println!(
+                    "  {} Authorizing account {}",
+                    yellow("↻"),
+                    bold(&format!("'{}'", missing_oauth[0]))
+                );
+                println!();
+                (missing_oauth[0].clone(), true)
+            }
+            n if n > 1 => {
+                let items: Vec<term::SelectItem> = missing_oauth
+                    .iter()
+                    .map(|a| term::SelectItem {
+                        label: bold(a).to_string(),
+                        value: a.clone(),
+                    })
+                    .collect();
+                match term::select("Which account to authorize?", &items, 0) {
+                    Some(v) => (v, true),
+                    None => return Ok(()),
+                }
+            }
+            _ => {
+                // Prompt for a new name
+                let hint = format!(
+                    "({} account name, e.g. \"{}\")",
+                    provider,
+                    provider.to_string().to_lowercase().replace(' ', "-")
+                );
+                print!("  {} Account name {}: ", dim("·"), dim(&hint));
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let n = input.trim().to_string();
+                if n.is_empty() {
+                    bail!("Account name cannot be empty.");
+                }
+                (n, false)
+            }
+        }
+    };
+
+    // ── Step 3: authenticate ─────────────────────────────────────────────────
+    use crate::provider::AuthKind;
+    let credential: Option<Credential> = match provider.auth_kind() {
+        AuthKind::OAuth => {
+            let mut cred = match provider {
+                Provider::Anthropic => run_oauth_flow().await?,
+                Provider::OpenAI => crate::oauth::run_openai_oauth_flow().await?,
+                _ => unreachable!(),
+            };
+            // Fetch email (non-fatal)
+            let email = match provider {
+                Provider::Anthropic => crate::oauth::fetch_account_email(&cred.access_token).await,
+                Provider::OpenAI => {
+                    crate::oauth::fetch_openai_account_email(&cred.access_token).await
+                }
+                _ => None,
+            };
+            if let Some(ref e) = email {
+                println!("  {} Signed in as {}", green(CHECK), bold(e));
+            }
+            cred.email = email;
+            Some(Credential::Oauth(cred))
+        }
+        AuthKind::ApiKey => {
+            // Show env-var hint if available
+            let env_hint = provider
+                .api_key_env_var()
+                .map(|v| format!(" (or set {} in your environment)", v))
+                .unwrap_or_default();
+            print!("  {} API key{}: ", dim("·"), dim(&env_hint));
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            // Read key — use rpassword for masked input if available, otherwise plain readline
+            let key = read_secret_line()?;
+            if key.is_empty() {
+                bail!("API key cannot be empty.");
+            }
+            // Soft sanity check: Anthropic keys start with `sk-ant-`. A truncated or
+            // wrong-field paste is the most common setup mistake — warn early rather
+            // than letting it surface as a confusing 401 on first live request.
+            if matches!(provider, Provider::Anthropic) && !key.starts_with("sk-ant-") {
+                println!(
+                    "  {} This doesn't look like an Anthropic API key (expected {} prefix).",
+                    yellow("!"),
+                    cyan("sk-ant-")
+                );
+                if !term::confirm("Save it anyway?") {
+                    bail!("Cancelled — re-run and paste the full API key.");
+                }
+            }
+            println!("  {} API key saved.", green(CHECK));
+            Some(Credential::Apikey { key })
+        }
+        AuthKind::None => {
+            // Local provider — no credential needed, but we may need upstream_url
+            None
+        }
+    };
+
+    // For Local provider, prompt for upstream URL
+    let upstream_url: Option<String> = if matches!(provider, Provider::Local) {
+        print!(
+            "  {} Upstream URL (e.g. http://localhost:11434): ",
+            dim("·")
+        );
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let u = input.trim().to_string();
+        if u.is_empty() {
+            bail!("Upstream URL cannot be empty for local provider.");
+        }
+        Some(u)
+    } else {
+        None
+    };
+
+    // ── Step 4: persist ──────────────────────────────────────────────────────
+    if !already_in_config {
+        let mut config_text = existing_config;
+        let schema_v2 = config_text.contains("schema_version = 2");
+        let table = if schema_v2 {
+            match pool {
+                crate::config::PoolKind::Claude => "pools.claude.accounts",
+                crate::config::PoolKind::Codex => "pools.codex.accounts",
+                crate::config::PoolKind::Legacy => "accounts",
+            }
+        } else {
+            "accounts"
+        };
+        let mut block = format!("\n[[{table}]]\nname = \"{name}\"\nprovider = \"{provider}\"\n");
+        if provider.auth_kind() == AuthKind::OAuth {
+            block.push_str("credential_source = \"shunt_store\"\n");
+        }
+        if let Some(owner) = owner {
+            block.push_str(&format!("owner = {:?}\n", owner));
+        }
+        if let Some(ref url) = upstream_url {
+            block.push_str(&format!("upstream_url = \"{url}\"\n"));
+        }
+        config_text.push_str(&block);
+        std::fs::write(&config_p, &config_text)?;
+    }
+
+    if let Some(cred) = credential {
+        let mut store = CredentialsStore::load();
+        store.insert(pool, name.clone(), cred);
+        store.save()?;
+    }
+
+    // Clear any persisted auth_failed / disabled flags so the proxy treats
+    // the fresh credential as healthy on next start (or hot-reload).
+    {
+        let state = crate::state::StateStore::load(&crate::config::state_path());
+        let state_name = if crate::config::config_needs_migration(&config_p).unwrap_or(true)
+            || pool == crate::config::PoolKind::Legacy
+        {
+            name.clone()
+        } else {
+            format!("{}/{}", pool.as_str(), name)
+        };
+        state.clear_auth_failed(&state_name);
+        // Give the background writer thread time to flush (~100 ms poll interval).
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    println!();
+    println!(
+        "  {} Account {} added.",
+        green(CHECK),
+        bold(&format!("'{name}'"))
+    );
+    offer_restart(config_override).await;
+    println!();
+    Ok(())
+}
+
+/// Read a line from stdin without echoing (for API keys). Falls back to
+/// plain readline if the terminal doesn't support it.
+fn read_secret_line() -> Result<String> {
+    // Try rpassword-style: disable echo via termios, then restore.
+    #[cfg(unix)]
+    {
+        use std::io::{BufRead, Write};
+        // Disable echo
+        let _ = std::process::Command::new("stty").arg("-echo").status();
+        let mut out = std::io::stdout();
+        let _ = out.flush();
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line)?;
+        // Re-enable echo and print newline
+        let _ = std::process::Command::new("stty").arg("echo").status();
+        println!();
+        Ok(line.trim().to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{BufRead, Write};
+        let mut out = std::io::stdout();
+        let _ = out.flush();
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line)?;
+        return Ok(line.trim().to_string());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// remove-account
+// ---------------------------------------------------------------------------
+
+async fn cmd_remove_account(config_override: Option<PathBuf>, name: Option<String>) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+    if !config_p.exists() {
+        bail!("No config found. Run `shunt setup` first.");
+    }
+
+    // Resolve name — pick interactively if not given
+    let name = if let Some(n) = name {
+        let config = crate::config::load_config(config_override.as_deref())?;
+        let matches: Vec<_> = config
+            .accounts
+            .iter()
+            .filter(|a| a.name == n || a.name.ends_with(&format!("/{n}")))
+            .collect();
+        match matches.as_slice() {
+            [account] => account.name.clone(),
+            [] => bail!("Account '{n}' not found."),
+            _ => bail!("Account name '{n}' exists in multiple pools; use the pool-qualified name."),
+        }
+    } else {
+        let config = crate::config::load_config(config_override.as_deref())?;
+        let removable: Vec<_> = config.accounts.iter().collect();
+        if removable.is_empty() {
+            bail!("No accounts to remove.");
+        }
+        let items: Vec<term::SelectItem> = removable
+            .iter()
+            .map(|a| {
+                let email = a.credential.as_ref().and_then(|c| c.email()).unwrap_or("");
+                term::SelectItem {
+                    label: format!("{}  {}", bold(&pad(&a.name, 12)), dim(&pad(email, 32))),
+                    value: a.name.clone(),
+                }
+            })
+            .collect();
+        match term::select("Remove account:", &items, 0) {
+            Some(v) => v,
+            None => return Ok(()),
+        }
+    };
+
+    let config_text = std::fs::read_to_string(&config_p)?;
+    let raw_name = name.rsplit('/').next().unwrap_or(&name);
+    if !config_text.contains(&format!("name = \"{raw_name}\"")) {
+        bail!("Account '{name}' not found.");
+    }
+
+    if !term::confirm(&format!("Remove account '{name}'? This cannot be undone.")) {
+        println!("  {} Cancelled.", dim("·"));
+        println!();
+        return Ok(());
+    }
+
+    print_splash(&[
+        format!(
+            "{}  {}",
+            brand_green("shunt"),
+            dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        ),
+        format!("Removing account {}", bold(&format!("'{name}'"))),
+        String::new(),
+    ]);
+
+    // Strip the [[accounts]] block for this name from config
+    let new_config = remove_account_block(&config_text, &name);
+    std::fs::write(&config_p, &new_config)?;
+    println!("  {} Removed from config", green(CHECK));
+
+    // Remove credential from store
+    let mut store = CredentialsStore::load();
+    let removed = if let Some((pool, raw_name)) = name.split_once('/') {
+        store
+            .pools
+            .get_mut(pool)
+            .and_then(|m| m.remove(raw_name))
+            .is_some()
+    } else {
+        store.accounts.remove(&name).is_some()
+    };
+    if removed {
+        store.save()?;
+        println!("  {} Credential removed", green(CHECK));
+    }
+
+    println!();
+    println!(
+        "  {} Account {} removed.",
+        green(CHECK),
+        bold(&format!("'{name}'"))
+    );
+    offer_restart(config_override).await;
+    println!();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// logout
+// ---------------------------------------------------------------------------
+
+async fn cmd_logout(
+    config_override: Option<PathBuf>,
+    name: Option<String>,
+    all: bool,
+) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+    if !config_p.exists() {
+        bail!("No config found. Run `shunt setup` first.");
+    }
+
+    let config = crate::config::load_config(config_override.as_deref())?;
+
+    // Collect account names to log out
+    let names: Vec<String> = if all {
+        config
+            .accounts
+            .iter()
+            .filter(|a| a.credential.is_some())
+            .map(|a| a.name.clone())
+            .collect()
+    } else if let Some(n) = name {
+        let matches: Vec<_> = config
+            .accounts
+            .iter()
+            .filter(|a| a.name == n || a.name.ends_with(&format!("/{n}")))
+            .collect();
+        if matches.len() != 1 {
+            if matches.is_empty() {
+                bail!("Account '{n}' not found.");
+            }
+            bail!("Account name '{n}' exists in multiple pools; use the pool-qualified name.");
+        }
+        vec![matches[0].name.clone()]
+    } else {
+        // Interactive picker — show only accounts that have credentials
+        let with_cred: Vec<_> = config
+            .accounts
+            .iter()
+            .filter(|a| a.credential.is_some())
+            .collect();
+        if with_cred.is_empty() {
+            println!("  {} No logged-in accounts.", dim("·"));
+            println!();
+            return Ok(());
+        }
+        let items: Vec<term::SelectItem> = with_cred
+            .iter()
+            .map(|a| {
+                let email = a.credential.as_ref().and_then(|c| c.email()).unwrap_or("");
+                term::SelectItem {
+                    label: format!("{}  {}", bold(&pad(&a.name, 12)), dim(&pad(email, 32))),
+                    value: a.name.clone(),
+                }
+            })
+            .collect();
+        match term::select("Log out account:", &items, 0) {
+            Some(v) => vec![v],
+            None => return Ok(()),
+        }
+    };
+
+    if names.is_empty() {
+        println!("  {} No logged-in accounts.", dim("·"));
+        println!();
+        return Ok(());
+    }
+
+    let label = if names.len() == 1 {
+        format!("account {}", bold(&format!("'{}'", names[0])))
+    } else {
+        format!("{} accounts", bold(&names.len().to_string()))
+    };
+
+    // Reconfirm for --all or multi-account logout
+    if names.len() > 1
+        && !term::confirm(&format!(
+            "Log out all {} accounts? You will need to re-authorize each one.",
+            names.len()
+        ))
+    {
+        println!("  {} Cancelled.", dim("·"));
+        println!();
+        return Ok(());
+    }
+
+    print_splash(&[
+        format!(
+            "{}  {}",
+            brand_green("shunt"),
+            dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        ),
+        format!("Logging out {label}"),
+        String::new(),
+    ]);
+
+    let mut store = CredentialsStore::load();
+
+    for name in &names {
+        let stored = name
+            .split_once('/')
+            .and_then(|(pool, raw)| store.pools.get(pool).and_then(|m| m.get(raw)))
+            .or_else(|| store.accounts.get(name));
+        // Revoke token on the server (best-effort)
+        if let Some(cred) = stored {
+            print!("  {} Revoking '{}' token… ", dim("↻"), name);
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            if revoke_token(cred.access_token()).await {
+                println!("{}", green("done"));
+            } else {
+                println!("{}", dim("(server did not confirm — cleared locally)"));
+            }
+        }
+
+        // Remove credential from local store
+        if let Some((pool, raw)) = name.split_once('/') {
+            if let Some(accounts) = store.pools.get_mut(pool) {
+                accounts.remove(raw);
+            }
+        } else {
+            store.accounts.remove(name);
+        }
+        println!("  {} Credential for '{}' removed", green(CHECK), name);
+    }
+
+    store.save()?;
+
+    println!();
+    println!("  {} Logged out {}.", green(CHECK), label);
+    println!("  {} To re-authorize: {}", dim("·"), cyan("shunt add"));
+    println!();
+    Ok(())
+}
+
+/// Remove a `[[accounts]]` TOML block with the given name from config text.
+/// Uses toml_edit for correct structured editing that handles comments and edge cases.
+fn remove_account_block(config: &str, name: &str) -> String {
+    let mut doc = match config.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(_) => return config.to_owned(), // unparseable — leave unchanged
+    };
+
+    let (pool, raw_name) = name
+        .split_once('/')
+        .map_or((None, name), |(pool, name)| (Some(pool), name));
+    let item = match pool {
+        Some(pool) => doc
+            .get_mut("pools")
+            .and_then(|item| item.get_mut(pool))
+            .and_then(|item| item.get_mut("accounts")),
+        None => doc.get_mut("accounts"),
+    };
+    if let Some(item) = item {
+        if let Some(arr) = item.as_array_of_tables_mut() {
+            // Collect indices to remove in reverse order so removal doesn't shift indices
+            let to_remove: Vec<usize> = arr
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.get("name").and_then(|v| v.as_str()) == Some(raw_name))
+                .map(|(i, _)| i)
+                .collect();
+            for i in to_remove.into_iter().rev() {
+                arr.remove(i);
+            }
+        }
+    }
+
+    doc.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// start
+// ---------------------------------------------------------------------------
+
+async fn cmd_start(
+    config_override: Option<PathBuf>,
+    host_override: Option<String>,
+    port_override: Option<u16>,
+    foreground: bool,
+    verbose: bool,
+    // Force-replace flag. The kill/no-op decision runs in `main.rs` before the
+    // runtime starts; this function only needs to accept the flag so that
+    // `shunt start --force` parses and clap does not reject it.
+    _force: bool,
+    daemon: bool,
+) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+    if config_p.exists() && crate::config::config_needs_migration(&config_p)? {
+        crate::config::migrate_config_file(&config_p, true, None)?;
+        tracing::info!(config = %config_p.display(), "automatically migrated config to schema v2");
+    }
+
+    // ── Daemon mode: internal re-exec, no user output ────────────────────────
+    if daemon {
+        if !config_p.exists() {
+            return Ok(());
+        }
+        let mut config = crate::config::load_config(config_override.as_deref())?;
+        let host = host_override.unwrap_or_else(|| config.server.host.clone());
+        let port = port_override.unwrap_or(config.server.port);
+
+        // #5: Warn once if sensitive values are found in config as plaintext.
+        if let Ok(raw) = std::fs::read_to_string(&config_p) {
+            if raw.lines().any(|l| {
+                l.trim_start().starts_with("cloudflare_api_token")
+                    || l.trim_start().starts_with("remote_key")
+            }) {
+                eprintln!("  [shunt] Warning: plaintext sensitive values detected in config.toml.");
+                eprintln!("  [shunt] Consider migrating to env vars: CLOUDFLARE_API_TOKEN, SHUNT_REMOTE_KEY");
+            }
+        }
+
+        for account in &mut config.accounts {
+            if let Some(cred) = &account.credential {
+                if cred.needs_refresh() {
+                    if let Some(oauth) = cred.as_oauth() {
+                        if let Ok(Ok(fresh)) = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            account.provider.refresh_token(oauth),
+                        )
+                        .await
+                        {
+                            let mut store = CredentialsStore::load();
+                            store.insert_resolved(
+                                account.name.clone(),
+                                Credential::Oauth(fresh.clone()),
+                            );
+                            store.save().ok();
+                            account.credential = Some(Credential::Oauth(fresh));
+                        }
+                    }
+                }
+            }
+        }
+
+        let lp = log_path();
+        let log_level = if verbose {
+            "debug"
+        } else {
+            config.server.log_level.as_str()
+        };
+        crate::logging::prune_old_logs(&lp, 7);
+        let _log_guard = crate::logging::setup(&lp, log_level)?;
+        let state = crate::state::StateStore::load(&crate::config::state_path());
+        write_pid();
+        // Apply routing on every daemon start — silently re-injects ANTHROPIC_BASE_URL
+        // into both settings files so Claude Code routes through shunt immediately.
+        apply_local_routing_silent(port);
+        serve_all_providers(config, state, &host, port).await?;
+        return Ok(());
+    }
+
+    // ── Auto-setup on first run ───────────────────────────────────────────────
+    // Skip interactive setup when stdin is not a TTY (e.g. curl | sh) to
+    // avoid blocking on macOS Keychain or OAuth prompts.
+    let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
+    if !config_p.exists() && stdin_is_tty {
+        cmd_setup_auto(config_override.clone()).await?;
+    }
+
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let host = host_override
+        .clone()
+        .unwrap_or_else(|| config.server.host.clone());
+    let port = port_override.unwrap_or(config.server.port);
+
+    // Kill any previous instance on this port
+    for pid in port_pids(port) {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+    }
+    if !port_pids(port).is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+
+    // ── Foreground mode (debugging) ───────────────────────────────────────────
+    if foreground {
+        use std::io::Write as _;
+        let mut config = config;
+        let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        print_routing_header(
+            &account_names,
+            &[
+                format!(
+                    "{}  {}",
+                    brand_green("shunt"),
+                    dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+                ),
+                dim("foreground").to_string(),
+            ],
+        );
+        for account in &mut config.accounts {
+            if let Some(cred) = &account.credential {
+                if cred.needs_refresh() {
+                    if let Some(oauth) = cred.as_oauth() {
+                        print!("  {} Refreshing '{}'… ", yellow("↻"), account.name);
+                        std::io::stdout().flush().ok();
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            account.provider.refresh_token(oauth),
+                        )
+                        .await
+                        {
+                            Ok(Ok(fresh)) => {
+                                println!("{}", green("done"));
+                                let mut store = CredentialsStore::load();
+                                store.insert_resolved(
+                                    account.name.clone(),
+                                    Credential::Oauth(fresh.clone()),
+                                );
+                                store.save().ok();
+                                account.credential = Some(Credential::Oauth(fresh));
+                            }
+                            Ok(Err(e)) => println!("{}", yellow(&format!("failed ({})", e))),
+                            Err(_) => println!("{}", yellow("timed out")),
+                        }
+                    }
+                }
+            }
+        }
+        let lp = log_path();
+        let log_level = if verbose {
+            "debug"
+        } else {
+            config.server.log_level.as_str()
+        };
+        crate::logging::prune_old_logs(&lp, 7);
+        let _log_guard = crate::logging::setup(&lp, log_level)?;
+        let col = 13usize;
+        println!(
+            "  {}  {} {}",
+            dim(&pad("listening", col)),
+            dim("[control]"),
+            green_bold(&format!("http://{host}:{}", config.server.control_port))
+        );
+        for (p, addr) in listener_addrs(&config, &host) {
+            println!(
+                "  {}  {} {}",
+                dim(&pad("listening", col)),
+                dim(&format!("[{p}]")),
+                green_bold(&addr)
+            );
+        }
+        println!(
+            "  {}  {}",
+            dim(&pad("logs", col)),
+            dim(&lp.display().to_string())
+        );
+        println!();
+        let state = crate::state::StateStore::load(&crate::config::state_path());
+        write_pid();
+        apply_local_routing_silent(port);
+        serve_all_providers(config, state, &host, port).await?;
+        return Ok(());
+    }
+
+    // ── Background mode (default) ─────────────────────────────────────────────
+    let exe = std::env::current_exe().context("cannot locate current executable")?;
+    // On Linux, after a binary self-update via rename(), current_exe() may return
+    // a path suffixed with " (deleted)" (e.g. "/usr/local/bin/shunt (deleted)").
+    // Strip the suffix so the spawn finds the newly-written binary.
+    let exe = {
+        let s = exe.to_string_lossy();
+        if let Some(stripped) = s.strip_suffix(" (deleted)") {
+            std::path::PathBuf::from(stripped)
+        } else {
+            exe
+        }
+    };
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("start").arg("--daemon");
+    if let Some(ref p) = config_override {
+        cmd.args(["--config", &p.display().to_string()]);
+    }
+    if let Some(ref h) = host_override {
+        cmd.args(["--host", h]);
+    }
+    if let Some(p) = port_override {
+        cmd.args(["--port", &p.to_string()]);
+    }
+    if verbose {
+        cmd.arg("--verbose");
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("failed to start proxy in background")?;
+
+    // Wait until the control plane is accepting connections (up to 8 s), then
+    // confirm the data port is actually accepting connections too. Both must be
+    // up before we let Claude Code point at the proxy: control health alone can
+    // be green a beat before the data listener binds.
+    let control_port = config.server.control_port;
+    let ready =
+        wait_for_health(&host, control_port, 8).await && wait_for_port(&host, port, 3).await;
+
+    if ready {
+        // Auto-write ANTHROPIC_BASE_URL to shell profile (silent if already there)
+        auto_write_shell_export(port);
+    } else {
+        // Startup did not become ready. The daemon child may have written
+        // ANTHROPIC_BASE_URL into Claude Code settings before failing to bind;
+        // remove it so Claude Code falls back to the direct API instead of
+        // hammering a dead localhost socket with ConnectionRefused.
+        if let Some(home) = dirs::home_dir() {
+            remove_from_settings_file_quiet(&home.join(".claude").join("settings.json"));
+            remove_from_settings_file_quiet(&managed_claude_settings_path(&home));
+        }
+    }
+
+    let account_names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+    let status_line = if ready {
+        format!(
+            "{}  {}  {}",
+            green(DOT),
+            green_bold("running"),
+            cyan(&format!("http://{host}:{port}"))
+        )
+    } else {
+        format!(
+            "{}  {}  {}",
+            yellow(DOT),
+            yellow("starting"),
+            dim(&format!("http://{host}:{port}"))
+        )
+    };
+    print_routing_header(
+        &account_names,
+        &[
+            format!(
+                "{}  {}",
+                brand_green("shunt"),
+                dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+            ),
+            status_line,
+        ],
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// stop
+// ---------------------------------------------------------------------------
+
+async fn cmd_stop() -> Result<()> {
+    cmd_stop_impl(false).await
+}
+
+async fn cmd_stop_quiet() -> Result<()> {
+    cmd_stop_impl(true).await
+}
+
+async fn cmd_stop_impl(quiet: bool) -> Result<()> {
+    let pid_p = pid_path();
+    let content = match std::fs::read_to_string(&pid_p) {
+        Ok(c) => c,
+        Err(_) => {
+            if !quiet {
+                println!("  {} Proxy is not running.", dim("·"));
+                println!();
+            }
+            return Ok(());
+        }
+    };
+    let pid = match content.trim().parse::<u32>() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = std::fs::remove_file(&pid_p);
+            if !quiet {
+                println!("  {} Proxy is not running.", dim("·"));
+                println!();
+            }
+            return Ok(());
+        }
+    };
+    if !is_shunt_pid(pid) {
+        let _ = std::fs::remove_file(&pid_p);
+        if !quiet {
+            println!("  {} Proxy is not running.", dim("·"));
+        }
+        // Daemon died without cleanup — remove stale routing so Claude Code doesn't
+        // keep hitting a dead localhost port.
+        if let Some(home) = dirs::home_dir() {
+            remove_from_settings_file_quiet(&home.join(".claude").join("settings.json"));
+            remove_from_settings_file_quiet(&managed_claude_settings_path(&home));
+        }
+        if !quiet {
+            println!();
+        }
+        return Ok(());
+    }
+
+    // SIGTERM — let axum drain connections cleanly
+    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+
+    // Wait up to 3 s for clean exit, then SIGKILL
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !is_shunt_pid(pid) {
+            break;
+        }
+    }
+    if is_shunt_pid(pid) {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    let _ = std::fs::remove_file(&pid_p);
+    if !quiet {
+        println!("  {} Proxy stopped.", green(CHECK));
+    }
+
+    // Remove routing from both settings files so Claude Code hits the API directly
+    // while the daemon is down (avoids "connection refused" errors).
+    // Routing is re-applied automatically when the daemon starts again.
+    if let Some(home) = dirs::home_dir() {
+        remove_from_settings_file_quiet(&home.join(".claude").join("settings.json"));
+        remove_from_settings_file_quiet(&managed_claude_settings_path(&home));
+    }
+
+    if !quiet {
+        println!();
+    }
+    Ok(())
+}
+
+fn is_shunt_pid(pid: u32) -> bool {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .contains("shunt")
+}
+
+// ---------------------------------------------------------------------------
+// restart
+// ---------------------------------------------------------------------------
+
+async fn cmd_restart(config_override: Option<PathBuf>) -> Result<()> {
+    print!("  {} Restarting…  ", dim("↻"));
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+    cmd_stop_quiet().await?;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // force = true: restart has already stopped the old daemon, so the fresh
+    // start must proceed even if a stale health probe would briefly still answer.
+    cmd_start(config_override, None, None, false, false, true, false).await
+}
+
+// ---------------------------------------------------------------------------
+// logs
+// ---------------------------------------------------------------------------
+
+async fn cmd_logs(
+    _config_override: Option<PathBuf>,
+    follow: bool,
+    lines: usize,
+    raw_json: bool,
+) -> Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let log = log_path();
+    if !log.exists() {
+        println!("  {} No log file found.", dim("·"));
+        println!(
+            "  {} Start the proxy first: {}",
+            dim("·"),
+            cyan("shunt start")
+        );
+        println!();
+        return Ok(());
+    }
+
+    let file = std::fs::File::open(&log)?;
+    let mut reader = BufReader::new(file);
+
+    let render = |l: &str| -> String {
+        if raw_json {
+            l.trim_end().to_string()
+        } else {
+            pretty_log_line(l)
+        }
+    };
+
+    // Ring buffer — keep last N lines regardless of file size.
+    let mut ring: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(lines + 1);
+    let mut line = String::new();
+    while reader.read_line(&mut line)? > 0 {
+        if ring.len() >= lines {
+            ring.pop_front();
+        }
+        ring.push_back(std::mem::take(&mut line));
+    }
+    for l in &ring {
+        println!("{}", render(l));
+    }
+    std::io::stdout().flush().ok();
+
+    if !follow {
+        return Ok(());
+    }
+
+    eprintln!("{}", dim("--- following (Ctrl+C to stop) ---"));
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? > 0 {
+            println!("{}", render(&line));
+            std::io::stdout().flush().ok();
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+}
+
+/// Format a log line into a human-readable string.
+/// Handles both JSON (rotating file appender) and ANSI tracing text
+/// (daemon stderr redirected into proxy.log). Strips ANSI when not JSON.
+fn pretty_log_line(line: &str) -> String {
+    let line = line.trim_end();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        // Not JSON (ANSI-formatted tracing stderr) — strip escape codes.
+        return strip_ansi(line);
+    };
+
+    // Timestamp: keep only HH:MM:SS from "2026-05-28T16:28:19.208352Z"
+    let time = v["timestamp"]
+        .as_str()
+        .and_then(|t| t.get(11..19))
+        .unwrap_or("??:??:??");
+
+    let level = v["level"].as_str().unwrap_or("????");
+    let level_str = match level {
+        "ERROR" => red("ERROR"),
+        "WARN" => yellow("WARN "),
+        "INFO" => dim("INFO "),
+        "DEBUG" => dim("DEBUG"),
+        other => dim(other),
+    };
+
+    let fields = v["fields"].as_object();
+    let message = fields.and_then(|f| f["message"].as_str()).unwrap_or(line);
+
+    // Message color by level
+    let message_str = match level {
+        "ERROR" => red(message),
+        "WARN" => yellow(message),
+        _ => message.to_string(),
+    };
+
+    // Build key=value pairs — skip "message", format latency nicely
+    let mut kvs = String::new();
+    if let Some(fields) = fields {
+        // Preferred key order for readability
+        const ORDER: &[&str] = &[
+            "account",
+            "model",
+            "status",
+            "latency_ms",
+            "path",
+            "request_id",
+        ];
+        let mut seen = std::collections::HashSet::new();
+
+        for &k in ORDER {
+            if let Some(val) = fields.get(k) {
+                seen.insert(k);
+                let v_str = val_to_str(val);
+                if v_str.is_empty() {
+                    continue;
+                }
+                let (display_k, display_v) = if k == "latency_ms" {
+                    ("latency", format!("{}ms", v_str))
+                } else {
+                    (k, v_str)
+                };
+                kvs.push_str(&format!("  {}={}", dim(display_k), display_v));
+            }
+        }
+        // Any remaining fields not in ORDER
+        for (k, val) in fields {
+            if k == "message" || seen.contains(k.as_str()) {
+                continue;
+            }
+            let v_str = val_to_str(val);
+            if v_str.is_empty() {
+                continue;
+            }
+            kvs.push_str(&format!("  {}={}", dim(k), v_str));
+        }
+    }
+
+    format!("{}  {}  {}{}", dim(time), level_str, message_str, kvs)
+}
+
+fn val_to_str(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Non-interactive setup called from `cmd_start`.
+/// Imports the existing Claude Code session silently.
+/// The only user interaction is the OAuth code paste if no session exists.
+async fn cmd_setup_auto(config_override: Option<PathBuf>) -> Result<()> {
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+
+    let mut cred = match crate::oauth::read_claude_credentials() {
+        Some(mut c) => {
+            if c.needs_refresh() {
+                if let Ok(fresh) = refresh_token(&c).await {
+                    c = fresh;
+                }
+            }
+            c
+        }
+        None => {
+            // No session on disk — run the full OAuth flow (user pastes code)
+            println!(
+                "  {} No Claude Code session found — opening browser for login…",
+                yellow("·")
+            );
+            crate::oauth::run_oauth_flow().await?
+        }
+    };
+
+    let plan = crate::oauth::read_claude_session_info()
+        .map(|s| s.plan)
+        .unwrap_or_else(|| "pro".to_string());
+
+    cred.email = crate::oauth::fetch_account_email(&cred.access_token).await;
+
+    if let Some(parent) = config_p.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &config_p,
+        crate::config::config_template(&[("main", &plan)]),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_p, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    let mut store = CredentialsStore::default();
+    store.insert(
+        crate::config::PoolKind::Claude,
+        "main".into(),
+        Credential::Oauth(cred),
+    );
+    if let Some(codex_credential) = crate::oauth::read_codex_credentials() {
+        let mut text = std::fs::read_to_string(&config_p)?;
+        text.push_str("\n[[pools.codex.accounts]]\nname = \"main\"\nprovider = \"openai\"\ncredential_source = \"codex_auth_file\"\n");
+        std::fs::write(&config_p, text)?;
+        store.insert(
+            crate::config::PoolKind::Codex,
+            "main".into(),
+            Credential::Oauth(codex_credential),
+        );
+    }
+    store.save()?;
+
+    // Track new installs — fire-and-forget, don't block setup completion.
+    tokio::spawn(crate::telemetry::track_cli_feature("setup"));
+
+    Ok(())
+}
+
+/// Wait until a TCP listener is accepting connections on `host:port`.
+/// Used to confirm the data port is bound before routing Claude Code to it.
+async fn wait_for_port(host: &str, port: u16, timeout_secs: u64) -> bool {
+    let probe_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
+    let addr = format!("{probe_host}:{port}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return true,
+            _ => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+        }
+    }
+    false
+}
+
+async fn wait_for_health(host: &str, port: u16, timeout_secs: u64) -> bool {
+    let url = format!("http://{host}:{port}/health");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while tokio::time::Instant::now() < deadline {
+        if client
+            .get(&url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    false
+}
+
+fn auto_write_shell_export(port: u16) {
+    use std::io::Write;
+    let line = format!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}");
+    let Some(profile) = detect_shell_profile() else {
+        return;
+    };
+
+    if profile.exists() {
+        if let Ok(contents) = std::fs::read_to_string(&profile) {
+            if contents.contains(&line) {
+                // Already exactly correct — nothing to do.
+                return;
+            }
+            if contents.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:") {
+                // Has the variable but with a different port — update it in-place.
+                let updated: String = contents
+                    .lines()
+                    .map(|l| {
+                        if l.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:") {
+                            line.as_str()
+                        } else {
+                            l
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n";
+                if std::fs::write(&profile, updated).is_ok() {
+                    println!(
+                        "  {} {} updated to port {}  → {}",
+                        green(CHECK),
+                        cyan("ANTHROPIC_BASE_URL"),
+                        port,
+                        dim(&profile.display().to_string())
+                    );
+                }
+                return;
+            }
+            if contents.contains("ANTHROPIC_BASE_URL") {
+                // Set to something else (e.g. remote URL) — leave it alone.
+                return;
+            }
+        }
+    }
+
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&profile)
+    {
+        writeln!(f, "\n# Added by shunt").ok();
+        writeln!(f, "{line}").ok();
+        println!(
+            "  {} {} → {}",
+            green(CHECK),
+            cyan("ANTHROPIC_BASE_URL"),
+            dim(&profile.display().to_string())
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// status
+// ---------------------------------------------------------------------------
+
+/// Renders status by fetching from a remote shunt URL (set by `shunt connect`).
+/// Accounts are sourced directly from the remote /status JSON, not local config.
+async fn cmd_status_remote(remote_url: &str) -> Result<()> {
+    let status_url = format!("{remote_url}/status");
+    let resp = reqwest::Client::new()
+        .get(&status_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+
+    let live: Option<serde_json::Value> = match resp {
+        Ok(r) => futures_executor_hack(r),
+        Err(e) => {
+            println!();
+            println!(
+                "  {} Cannot connect to remote shunt at {}",
+                red(CROSS),
+                cyan(remote_url)
+            );
+            if e.is_connect() || e.is_timeout() {
+                println!(
+                    "  {} Host unreachable — is the tunnel/domain still active?",
+                    dim("·")
+                );
+            } else {
+                println!("  {} Error: {e}", dim("·"));
+            }
+            println!(
+                "  {} Run {} on the host machine to create a new share code.",
+                dim("·"),
+                cyan("shunt share")
+            );
+            println!();
+            return Ok(());
+        }
+    };
+
+    let Some(data) = live else {
+        println!();
+        println!(
+            "  {} Connected to {} but got an unexpected response.",
+            red(CROSS),
+            cyan(remote_url)
+        );
+        println!("  {} The URL may not point to a shunt instance.", dim("·"));
+        println!();
+        return Ok(());
+    };
+
+    let accounts = data["accounts"]
+        .as_array()
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let version = data["version"].as_str().unwrap_or("?");
+
+    let provider_lines = {
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for a in accounts {
+            let label = a["provider"].as_str().unwrap_or("unknown");
+            *counts.entry(label).or_default() += 1;
+        }
+        let mut lines = vec!["accounts connected".to_string(), String::new()];
+        lines.extend(counts.iter().map(|(label, n)| {
+            let provider_display = match *label {
+                "anthropic" => "Claude Code",
+                "openai" => "Codex",
+                l => l,
+            };
+            format!(
+                "{n} {provider_display} {}",
+                if *n == 1 { "account" } else { "accounts" }
+            )
+        }));
+        lines
+    };
+
+    let title = format!("shunt  v{}", env!("CARGO_PKG_VERSION"));
+    print_status_splash(&title, provider_lines);
+    println!();
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pinned = data["pinned_account"].as_str().map(|s| s.to_owned());
+    let last_used = data["last_used_account"].as_str().map(|s| s.to_owned());
+
+    // Pinned notice
+    if let Some(ref p) = pinned {
+        println!("  {}  pinned to {}", yellow(DIAMOND), bold(p));
+        println!(
+            "  {}  run {} to restore auto routing",
+            dim("·"),
+            cyan("shunt use auto")
+        );
+        println!();
+    }
+
+    for acc in accounts {
+        let name = acc["name"].as_str().unwrap_or("?");
+        let status = acc["status"].as_str().unwrap_or("offline");
+        let email = acc["email"].as_str().unwrap_or("");
+        let plan_type = acc["plan_type"].as_str().unwrap_or("pro");
+        let provider = acc["provider"].as_str().unwrap_or("anthropic");
+
+        let (status_icon, status_text): (String, String) = match status {
+            "available" => (green(CHECK), green("available")),
+            "cooling" => (yellow("↻"), yellow("cooling")),
+            "disabled" => (red(CROSS), red("disabled")),
+            "reauth_required" => (red(CROSS), red("session expired")),
+            _ => (dim(EMPTY), dim("offline")),
+        };
+
+        let plan_label = match provider {
+            "anthropic" => match plan_type.to_lowercase().as_str() {
+                "max" | "claude_max" => "Claude Max",
+                "team" => "Claude Team",
+                _ => "Claude Pro",
+            },
+            _ => "",
+        };
+
+        let is_pinned = pinned.as_deref() == Some(name);
+        let is_last = !is_pinned && last_used.as_deref() == Some(name);
+        let (routing_tag, tag_vis_len): (String, usize) = if is_pinned {
+            (format!("  {}", yellow("pinned")), 8)
+        } else if is_last {
+            (format!("  {}", green("active")), 8)
+        } else {
+            (String::new(), 0)
+        };
+
+        println!(
+            "{}",
+            card_header(
+                name,
+                &green_bold(name),
+                &routing_tag,
+                tag_vis_len,
+                plan_label
+            )
+        );
+        if !email.is_empty() {
+            println!("{}", card_row(&dim(email)));
+        }
+        println!();
+        println!("{}", card_row(&format!("{}  {}", status_icon, status_text)));
+
+        // Rate-limit bars
+        if let Some(rl) = acc["rate_limit"].as_object() {
+            let util_5h = rl.get("utilization_5h").and_then(|v| v.as_f64());
+            let reset_5h = rl.get("reset_5h").and_then(|v| v.as_u64());
+            let status_5h = rl
+                .get("status_5h")
+                .and_then(|v| v.as_str())
+                .unwrap_or("allowed");
+            let util_7d = rl.get("utilization_7d").and_then(|v| v.as_f64());
+            let reset_7d = rl.get("reset_7d").and_then(|v| v.as_u64());
+            let status_7d = rl
+                .get("status_7d")
+                .and_then(|v| v.as_str())
+                .unwrap_or("allowed");
+
+            let window_row = |label: &str, util: Option<f64>, reset: Option<u64>, wstatus: &str| {
+                if reset.map(|t| t <= now_secs).unwrap_or(false) {
+                    let ago = reset
+                        .map(|t| {
+                            format!(
+                                "  {} ago",
+                                term::fmt_duration_ms(now_secs.saturating_sub(t) * 1000)
+                            )
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "{}",
+                        card_row(&format!(
+                            "{}  {}  {}{}",
+                            dim(label),
+                            green(&"─".repeat(20)),
+                            green("fresh"),
+                            dim(&ago)
+                        ))
+                    );
+                } else if let Some(u) = util {
+                    let rem = 100u64.saturating_sub((u * 100.0) as u64);
+                    let bar = util_bar(u, 20);
+                    let reset_str = reset
+                        .and_then(secs_until)
+                        .map(|s| format!("  ·  resets in {}", term::fmt_duration_ms(s * 1000)))
+                        .unwrap_or_default();
+                    let pct = if wstatus == "exhausted" {
+                        red("exhausted")
+                    } else {
+                        format!("{}% left", bold(&rem.to_string()))
+                    };
+                    println!(
+                        "{}",
+                        card_row(&format!(
+                            "{}  {}  {}{}",
+                            dim(label),
+                            bar,
+                            pct,
+                            dim(&reset_str)
+                        ))
+                    );
+                }
+            };
+
+            if util_5h.is_some() || reset_5h.is_some() {
+                window_row("5h", util_5h, reset_5h, status_5h);
+            }
+            if util_7d.is_some() || reset_7d.is_some() {
+                window_row("7d", util_7d, reset_7d, status_7d);
+            }
+        }
+
+        println!();
+        println!("{}", card_sep());
+        println!();
+    }
+
+    // Remote host info footer
+    println!(
+        "  {}  remote shunt v{}  {}  {}",
+        dim("·"),
+        dim(version),
+        dim("·"),
+        dim(remote_url)
+    );
+    println!();
+    Ok(())
+}
+
+async fn cmd_status(config_override: Option<PathBuf>, pool: Option<&str>) -> Result<()> {
+    // Remote mode: ANTHROPIC_BASE_URL is a non-local shunt (written by `shunt connect`).
+    // Render accounts directly from the remote /status JSON — local config is irrelevant.
+    if let Some(remote) = std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|u| !u.contains("127.0.0.1") && !u.contains("localhost"))
+        .map(|u| u.trim_end_matches('/').to_owned())
+    {
+        return cmd_status_remote(&remote).await;
+    }
+
+    let mut config = crate::config::load_config(config_override.as_deref())?;
+    if let Some(pool) = pool {
+        config.accounts.retain(|a| match pool {
+            "claude" => matches!(
+                a.provider,
+                crate::provider::Provider::Anthropic | crate::provider::Provider::AnthropicApi
+            ),
+            "codex" => matches!(
+                a.provider,
+                crate::provider::Provider::OpenAI | crate::provider::Provider::OpenAIApi
+            ),
+            _ => false,
+        });
+    }
+
+    // Fetch live status from local control port.
+    let live: Option<serde_json::Value> = reqwest::get(format!(
+        "http://{}:{}{}",
+        config.server.host,
+        config.server.control_port,
+        pool.map(|p| format!("/pools/{p}/status"))
+            .unwrap_or_else(|| "/status".into())
+    ))
+    .await
+    .ok()
+    .and_then(futures_executor_hack);
+
+    // Back-fill missing emails (existing accounts set up before email support).
+    // Fetch in parallel, persist any that are new.
+    let mut store_dirty = false;
+    let mut store = CredentialsStore::load();
+    for acc in &mut config.accounts {
+        if acc
+            .credential
+            .as_ref()
+            .map(|c| c.email().is_none())
+            .unwrap_or(false)
+        {
+            let token = acc
+                .credential
+                .as_ref()
+                .map(|c| c.access_token().to_owned())
+                .unwrap_or_default();
+            if let Some(email) = crate::oauth::fetch_account_email(&token).await {
+                if let Some(oauth) = acc.credential.as_mut().and_then(|c| c.as_oauth_mut()) {
+                    oauth.email = Some(email.clone());
+                }
+                if let Some(stored) = store.get_mut_resolved(&acc.name) {
+                    if let Some(oauth) = stored.as_oauth_mut() {
+                        oauth.email = Some(email);
+                        store_dirty = true;
+                    }
+                }
+            }
+        }
+    }
+    if store_dirty {
+        store.save().ok();
+    }
+
+    // Build per-provider account counts for the splash right panel.
+    let provider_lines: Vec<String> = {
+        let mut counts: Vec<(String, usize)> = vec![];
+        for acc in &config.accounts {
+            let label = match &acc.provider {
+                crate::provider::Provider::Anthropic => "Claude Code",
+                crate::provider::Provider::AnthropicApi => "Anthropic API",
+                crate::provider::Provider::OpenAI => "Codex",
+                crate::provider::Provider::OpenAIApi => "OpenAI",
+                crate::provider::Provider::OllamaCloud => "Ollama",
+                crate::provider::Provider::Groq => "Groq",
+                crate::provider::Provider::Mistral => "Mistral",
+                crate::provider::Provider::Together => "Together",
+                crate::provider::Provider::OpenRouter => "OpenRouter",
+                crate::provider::Provider::DeepSeek => "DeepSeek",
+                crate::provider::Provider::Fireworks => "Fireworks",
+                crate::provider::Provider::Gemini => "Gemini",
+                crate::provider::Provider::Local => "Local",
+            };
+            if let Some(entry) = counts.iter_mut().find(|(l, _)| l == label) {
+                entry.1 += 1;
+            } else {
+                counts.push((label.to_string(), 1));
+            }
+        }
+        let mut lines = vec!["accounts connected".to_string(), String::new()];
+        lines.extend(counts.iter().map(|(label, n)| {
+            let noun = if *n == 1 { "account" } else { "accounts" };
+            format!("{n} {label} {noun}")
+        }));
+        lines
+    };
+
+    let title = format!("shunt  v{}", env!("CARGO_PKG_VERSION"));
+    print_status_splash(&title, provider_lines);
+    println!();
+
+    let pinned_account = live
+        .as_ref()
+        .and_then(|v| v["pinned"].as_str())
+        .map(|s| s.to_owned());
+    let last_used_account = live
+        .as_ref()
+        .and_then(|v| v["last_used"].as_str())
+        .map(|s| s.to_owned());
+
+    // Pinned notice
+    if let Some(ref pinned) = pinned_account {
+        println!("  {}  pinned to {}", yellow(DIAMOND), bold(pinned));
+        println!(
+            "  {}  run {} to restore auto routing",
+            dim("·"),
+            cyan("shunt use auto")
+        );
+        println!();
+    }
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    for acc in &config.accounts {
+        let live_acc = live
+            .as_ref()
+            .and_then(|v| v["accounts"].as_array())
+            .and_then(|arr| arr.iter().find(|a| a["name"] == acc.name));
+
+        let status = live_acc
+            .and_then(|a| a["status"].as_str())
+            .unwrap_or("offline");
+
+        let (status_icon, status_text): (String, String) = match status {
+            "available" => (green(CHECK), green("available")),
+            "cooling" => (yellow("↻"), yellow("cooling")),
+            "disabled" => (red(CROSS), red("disabled")),
+            "reauth_required" => (red(CROSS), red("session expired")),
+            _ => {
+                use crate::provider::AuthKind;
+                match &acc.credential {
+                    // Local/None-auth providers don't need a credential — show offline, not error.
+                    None if acc.provider.auth_kind() == AuthKind::None => {
+                        (dim(EMPTY), dim("offline"))
+                    }
+                    None => (red(CROSS), red("no credential")),
+                    Some(c) if c.needs_refresh() => (yellow(CROSS), yellow("token expired")),
+                    _ => (dim(EMPTY), dim("offline")),
+                }
+            }
+        };
+
+        let plan_label: &str = match &acc.provider {
+            crate::provider::Provider::OpenAI => match acc.plan_type.to_lowercase().as_str() {
+                "plus" => "ChatGPT Plus [beta]",
+                "pro" => "ChatGPT Pro [beta]",
+                "team" => "ChatGPT Team [beta]",
+                _ => "ChatGPT [beta]",
+            },
+            crate::provider::Provider::Anthropic => match acc.plan_type.to_lowercase().as_str() {
+                "max" | "claude_max" => "Claude Max",
+                "team" => "Claude Team",
+                _ => "Claude Pro",
+            },
+            // API-key and Local providers don't have Claude plan tiers.
+            _ => "",
+        };
+        let email_str = acc
+            .credential
+            .as_ref()
+            .and_then(|c| c.email())
+            .unwrap_or("");
+
+        // ── routing tag ─────────────────────────────────────
+        let is_pinned = pinned_account.as_deref() == Some(&acc.name);
+        let is_last = !is_pinned && last_used_account.as_deref() == Some(&acc.name);
+        let (routing_tag, tag_vis_len): (String, usize) = if is_pinned {
+            (format!("  {}", yellow("pinned")), 8)
+        } else if is_last {
+            (format!("  {}", green("active")), 8)
+        } else {
+            (String::new(), 0)
+        };
+
+        // ── account header (name + tag + plan) ──────────────
+        println!(
+            "{}",
+            card_header(
+                &acc.name,
+                &green_bold(&acc.name),
+                &routing_tag,
+                tag_vis_len,
+                plan_label
+            )
+        );
+
+        // ── email + provider badge row ───────────────────────
+        let provider_label = match &acc.provider {
+            crate::provider::Provider::Anthropic => String::new(),
+            crate::provider::Provider::OpenAI => "chatgpt".to_string(),
+            p => p.to_string(),
+        };
+        let provider_badge = if provider_label.is_empty() {
+            String::new()
+        } else {
+            format!("  {}  {}", dim("·"), dim(&format!("[{provider_label}]")))
+        };
+        if !email_str.is_empty() {
+            println!(
+                "{}",
+                card_row(&format!("{}{}", dim(email_str), provider_badge))
+            );
+        } else if !provider_badge.is_empty() {
+            println!("{}", card_row(&dim(&format!("[{provider_label}]"))));
+        }
+
+        println!();
+
+        // ── status ───────────────────────────────────────────
+        println!("{}", card_row(&format!("{}  {}", status_icon, status_text)));
+
+        // ── rate limit bars ──────────────────────────────────
+        if let Some(rl) = live_acc.and_then(|a| a["rate_limit"].as_object()) {
+            let util_5h = rl.get("utilization_5h").and_then(|v| v.as_f64());
+            let reset_5h = rl.get("reset_5h").and_then(|v| v.as_u64());
+            let status_5h = rl
+                .get("status_5h")
+                .and_then(|v| v.as_str())
+                .unwrap_or("allowed");
+            let util_7d = rl.get("utilization_7d").and_then(|v| v.as_f64());
+            let reset_7d = rl.get("reset_7d").and_then(|v| v.as_u64());
+            let status_7d = rl
+                .get("status_7d")
+                .and_then(|v| v.as_str())
+                .unwrap_or("allowed");
+
+            let window_row = |label: &str, util: Option<f64>, reset: Option<u64>, wstatus: &str| {
+                if reset.map(|t| t <= now_secs).unwrap_or(false) {
+                    let ago = reset
+                        .map(|t| {
+                            format!(
+                                "  {} ago",
+                                term::fmt_duration_ms(now_secs.saturating_sub(t) * 1000)
+                            )
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "{}",
+                        card_row(&format!(
+                            "{}  {}  {}{}",
+                            dim(label),
+                            green(&"─".repeat(20)),
+                            green("fresh"),
+                            dim(&ago)
+                        ))
+                    );
+                } else if let Some(u) = util {
+                    let rem = 100u64.saturating_sub((u * 100.0) as u64);
+                    let bar = util_bar(u, 20);
+                    let reset_str = reset
+                        .and_then(secs_until)
+                        .map(|s| format!("  ·  resets in {}", term::fmt_duration_ms(s * 1000)))
+                        .unwrap_or_default();
+                    let pct = if wstatus == "exhausted" {
+                        red("exhausted")
+                    } else {
+                        format!("{}% left", bold(&rem.to_string()))
+                    };
+                    println!(
+                        "{}",
+                        card_row(&format!(
+                            "{}  {}  {}{}",
+                            dim(label),
+                            bar,
+                            pct,
+                            dim(&reset_str)
+                        ))
+                    );
+                }
+            };
+
+            if util_5h.is_some() || reset_5h.is_some() {
+                window_row("5h", util_5h, reset_5h, status_5h);
+            }
+            if util_7d.is_some() || reset_7d.is_some() {
+                window_row("7d", util_7d, reset_7d, status_7d);
+            }
+        } else if acc.credential.is_none()
+            && acc.provider.auth_kind() != crate::provider::AuthKind::None
+        {
+            println!(
+                "{}",
+                card_row(&format!(
+                    "{}  run {}",
+                    dim("·"),
+                    cyan(&format!("shunt add {}", acc.name))
+                ))
+            );
+        } else if status == "reauth_required" {
+            println!(
+                "{}",
+                card_row(&format!(
+                    "{}  run {}",
+                    dim("·"),
+                    cyan(&format!("shunt add {}", acc.name))
+                ))
+            );
+        } else if live.is_some() && live_acc.is_some() {
+            match &acc.provider {
+                crate::provider::Provider::Anthropic => println!(
+                    "{}",
+                    card_row(&dim("· quota data will appear after first request"))
+                ),
+                crate::provider::Provider::Local => {
+                    if acc.model.is_none() {
+                        println!(
+                            "{}",
+                            card_row(&dim(
+                                "· tip: set model = \"your-model\" in config for this account"
+                            ))
+                        );
+                    }
+                }
+                _ => println!(
+                    "{}",
+                    card_row(&dim(
+                        "· quota tracking unavailable (provider doesn't report utilization)"
+                    ))
+                ),
+            }
+        }
+
+        // ── separator ────────────────────────────────────────
+        println!();
+        println!("{}", card_sep());
+        println!();
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// use (pin account)
+// ---------------------------------------------------------------------------
+
+async fn cmd_use(
+    config_override: Option<PathBuf>,
+    pool: Option<&str>,
+    account: Option<String>,
+) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let prefix = pool.map(|p| format!("/pools/{p}")).unwrap_or_default();
+    let use_url = format!(
+        "http://{}:{}{prefix}/use",
+        config.server.host, config.server.control_port
+    );
+
+    // Fetch live state for utilization info
+    let live: Option<serde_json::Value> = reqwest::get(&format!(
+        "http://{}:{}{prefix}/status",
+        config.server.host, config.server.control_port
+    ))
+    .await
+    .ok()
+    .and_then(futures_executor_hack);
+
+    let current_pinned = live
+        .as_ref()
+        .and_then(|v| v["pinned_account"].as_str())
+        .map(|s| s.to_owned());
+
+    // Build menu items
+    let pool_accounts: Vec<_> = config
+        .accounts
+        .iter()
+        .filter(|a| match pool {
+            Some("claude") => matches!(
+                a.provider,
+                crate::provider::Provider::Anthropic | crate::provider::Provider::AnthropicApi
+            ),
+            Some("codex") => matches!(
+                a.provider,
+                crate::provider::Provider::OpenAI | crate::provider::Provider::OpenAIApi
+            ),
+            _ => true,
+        })
+        .collect();
+    let mut items: Vec<term::SelectItem> = pool_accounts
+        .into_iter()
+        .map(|a| {
+            let live_acc = live
+                .as_ref()
+                .and_then(|v| v["accounts"].as_array())
+                .and_then(|arr| arr.iter().find(|x| x["name"] == a.name));
+
+            let status = live_acc
+                .and_then(|x| x["status"].as_str())
+                .unwrap_or("offline");
+            let util = live_acc.and_then(|x| x["rate_limit"]["utilization_5h"].as_f64());
+            let is_pinned = current_pinned.as_deref() == Some(&a.name);
+
+            let status_str = match status {
+                "reauth_required" => red("session expired"),
+                "disabled" => red("disabled"),
+                "cooling" => yellow("cooling"),
+                "available" => match util {
+                    Some(u) => {
+                        let rem = 100u64.saturating_sub((u * 100.0) as u64);
+                        green(&format!("{}% remaining", rem))
+                    }
+                    None => dim("fresh").to_string(),
+                },
+                _ => dim("offline").to_string(),
+            };
+
+            let email = a.credential.as_ref().and_then(|c| c.email()).unwrap_or("");
+            let pin = if is_pinned {
+                format!("  {}", yellow("pinned"))
+            } else {
+                String::new()
+            };
+
+            term::SelectItem {
+                label: format!(
+                    "{}  {}  {}{}",
+                    bold(&pad(&a.name, 12)),
+                    dim(&pad(email, 32)),
+                    status_str,
+                    pin
+                ),
+                value: a.name.clone(),
+            }
+        })
+        .collect();
+
+    let auto_marker = if current_pinned.is_none() {
+        format!("  {}", yellow("active"))
+    } else {
+        String::new()
+    };
+    items.push(term::SelectItem {
+        label: format!(
+            "{}  {}{}",
+            bold(&pad("auto", 12)),
+            dim("least-utilization routing"),
+            auto_marker
+        ),
+        value: "auto".to_owned(),
+    });
+
+    // Determine initial cursor position (current pinned account or auto)
+    let initial = current_pinned
+        .as_ref()
+        .and_then(|p| items.iter().position(|it| &it.value == p))
+        .unwrap_or(items.len() - 1);
+
+    // If account name was given directly, skip the picker
+    let mut chosen = if let Some(name) = account {
+        name
+    } else {
+        match term::select("Route traffic to:", &items, initial) {
+            Some(v) => v,
+            None => return Ok(()), // cancelled
+        }
+    };
+    if chosen != "auto" && !chosen.contains('/') {
+        if let Some(pool) = pool {
+            chosen = format!("{pool}/{chosen}");
+        }
+    }
+
+    // Validate
+    let is_auto = chosen == "auto";
+    if !is_auto && !config.accounts.iter().any(|a| a.name == chosen) {
+        let names: Vec<_> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        anyhow::bail!(
+            "Unknown account '{}'. Available: {}",
+            chosen,
+            names.join(", ")
+        );
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&use_url)
+        .json(&serde_json::json!({ "account": chosen }))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            if is_auto {
+                println!("  {} Automatic routing restored", green(CHECK));
+            } else {
+                println!(
+                    "  {} Pinned to {}  ·  {}",
+                    green(CHECK),
+                    bold(&chosen),
+                    dim("shunt use auto to restore")
+                );
+            }
+            println!();
+        }
+        Ok(r) => {
+            let body = r.text().await.unwrap_or_default();
+            anyhow::bail!("Proxy returned error: {body}");
+        }
+        Err(_) => {
+            // Proxy not running — persist directly to the state file so it
+            // takes effect when the proxy next starts.
+            write_pinned_to_state(pool, if is_auto { None } else { Some(chosen.clone()) });
+            if is_auto {
+                println!(
+                    "  {} Automatic routing saved  ·  {}",
+                    green(CHECK),
+                    dim("applies on next shunt start")
+                );
+            } else {
+                println!(
+                    "  {} Pinned to {}  ·  {}",
+                    green(CHECK),
+                    bold(&chosen),
+                    dim("applies on next shunt start")
+                );
+            }
+            println!();
+        }
+    }
+    Ok(())
+}
+
+/// Write a pinned account directly into the state file (used when proxy is not running).
+fn write_pinned_to_state(pool: Option<&str>, account: Option<String>) {
+    let path = crate::config::state_path();
+    let mut data: serde_json::Value = path
+        .exists()
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let value = match account {
+        Some(a) => serde_json::Value::String(a),
+        None => serde_json::Value::Null,
+    };
+    if matches!(pool, None | Some("claude")) {
+        data["pinned_account"] = value;
+    } else if let Some(pool) = pool {
+        data["pinned_by_pool"][pool] = value;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("tmp");
+    if let Ok(text) = serde_json::to_string_pretty(&data) {
+        let _ = std::fs::write(&tmp, text);
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+async fn cmd_model(
+    config_override: Option<PathBuf>,
+    pool: Option<&str>,
+    action: Option<ModelAction>,
+) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let prefix = pool.map(|p| format!("/pools/{p}")).unwrap_or_default();
+    let model_url = format!(
+        "http://{}:{}{prefix}/model",
+        config.server.host, config.server.control_port
+    );
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            // Show current override
+            let resp = client.get(&model_url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    match v["model"].as_str() {
+                        Some(m) => println!(
+                            "  {} Model override: {}  ·  {}",
+                            green(CHECK),
+                            bold(m),
+                            dim("shunt model clear to restore")
+                        ),
+                        None => println!(
+                            "  {} No model override  ·  {}",
+                            dim(DOT),
+                            dim("clients choose their own model")
+                        ),
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(ModelAction::Set { model }) => {
+            let resp = client
+                .post(&model_url)
+                .json(&serde_json::json!({ "model": model }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!(
+                        "  {} Model override set: {}  ·  {}",
+                        green(CHECK),
+                        bold(&model),
+                        dim("shunt model clear to restore")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(ModelAction::Clear) => {
+            let resp = client.delete(&model_url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!(
+                        "  {} Model override cleared  ·  {}",
+                        green(CHECK),
+                        dim("clients now choose their own model")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_strategy(
+    config_override: Option<PathBuf>,
+    pool: Option<&str>,
+    action: Option<StrategyAction>,
+) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let prefix = pool.map(|p| format!("/pools/{p}")).unwrap_or_default();
+    let strategy_url = format!(
+        "http://{}:{}{prefix}/strategy",
+        config.server.host, config.server.control_port
+    );
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            // Show current strategy + source
+            let resp = client.get(&strategy_url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let strategy = v["strategy"].as_str().unwrap_or("unknown");
+                    let source = v["source"].as_str().unwrap_or("unknown");
+                    if source == "override" {
+                        println!(
+                            "  {} Routing strategy: {}  ·  {}  ·  {}",
+                            green(CHECK),
+                            bold(strategy),
+                            dim("runtime override"),
+                            dim("shunt strategy clear to restore")
+                        );
+                    } else {
+                        println!(
+                            "  {} Routing strategy: {}  ·  {}",
+                            dim(DOT),
+                            bold(strategy),
+                            dim("from config")
+                        );
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(StrategyAction::Set { strategy }) => {
+            // Validate client-side so a typo gets an actionable message instead of a
+            // raw proxy error (or a silent no-op).
+            const VALID: &[&str] = &["maximus", "reaper", "carousel", "cushion"];
+            if !VALID.contains(&strategy.as_str()) {
+                anyhow::bail!(
+                    "Unknown strategy '{strategy}'. Valid: {}.",
+                    VALID.join(", ")
+                );
+            }
+            let resp = client
+                .post(&strategy_url)
+                .json(&serde_json::json!({ "strategy": strategy }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!(
+                        "  {} Routing strategy set: {}  ·  {}",
+                        green(CHECK),
+                        bold(&strategy),
+                        dim("shunt strategy clear to restore")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(StrategyAction::Clear) => {
+            let resp = client.delete(&strategy_url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let strategy = v["strategy"].as_str().unwrap_or("unknown");
+                    println!(
+                        "  {} Strategy override cleared  ·  {}  ·  {}",
+                        green(CHECK),
+                        bold(strategy),
+                        dim("from config")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_burst_limit(
+    config_override: Option<PathBuf>,
+    action: Option<BurstLimitAction>,
+) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let url = format!(
+        "http://{}:{}/burst-limit",
+        config.server.host, config.server.control_port
+    );
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            let resp = client.get(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let limit = v["burst_rpm_limit"].as_u64().unwrap_or(0);
+                    let source = v["source"].as_str().unwrap_or("unknown");
+                    let display = if limit == 0 {
+                        "off".to_owned()
+                    } else {
+                        format!("{limit}/min")
+                    };
+                    if source == "override" {
+                        println!(
+                            "  {} Burst limit: {}  ·  {}  ·  {}",
+                            green(CHECK),
+                            bold(&display),
+                            dim("runtime override"),
+                            dim("shunt burst-limit clear to restore")
+                        );
+                    } else {
+                        println!(
+                            "  {} Burst limit: {}  ·  {}",
+                            dim(DOT),
+                            bold(&display),
+                            dim(&format!("from {source}"))
+                        );
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(BurstLimitAction::Set { limit }) => {
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({ "burst_rpm_limit": limit }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let display = if limit == 0 {
+                        "off".to_owned()
+                    } else {
+                        format!("{limit}/min")
+                    };
+                    println!(
+                        "  {} Burst limit set: {}  ·  {}",
+                        green(CHECK),
+                        bold(&display),
+                        dim("shunt burst-limit clear to restore")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(BurstLimitAction::Clear) => {
+            let resp = client.delete(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let limit = v["burst_rpm_limit"].as_u64().unwrap_or(0);
+                    let display = if limit == 0 {
+                        "off".to_owned()
+                    } else {
+                        format!("{limit}/min")
+                    };
+                    println!(
+                        "  {} Burst limit override cleared  ·  {}  ·  {}",
+                        green(CHECK),
+                        bold(&display),
+                        dim("from default")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_fallback(
+    config_override: Option<PathBuf>,
+    action: Option<FallbackAction>,
+) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let url = format!(
+        "http://{}:{}/fallback",
+        config.server.host, config.server.control_port
+    );
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            let resp = client.get(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let source = v["source"].as_str().unwrap_or("unknown");
+                    let disabled = v.get("disabled").and_then(|d| d.as_bool()).unwrap_or(false);
+                    if disabled {
+                        println!(
+                            "  {} Fallback: {}  ·  {}",
+                            dim(DOT),
+                            bold("disabled"),
+                            dim("shunt fallback clear to restore")
+                        );
+                    } else {
+                        let model = v["fallback_model"].as_str().unwrap_or("none");
+                        if source == "override" {
+                            println!(
+                                "  {} Fallback: {}  ·  {}  ·  {}",
+                                green(CHECK),
+                                bold(model),
+                                dim("runtime override"),
+                                dim("shunt fallback clear to restore")
+                            );
+                        } else {
+                            println!(
+                                "  {} Fallback: {}  ·  {}",
+                                dim(DOT),
+                                bold(model),
+                                dim(&format!("from {source}"))
+                            );
+                        }
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(FallbackAction::Set { model }) => {
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({ "fallback_model": model }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!(
+                        "  {} Fallback model set: {}  ·  {}",
+                        green(CHECK),
+                        bold(&model),
+                        dim("shunt fallback clear to restore")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(FallbackAction::Off) => {
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({ "fallback_model": null }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!(
+                        "  {} Fallback disabled  ·  {}",
+                        green(CHECK),
+                        dim("shunt fallback clear to restore")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(FallbackAction::Clear) => {
+            let resp = client.delete(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let source = v["source"].as_str().unwrap_or("auto");
+                    let model = v["fallback_model"].as_str().unwrap_or("auto");
+                    println!(
+                        "  {} Fallback override cleared  ·  {}  ·  {}",
+                        green(CHECK),
+                        bold(model),
+                        dim(&format!("from {source}"))
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_effort(config_override: Option<PathBuf>, action: Option<EffortAction>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let url = format!(
+        "http://{}:{}/effort",
+        config.server.host, config.server.control_port
+    );
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            let resp = client.get(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let source = v["source"].as_str().unwrap_or("unknown");
+                    if source == "override" {
+                        let effort = v["effort"].as_str().unwrap_or("high");
+                        println!(
+                            "  {} Effort: {}  ·  {}  ·  {}",
+                            green(CHECK),
+                            bold(effort),
+                            dim("runtime override"),
+                            dim("shunt effort clear to restore")
+                        );
+                    } else {
+                        println!(
+                            "  {} Effort: {}  ·  {}",
+                            dim(DOT),
+                            bold("passthrough"),
+                            dim("client requests unmodified")
+                        );
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(EffortAction::Set { level }) => {
+            const VALID: &[&str] = &["low", "medium", "high", "max"];
+            if !VALID.contains(&level.as_str()) {
+                anyhow::bail!("Unknown effort '{level}'. Valid: {}.", VALID.join(", "));
+            }
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({ "effort": level }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!(
+                        "  {} Effort set: {}  ·  {}",
+                        green(CHECK),
+                        bold(&level),
+                        dim("shunt effort clear to restore")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(EffortAction::Clear) => {
+            let resp = client.delete(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!(
+                        "  {} Effort override cleared  ·  {}",
+                        green(CHECK),
+                        dim("passthrough restored")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_thinking(
+    config_override: Option<PathBuf>,
+    action: Option<ThinkingAction>,
+) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let url = format!(
+        "http://{}:{}/thinking",
+        config.server.host, config.server.control_port
+    );
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            let resp = client.get(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    let source = v["source"].as_str().unwrap_or("unknown");
+                    if source == "override" {
+                        let mode = v["thinking"].as_str().unwrap_or("adaptive");
+                        let display = if mode == "disabled" { "off" } else { mode };
+                        println!(
+                            "  {} Thinking: {}  ·  {}  ·  {}",
+                            green(CHECK),
+                            bold(display),
+                            dim("runtime override"),
+                            dim("shunt thinking clear to restore")
+                        );
+                    } else {
+                        println!(
+                            "  {} Thinking: {}  ·  {}",
+                            dim(DOT),
+                            bold("passthrough"),
+                            dim("client requests unmodified")
+                        );
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(ThinkingAction::Set { mode }) => {
+            const VALID: &[&str] = &["adaptive", "disabled", "off"];
+            if !VALID.contains(&mode.as_str()) {
+                anyhow::bail!("Unknown thinking mode '{mode}'. Valid: adaptive, off.");
+            }
+            let api_mode = if mode == "off" { "disabled" } else { &mode };
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({ "thinking": api_mode }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!(
+                        "  {} Thinking set: {}  ·  {}",
+                        green(CHECK),
+                        bold(&mode),
+                        dim("shunt thinking clear to restore")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(ThinkingAction::Clear) => {
+            let resp = client.delete(&url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!(
+                        "  {} Thinking override cleared  ·  {}",
+                        green(CHECK),
+                        dim("passthrough restored")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_alerts(config_override: Option<PathBuf>, action: Option<AlertsAction>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    let alerts_url = format!(
+        "http://{}:{}/alerts",
+        config.server.host, config.server.control_port
+    );
+    let client = reqwest::Client::new();
+
+    match action {
+        None => {
+            let resp = client.get(&alerts_url).send().await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: serde_json::Value = r.json().await.unwrap_or_default();
+                    if v["muted"].as_bool().unwrap_or(false) {
+                        println!(
+                            "  {} Alerts muted  ·  {}",
+                            yellow("!"),
+                            dim("shunt alerts unmute to re-enable")
+                        );
+                    } else {
+                        println!(
+                            "  {} Alerts active  ·  {}",
+                            green(CHECK),
+                            dim("shunt alerts mute to suppress")
+                        );
+                    }
+                }
+                _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(AlertsAction::Mute) => {
+            let resp = client
+                .post(&alerts_url)
+                .json(&serde_json::json!({ "muted": true }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!(
+                        "  {} Alerts muted  ·  {}",
+                        yellow("!"),
+                        dim("shunt alerts unmute to re-enable")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+        Some(AlertsAction::Unmute) => {
+            let resp = client
+                .post(&alerts_url)
+                .json(&serde_json::json!({ "muted": false }))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!(
+                        "  {} Alerts active  ·  {}",
+                        green(CHECK),
+                        dim("notifications re-enabled")
+                    );
+                }
+                Ok(r) => {
+                    let body = r.text().await.unwrap_or_default();
+                    anyhow::bail!("Proxy returned error: {body}");
+                }
+                Err(_) => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+            }
+        }
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_savings(config_override: Option<PathBuf>) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())?;
+    if config.server.telemetry {
+        tokio::spawn(crate::telemetry::track_cli_feature("savings"));
+    }
+    let url = format!(
+        "http://{}:{}/status",
+        config.server.host, config.server.control_port
+    );
+
+    let v: serde_json::Value = match reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+        _ => anyhow::bail!("Proxy is not running. Start with `shunt start`."),
+    };
+
+    let s = &v["savings"];
+    let today_usd = s["today_cost_usd"].as_f64().unwrap_or(0.0);
+    let week_usd = s["week_cost_usd"].as_f64().unwrap_or(0.0);
+    let alltime_usd = s["all_time_cost_usd"].as_f64().unwrap_or(0.0);
+    let today_in = s["today_input"].as_u64().unwrap_or(0);
+    let today_out = s["today_output"].as_u64().unwrap_or(0);
+    let week_in = s["week_input"].as_u64().unwrap_or(0);
+    let week_out = s["week_output"].as_u64().unwrap_or(0);
+    let all_in = s["all_time_input"].as_u64().unwrap_or(0);
+    let all_out = s["all_time_output"].as_u64().unwrap_or(0);
+
+    fn fmt_tok(n: u64) -> String {
+        if n >= 1_000_000 {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        } else if n >= 1_000 {
+            format!("{:.1}K", n as f64 / 1_000.0)
+        } else {
+            n.to_string()
+        }
+    }
+
+    println!();
+    if alltime_usd > 0.001 {
+        println!(
+            "  {} shunt has saved you {}  ·  {}",
+            green(CHECK),
+            bold(&crate::pricing::fmt_cost(alltime_usd)),
+            dim("vs public Claude API at list prices")
+        );
+    } else {
+        println!(
+            "  {} {}  ·  {}",
+            dim(DOT),
+            bold("no savings tracked yet"),
+            dim("make some requests and come back")
+        );
+    }
+    println!();
+    println!(
+        "  {:<18} {}  {}",
+        dim("today"),
+        crate::pricing::fmt_cost(today_usd),
+        dim(&format!(
+            "{}in · {}out",
+            fmt_tok(today_in),
+            fmt_tok(today_out)
+        ))
+    );
+    println!(
+        "  {:<18} {}  {}",
+        dim("this week"),
+        crate::pricing::fmt_cost(week_usd),
+        dim(&format!(
+            "{}in · {}out",
+            fmt_tok(week_in),
+            fmt_tok(week_out)
+        ))
+    );
+    println!(
+        "  {:<18} {}  {}",
+        dim("all time"),
+        bold(&crate::pricing::fmt_cost(alltime_usd)),
+        dim(&format!("{}in · {}out", fmt_tok(all_in), fmt_tok(all_out)))
+    );
+    println!();
+    Ok(())
+}
+
+/// Synchronously awaits a reqwest response to get its JSON.
+fn futures_executor_hack(resp: reqwest::Response) -> Option<serde_json::Value> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(async { resp.json::<serde_json::Value>().await.ok() })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Circuit shunt symbol: rectangle with wires extending left/right from the mid row,
+/// and two legs going down from the bottom.
+///
+///   ·  ██████  ·
+///   ███      ███   ← wire row (middle of box)
+///   ·  ██████  ·
+///   ·    █ █   ·   ← legs
+fn build_logo_lines(h: usize, w: usize) -> Vec<String> {
+    if h == 0 || w < 5 {
+        return vec![];
+    }
+
+    let box_l = w / 4;
+    let box_r = w - w / 4; // exclusive
+    let leg_h = (h / 4).max(1);
+    let box_h = h.saturating_sub(leg_h).max(2); // at least top + bottom row
+    let wire_row = box_h / 2; // wire connects at vertical mid of box
+
+    // Mirror from each side so legs are symmetric around centre.
+    let leg1 = w / 3;
+    let leg2 = w - w / 3 - 1;
+
+    let mut out = Vec::new();
+    for row in 0..h {
+        let mut r = vec![' '; w];
+        if row < box_h {
+            let is_top = row == 0;
+            let is_bot = row == box_h - 1;
+            if is_top || is_bot {
+                for j in box_l..box_r {
+                    r[j] = '█';
+                }
+            } else {
+                r[box_l] = '█';
+                r[box_r - 1] = '█';
+            }
+            if row == wire_row {
+                for j in 0..box_l {
+                    r[j] = '█';
+                }
+                for j in box_r..w {
+                    r[j] = '█';
+                }
+            }
+        } else {
+            if leg1 < w {
+                r[leg1] = '█';
+            }
+            if leg2 < w {
+                r[leg2] = '█';
+            }
+        }
+        out.push(r.into_iter().collect());
+    }
+    out
+}
+
+fn render_splash_frame(
+    f: &mut ratatui::Frame,
+    title_raw: &str,
+    subtitle_raw: &str,
+    right_lines: &[String],
+) {
+    use ratatui::{
+        layout::{Constraint, Direction, Layout},
+        style::{Color, Style},
+        text::Line,
+        widgets::{Block, Borders, Paragraph},
+    };
+
+    let brand = Color::Indexed(154); // #afd700 bright lime-green
+    let dim_col = Color::Indexed(240); // #585858 gray
+    let dk_green = Color::Indexed(28); // #008700 dark green
+
+    // Fixed-width box — does not stretch to fill the terminal.
+    const BOX_W: u16 = 70;
+    let full = f.area();
+    let area = Layout::new(
+        Direction::Horizontal,
+        [
+            Constraint::Length(BOX_W.min(full.width)),
+            Constraint::Fill(1),
+        ],
+    )
+    .split(full)[0];
+
+    // Outer bordered box.
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(dk_green))
+        .title(Line::styled(
+            format!(" {title_raw} "),
+            Style::default().fg(brand),
+        ));
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    const CONTENT_H: u16 = 4;
+    const LOGO_W: u16 = 10;
+
+    // Main horizontal split: left half | separator | right half
+    let cols = Layout::new(
+        Direction::Horizontal,
+        [
+            Constraint::Fill(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ],
+    )
+    .split(inner);
+    let (left_area, sep_area, right_area) = (cols[0], cols[1], cols[2]);
+
+    // Left: vertical centering around the content row.
+    let has_sub = !subtitle_raw.is_empty();
+    let left_v_constraints: Vec<Constraint> = if has_sub {
+        vec![
+            Constraint::Fill(1),
+            Constraint::Length(CONTENT_H),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![
+            Constraint::Fill(1),
+            Constraint::Length(CONTENT_H),
+            Constraint::Fill(1),
+        ]
+    };
+    let left_v = Layout::new(Direction::Vertical, left_v_constraints).split(left_area);
+    let content_row = left_v[1];
+
+    // Left content: logo centered horizontally within the left half
+    let h = Layout::new(
+        Direction::Horizontal,
+        [
+            Constraint::Fill(1),
+            Constraint::Length(LOGO_W),
+            Constraint::Fill(1),
+        ],
+    )
+    .split(content_row);
+
+    let logo = build_logo_lines(CONTENT_H as usize, LOGO_W as usize);
+    f.render_widget(
+        Paragraph::new(
+            logo.into_iter()
+                .map(|l| Line::styled(l, Style::default().fg(brand)))
+                .collect::<Vec<_>>(),
+        ),
+        h[1],
+    );
+
+    if has_sub {
+        f.render_widget(
+            Paragraph::new(subtitle_raw).style(Style::default().fg(dim_col)),
+            left_v[3],
+        );
+    }
+
+    // Vertical separator spanning full inner height.
+    let sep_lines: Vec<Line> = (0..sep_area.height)
+        .map(|_| Line::styled("│", Style::default().fg(dk_green)))
+        .collect();
+    f.render_widget(Paragraph::new(sep_lines), sep_area);
+
+    // Right: custom lines (center-aligned) or static description (right-aligned).
+    let static_desc: Vec<String> = vec![
+        "Pool multiple AI coding agent".into(),
+        "accounts behind a single endpoint.".into(),
+        "Maximise rate limits across".into(),
+        "all accounts automatically.".into(),
+    ];
+    let (desc_lines, alignment) = if right_lines.is_empty() {
+        (static_desc.as_slice(), ratatui::layout::Alignment::Center)
+    } else {
+        (right_lines, ratatui::layout::Alignment::Center)
+    };
+    let desc: Vec<Line> = desc_lines
+        .iter()
+        .map(|s| Line::styled(s.clone(), Style::default().fg(dim_col)))
+        .collect();
+    let desc_h = desc.len() as u16;
+    // 1-col left spacer so text doesn't touch the separator.
+    let right_inner = Layout::new(
+        Direction::Horizontal,
+        [Constraint::Length(1), Constraint::Fill(1)],
+    )
+    .split(right_area)[1];
+    let right_v = Layout::new(
+        Direction::Vertical,
+        [
+            Constraint::Fill(1),
+            Constraint::Length(desc_h),
+            Constraint::Fill(1),
+        ],
+    )
+    .split(right_inner);
+    f.render_widget(Paragraph::new(desc).alignment(alignment), right_v[1]);
+}
+
+/// Print the splash using ratatui inline viewport — redraws live on resize.
+fn print_splash(info: &[String]) {
+    use crossterm::{
+        event::{self, Event},
+        terminal as cterm,
+    };
+    use ratatui::{backend::CrosstermBackend, Terminal, TerminalOptions, Viewport};
+    use std::io::stdout;
+
+    let title_raw = info.first().map(|s| strip_ansi(s)).unwrap_or_default();
+    let subtitle_raw = info.get(1).map(|s| strip_ansi(s)).unwrap_or_default();
+
+    // Logo = 4 rows content + 2 border + 2 vertical padding + optional subtitle
+    let splash_h: u16 = 4 + 2 + 2 + if subtitle_raw.is_empty() { 0 } else { 1 };
+
+    let mut terminal = match Terminal::with_options(
+        CrosstermBackend::new(stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(splash_h),
+        },
+    ) {
+        Ok(t) => t,
+        Err(_) => {
+            // Fallback: plain text header if ratatui fails (e.g. non-TTY).
+            println!("\n  ◆  {}  {}\n", title_raw.trim(), subtitle_raw);
+            return;
+        }
+    };
+
+    let draw = |t: &mut Terminal<CrosstermBackend<std::io::Stdout>>| {
+        t.draw(|f| render_splash_frame(f, &title_raw, &subtitle_raw, &[]))
+            .ok();
+    };
+
+    draw(&mut terminal);
+
+    // Redraw on resize for up to 500 ms.
+    let _ = cterm::enable_raw_mode();
+    let dl = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let rem = dl.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        if event::poll(rem).unwrap_or(false) {
+            match event::read() {
+                Ok(Event::Resize(_, _)) => draw(&mut terminal),
+                _ => break,
+            }
+        } else {
+            break;
+        }
+    }
+    let _ = cterm::disable_raw_mode();
+    let _ = terminal.show_cursor();
+    // Ratatui leaves the cursor at the end of the inline viewport's last line.
+    // \r resets to column 0 before \n moves down, so subsequent output is left-aligned.
+    print!("\r\n");
+}
+
+/// Like print_splash but with custom right-side lines (used by cmd_status).
+///
+/// Plain println-based box drawing — no ratatui/crossterm terminal state so
+/// subsequent output is always left-aligned.
+fn print_status_splash(title: &str, right_lines: Vec<String>) {
+    use crate::term::{brand_green, dark_green, dim};
+
+    const BOX_W: usize = 70; // visible width of the box (excluding indent)
+    const LOGO_W: usize = 10;
+    const CONTENT_H: usize = 4;
+
+    let splash_h = (right_lines.len() + 4).max(8);
+    let inner_h = splash_h - 2; // rows inside (between borders)
+    let left_w = (BOX_W - 3) / 2; // left panel visible width  (33)
+    let right_w = BOX_W - 3 - left_w; // right panel visible width (34)
+
+    // ── top border ──────────────────────────────────────────────────────
+    let title_part = format!(" {title} ");
+    let fill = BOX_W.saturating_sub(4 + title_part.len());
+    print!("  {}", dark_green("┌─"));
+    print!("{}", brand_green(&title_part));
+    println!("{}", dark_green(&format!("{}─┐", "─".repeat(fill))));
+
+    // ── content rows ────────────────────────────────────────────────────
+    let logo = build_logo_lines(CONTENT_H, LOGO_W);
+    let logo_top = inner_h.saturating_sub(CONTENT_H) / 2;
+    let right_top = inner_h.saturating_sub(right_lines.len()) / 2;
+    let logo_lpad = left_w.saturating_sub(LOGO_W) / 2;
+
+    for row in 0..inner_h {
+        // Left panel: logo centered vertically and horizontally
+        let left_content: String = if row >= logo_top && row < logo_top + CONTENT_H {
+            let lrow = logo.get(row - logo_top).map(|s| s.as_str()).unwrap_or("");
+            let right_pad = left_w.saturating_sub(logo_lpad + LOGO_W);
+            format!(
+                "{}{}{}",
+                " ".repeat(logo_lpad),
+                brand_green(lrow),
+                " ".repeat(right_pad)
+            )
+        } else {
+            " ".repeat(left_w)
+        };
+
+        // Right panel: lines centered vertically, left-aligned with padding
+        let right_content: String = if row >= right_top && row < right_top + right_lines.len() {
+            let rline = &right_lines[row - right_top];
+            let lpad = right_w.saturating_sub(rline.len()) / 2;
+            let rpad = right_w.saturating_sub(lpad.saturating_add(rline.len()));
+            format!("{}{}{}", " ".repeat(lpad), dim(rline), " ".repeat(rpad))
+        } else {
+            " ".repeat(right_w)
+        };
+
+        print!("  {}", dark_green("│"));
+        print!("{left_content}");
+        print!("{}", dark_green("│"));
+        print!("{right_content}");
+        println!("{}", dark_green("│"));
+    }
+
+    // ── bottom border ───────────────────────────────────────────────────
+    println!("  {}", dark_green(&format!("└{}┘", "─".repeat(BOX_W - 2))));
+}
+
+// ---------------------------------------------------------------------------
+// Account card helpers  (used by cmd_status)
+// ---------------------------------------------------------------------------
+
+/// Target visible width for account header lines and separators.
+const CARD_W: usize = 58;
+
+/// Account header: "  ◆  name  tag                     Plan"
+fn card_header(name: &str, name_c: &str, routing_tag: &str, tag_vis: usize, plan: &str) -> String {
+    // Visible prefix: "  ◆  " = 5, then name (name.len()), then tag (tag_vis)
+    let left_vis = 5 + name.len() + tag_vis;
+    let gap = CARD_W.saturating_sub(left_vis + plan.len());
+    format!(
+        "  {}  {}{}{}{}",
+        brand_green(DIAMOND),
+        name_c,
+        routing_tag,
+        " ".repeat(gap),
+        dim(plan)
+    )
+}
+
+/// An indented content row: "    content"
+fn card_row(content: &str) -> String {
+    format!("    {content}")
+}
+
+/// Thin separator line between accounts.
+fn card_sep() -> String {
+    format!("  {}", dim(&"─".repeat(CARD_W - 2)))
+}
+
+/// Routing diagram — account names in bold green, connectors in dark green.
+///
+/// 1 account:           2 accounts:          3+ accounts:
+///   main  ─→  [info]    main ─┐ →  [info]    main ─┐
+///             [info1]   work ─┘     [info1]   work ─┼─→  [info]
+///                                             sec  ─┘     [info1]
+fn print_routing_header(account_names: &[&str], info: &[String]) {
+    println!();
+    let n = account_names.len();
+    let name_w = account_names.iter().map(|s| s.len()).max().unwrap_or(4);
+    let info0 = info.first().map(|s| s.as_str()).unwrap_or("");
+    let info1 = info.get(1).map(|s| s.as_str()).unwrap_or("");
+
+    match n {
+        0 => {
+            // No accounts yet — clean two-line header
+            println!("  {}  {}", brand_green(DIAMOND), info0);
+            if !info1.is_empty() {
+                println!("       {}", info1);
+            }
+        }
+        1 => {
+            // "  name  ─→  info0"  (info1 indented to same column)
+            let indent = name_w + 8; // 2 + name + 2 + "─→" + 2
+            println!(
+                "  {}  {}  {}",
+                green_bold(account_names[0]),
+                dark_green("─→"),
+                info0
+            );
+            if !info1.is_empty() {
+                println!("  {}{}", " ".repeat(indent), info1);
+            }
+        }
+        2 => {
+            // "  name0 ─┐ →  info0"
+            // "  name1 ─┘     info1"
+            println!(
+                "  {}  {} {}  {}",
+                green_bold(&pad(account_names[0], name_w)),
+                dark_green("─┐"),
+                dark_green("→"),
+                info0
+            );
+            println!(
+                "  {}  {}    {}",
+                green_bold(&pad(account_names[1], name_w)),
+                dark_green("─┘"),
+                info1
+            );
+        }
+        3 => {
+            // "  name0 ─┐"
+            // "  name1 ─┼─→  info0"
+            // "  name2 ─┘     info1"
+            println!(
+                "  {}  {}",
+                green_bold(&pad(account_names[0], name_w)),
+                dark_green("─┐")
+            );
+            println!(
+                "  {}  {}  {}",
+                green_bold(&pad(account_names[1], name_w)),
+                dark_green("─┼─→"),
+                info0
+            );
+            println!(
+                "  {}  {}    {}",
+                green_bold(&pad(account_names[2], name_w)),
+                dark_green("─┘"),
+                info1
+            );
+        }
+        _ => {
+            // "  name0      ─┐"
+            // "  + N more   ─┼─→  info0"
+            // "  nameN      ─┘     info1"
+            let more = dim(&pad(&format!("+ {} more", n - 2), name_w));
+            println!(
+                "  {}  {}",
+                green_bold(&pad(account_names[0], name_w)),
+                dark_green("─┐")
+            );
+            println!("  {}  {}  {}", more, dark_green("─┼─→"), info0);
+            println!(
+                "  {}  {}    {}",
+                green_bold(&pad(account_names[n - 1], name_w)),
+                dark_green("─┘"),
+                info1
+            );
+        }
+    }
+
+    println!();
+}
+
+/// Capacity bar — `util` is 0.0–1.0; filled blocks show REMAINING capacity.
+/// Green = plenty left, yellow = getting low, red = nearly exhausted.
+fn util_bar(util: f64, width: usize) -> String {
+    let used = (util.clamp(0.0, 1.0) * width as f64).round() as usize;
+    let free = width.saturating_sub(used);
+    // filled = remaining, empty = used — so a full bar means lots of quota left
+    let bar = format!("{}{}", "█".repeat(free), "░".repeat(used));
+    let pct = (util * 100.0) as u64;
+    if pct < 50 {
+        green(&bar)
+    } else if pct < 80 {
+        yellow(&bar)
+    } else {
+        red(&bar)
+    }
+}
+
+/// Seconds until a Unix-epoch reset timestamp. Returns None if past or zero.
+fn secs_until(epoch_secs: u64) -> Option<u64> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    epoch_secs.checked_sub(now).filter(|&s| s > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-provider listener helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `(provider_label, url)` pairs for every provider present in accounts,
+/// using `primary_port` for Anthropic and each provider's default port for others.
+fn listener_addrs(config: &crate::config::Config, host: &str) -> Vec<(String, String)> {
+    use crate::provider::Provider;
+    use std::collections::BTreeSet;
+    let mut out = Vec::new();
+    if config
+        .accounts
+        .iter()
+        .any(|a| matches!(a.provider, Provider::Anthropic | Provider::AnthropicApi))
+    {
+        out.push((
+            "claude".into(),
+            format!("http://{host}:{}", config.pools.claude.port),
+        ));
+    }
+    if config
+        .accounts
+        .iter()
+        .any(|a| matches!(a.provider, Provider::OpenAI | Provider::OpenAIApi))
+    {
+        out.push((
+            "codex".into(),
+            format!("http://{host}:{}", config.pools.codex.port),
+        ));
+    }
+    let providers: BTreeSet<String> = config
+        .accounts
+        .iter()
+        .filter(|a| {
+            !matches!(
+                a.provider,
+                Provider::Anthropic
+                    | Provider::AnthropicApi
+                    | Provider::OpenAI
+                    | Provider::OpenAIApi
+            )
+        })
+        .map(|a| a.provider.to_string())
+        .collect();
+    out.extend(providers.into_iter().map(|p| {
+        let port = Provider::from_str(&p).default_port();
+        (p, format!("http://{host}:{port}"))
+    }));
+    out
+}
+
+/// Bind a listener and spawn an axum server for each provider group found in
+/// `config.accounts`. All servers run concurrently; the function returns when
+/// the first one stops (error or clean shutdown).
+async fn serve_all_providers(
+    config: crate::config::Config,
+    state: crate::state::StateStore,
+    host: &str,
+    primary_port: u16,
+) -> anyhow::Result<()> {
+    use crate::config::{Config, ServerConfig};
+    use crate::provider::Provider;
+    use std::collections::HashMap;
+
+    // Save all accounts for the control plane before the provider loop consumes them.
+    let all_accounts = config.accounts.clone();
+    let control_port = config.server.control_port;
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        accounts = all_accounts.len(),
+        port = primary_port,
+        control_port,
+        "shunt proxy started"
+    );
+
+    // Native Claude and Codex traffic live in independent pools. API-key lanes
+    // join only their matching pool; all other providers remain isolated legacy
+    // listeners and are never implicit cross-provider fallback.
+    let mut claude_accounts = Vec::new();
+    let mut codex_accounts = Vec::new();
+    let mut legacy_by_provider: HashMap<String, Vec<crate::config::AccountConfig>> = HashMap::new();
+    for account in config.accounts.clone() {
+        match account.provider {
+            Provider::Anthropic | Provider::AnthropicApi => claude_accounts.push(account),
+            Provider::OpenAI | Provider::OpenAIApi => codex_accounts.push(account),
+            _ => legacy_by_provider
+                .entry(account.provider.to_string())
+                .or_default()
+                .push(account),
+        }
+    }
+
+    // Shared shutdown signal — fired on SIGTERM so every axum server drains
+    // in-flight connections, state is flushed, then the process exits cleanly.
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    // Create Supabase telemetry client if enabled.
+    let supabase: Option<std::sync::Arc<crate::telemetry::SupabaseTelemetry>> =
+        if config.server.telemetry {
+            let sb = std::sync::Arc::new(crate::telemetry::SupabaseTelemetry::new());
+            let providers: Vec<String> = {
+                let mut seen = std::collections::HashSet::new();
+                all_accounts
+                    .iter()
+                    .map(|a| a.provider.to_string())
+                    .filter(|p| seen.insert(p.clone()))
+                    .collect()
+            };
+            sb.emit_daemon_start(
+                env!("CARGO_PKG_VERSION"),
+                all_accounts.len(),
+                config.server.routing_strategy.as_str(),
+                &providers,
+                config.server.custom_domain.is_some(),
+            );
+            sb.start_flush_loop();
+            Some(sb)
+        } else {
+            None
+        };
+
+    // SIGTERM handler: flush state then wake all servers.
+    {
+        let state_s = state.clone();
+        let notify = shutdown.clone();
+        let sb_stop = supabase.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                if let Ok(mut sig) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                {
+                    sig.recv().await;
+                    tracing::info!("SIGTERM received — flushing state before shutdown");
+                    state_s.flush_sync();
+                    if let Some(sb) = sb_stop {
+                        let savings = state_s.savings_snapshot();
+                        sb.emit_daemon_stop(savings.all_time_cost_usd).await;
+                    }
+                    notify.notify_waiters();
+                }
+            }
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await
+        });
+    }
+
+    let mut handles = Vec::new();
+    let mut listeners: Vec<(
+        String,
+        Provider,
+        u16,
+        Vec<crate::config::AccountConfig>,
+        crate::config::ApiOverflowConfig,
+    )> = Vec::new();
+    if !claude_accounts.is_empty() {
+        listeners.push((
+            "claude".into(),
+            Provider::Anthropic,
+            config.pools.claude.port,
+            claude_accounts,
+            config.pools.claude.overflow.clone(),
+        ));
+    }
+    if !codex_accounts.is_empty() {
+        listeners.push((
+            "codex".into(),
+            Provider::OpenAI,
+            config.pools.codex.port,
+            codex_accounts,
+            config.pools.codex.overflow.clone(),
+        ));
+    }
+    for (provider_str, accounts) in legacy_by_provider {
+        let provider = Provider::from_str(&provider_str);
+        listeners.push((
+            provider_str,
+            provider.clone(),
+            provider.default_port(),
+            accounts,
+            crate::config::ApiOverflowConfig::default(),
+        ));
+    }
+
+    for (provider_str, provider, port, proxy_accounts, overflow) in listeners {
+        let pool_state = state.scoped(&provider_str);
+
+        let provider_config = Config {
+            schema_version: config.schema_version,
+            accounts: proxy_accounts,
+            server: ServerConfig {
+                host: host.to_owned(),
+                port,
+                upstream_url: provider.default_upstream_url().to_owned(),
+                routing_strategy: if provider == Provider::OpenAI {
+                    config.pools.codex.routing_strategy
+                } else if provider == Provider::Anthropic {
+                    config.pools.claude.routing_strategy
+                } else {
+                    config.server.routing_strategy
+                },
+                ..config.server.clone()
+            },
+            config_file: config.config_file.clone(),
+            model_mapping: config.model_mapping.clone(),
+            api_overflow: overflow,
+            pools: config.pools.clone(),
+            secrets: config.secrets.clone(),
+            classifier: config.classifier.clone(),
+            bridge: config.bridge.clone(),
+        };
+
+        let (app, live_creds) = crate::proxy::create_proxy_app(
+            provider_config.clone(),
+            pool_state.clone(),
+            None,
+            supabase.clone(),
+        )?;
+        let listener = tokio::net::TcpListener::bind(format!("{host}:{port}"))
+            .await
+            .with_context(|| format!("cannot bind {host}:{port} for {provider_str} proxy"))?;
+
+        let cfg_arc = std::sync::Arc::new(provider_config);
+        tokio::spawn(crate::proxy::prefetch_rate_limits(
+            cfg_arc.clone(),
+            pool_state.clone(),
+            live_creds.clone(),
+        ));
+        tokio::spawn(crate::proxy::openai_token_refresh_loop(
+            cfg_arc.clone(),
+            pool_state.clone(),
+            live_creds.clone(),
+        ));
+        tokio::spawn(crate::proxy::cooldown_watcher(
+            cfg_arc.clone(),
+            pool_state.clone(),
+            live_creds.clone(),
+        ));
+        tokio::spawn(crate::proxy::recovery_watcher(
+            cfg_arc.clone(),
+            pool_state.clone(),
+            live_creds.clone(),
+        ));
+        tokio::spawn(crate::proxy::health_check_loop(
+            cfg_arc, pool_state, live_creds,
+        ));
+        let sd = shutdown.clone();
+        handles.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { sd.notified().await })
+                .await
+        }));
+    }
+
+    // Spawn the control plane — management endpoints with visibility into ALL accounts.
+    let control_config = Config {
+        schema_version: config.schema_version,
+        accounts: all_accounts,
+        server: ServerConfig {
+            host: host.to_owned(),
+            port: control_port,
+            upstream_url: "https://api.anthropic.com".to_owned(),
+            ..config.server.clone()
+        },
+        config_file: config.config_file.clone(),
+        model_mapping: config.model_mapping.clone(),
+        api_overflow: config.api_overflow.clone(),
+        pools: config.pools.clone(),
+        secrets: config.secrets.clone(),
+        classifier: config.classifier.clone(),
+        bridge: config.bridge.clone(),
+    };
+    let control_app =
+        crate::proxy::create_control_app(control_config.clone(), state.scoped("claude"))?;
+    let control_listener = tokio::net::TcpListener::bind(format!("{host}:{control_port}"))
+        .await
+        .with_context(|| format!("cannot bind {host}:{control_port} for control plane"))?;
+    let sd = shutdown.clone();
+    handles.push(tokio::spawn(async move {
+        axum::serve(control_listener, control_app)
+            .with_graceful_shutdown(async move { sd.notified().await })
+            .await
+    }));
+
+    // Spawn settings guardian — re-injects ANTHROPIC_BASE_URL into ~/.claude/settings.json
+    // if a Claude Code re-login overwrites it while the daemon is running.
+    tokio::spawn(settings_guardian_loop(primary_port));
+
+    // Spawn heartbeat loop if telemetry is configured.
+    if let Some(telemetry_url) = config.server.telemetry_url.clone() {
+        let telem = crate::telemetry::TelemetryClient::new(
+            &telemetry_url,
+            config.server.telemetry_token.clone(),
+            config.server.instance_name.clone(),
+        );
+        let state_hb = state.clone();
+        let config_hb = std::sync::Arc::new(control_config);
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let snapshot = crate::proxy::build_status_snapshot(&config_hb, &state_hb, started);
+                telem.push_heartbeat(snapshot).await;
+            }
+        });
+    }
+
+    if handles.is_empty() {
+        return Ok(());
+    }
+
+    // Wait until the first listener stops, then exit (whole daemon restarts on error).
+    let (result, _idx, _rest) = futures_util::future::select_all(handles).await;
+    result??;
+    Ok(())
+}
+
+fn write_pid() {
+    let p = pid_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, std::process::id().to_string());
+}
+
+/// PIDs of processes listening on the given port.
+fn port_pids(port: u16) -> Vec<u32> {
+    let out = std::process::Command::new("lsof")
+        .args(["-ti", &format!(":{port}")])
+        .output();
+    let Ok(out) = out else { return vec![] };
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect()
+}
+
+#[allow(dead_code)]
+fn kill_port(port: u16) -> bool {
+    let pids = port_pids(port);
+    let mut any = false;
+    for pid in pids {
+        if std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            any = true;
+        }
+    }
+    any
+}
+
+/// Pad a string to display width using spaces (strips ANSI codes first; handles Unicode).
+fn pad(s: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let visible_width = UnicodeWidthStr::width(strip_ansi(s).as_str());
+    if visible_width >= width {
+        s.to_owned()
+    } else {
+        format!("{s}{}", " ".repeat(width - visible_width))
+    }
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// monitor
+// ---------------------------------------------------------------------------
+
+async fn cmd_monitor(config_override: Option<PathBuf>) -> Result<()> {
+    let client = reqwest::Client::new();
+    tokio::spawn(crate::telemetry::track_cli_feature("monitor"));
+
+    // If ANTHROPIC_BASE_URL points to a remote shunt (written by `shunt connect`),
+    // always use that — the user intends to monitor the host machine, not local.
+    let remote_base = std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|u| !u.contains("127.0.0.1") && !u.contains("localhost"))
+        .map(|u| u.trim_end_matches('/').to_owned());
+
+    let base_url = if let Some(remote) = remote_base {
+        remote
+    } else {
+        // Local mode: use the control port.
+        let config = crate::config::load_config(config_override.as_deref())?;
+        let local = format!(
+            "http://{}:{}",
+            config.server.host, config.server.control_port
+        );
+        let running = client
+            .get(format!("{local}/health"))
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .is_ok();
+        if !running {
+            println!();
+            println!("  {} Proxy is not running.", red(CROSS));
+            println!(
+                "  {} Start it first with {}.",
+                dim("·"),
+                cyan("shunt start")
+            );
+            println!();
+            return Ok(());
+        }
+        local
+    };
+
+    crate::monitor::run_monitor(&base_url).await
+}
+
+// ---------------------------------------------------------------------------
+// remote
+// ---------------------------------------------------------------------------
+
+// update
+// ---------------------------------------------------------------------------
+
+async fn cmd_update() -> Result<()> {
+    tokio::spawn(crate::telemetry::track_cli_feature("update"));
+    const REPO: &str = "ramc10/shunt";
+    let current = env!("CARGO_PKG_VERSION");
+
+    print_splash(&[format!(
+        "{}  {}",
+        brand_green("shunt"),
+        dim(&format!("v{current}"))
+    )]);
+
+    // Each status line is prefixed with \r so it starts at column 0 regardless
+    // of where the cursor was left after the ratatui inline viewport.
+    macro_rules! status {
+        ($($arg:tt)*) => { println!("\r{}", format_args!($($arg)*)) };
+    }
+
+    status!("  {} Checking for updates…", dim("·"));
+
+    // Fetch latest release from GitHub API
+    let client = reqwest::Client::builder()
+        .user_agent("shunt-updater")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+
+    let api_url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let resp = client
+        .get(&api_url)
+        .send()
+        .await
+        .context("Failed to reach GitHub API")?;
+
+    if !resp.status().is_success() {
+        bail!("GitHub API returned {}", resp.status());
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+    let latest_tag = json["tag_name"]
+        .as_str()
+        .context("Missing tag_name in release")?;
+    let latest = latest_tag.trim_start_matches('v');
+
+    // Compare versions numerically to correctly handle both upgrades and the
+    // case where the installed build is newer than the latest GitHub release.
+    if parse_version(latest) <= parse_version(current) {
+        status!(
+            "  {} Already up to date ({})",
+            green(CHECK),
+            bold(&format!("v{current}"))
+        );
+        println!();
+        return Ok(());
+    }
+
+    status!(
+        "  {} Update available: {}  →  {}",
+        green("↑"),
+        dim(&format!("v{current}")),
+        bold_white(&format!("v{latest}"))
+    );
+    println!();
+
+    // Detect platform
+    let target = detect_update_target()?;
+    let archive_name = format!("shunt-v{latest}-{target}.tar.gz");
+    let url = format!("https://github.com/{REPO}/releases/download/v{latest}/{archive_name}");
+
+    print!("\r  {} Downloading {}… ", dim("↓"), dim(&archive_name));
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("Download request failed")?;
+
+    if !resp.status().is_success() {
+        bail!("Download failed: HTTP {} for {url}", resp.status());
+    }
+
+    let bytes = resp.bytes().await.context("Failed to read download")?;
+
+    // #4: Verify checksum before trusting the download.
+    let base_url = format!("https://github.com/{REPO}/releases/download/v{latest}");
+    let checksum_url = format!("{base_url}/checksums.txt");
+    match client.get(&checksum_url).send().await {
+        Ok(cr) if cr.status().is_success() => {
+            use sha2::{Digest, Sha256};
+            let checksums_text = cr.text().await.context("Failed to read checksums")?;
+            let expected_hash = checksums_text
+                .lines()
+                .find(|l| l.contains(&archive_name))
+                .and_then(|l| l.split_whitespace().next())
+                .context("Checksum not found for this artifact — cannot verify download")?;
+            let actual_hash = hex::encode(Sha256::digest(&bytes));
+            if actual_hash != expected_hash {
+                bail!("Checksum mismatch! Expected {expected_hash}, got {actual_hash}. Aborting update.");
+            }
+            status!("  {} Checksum verified", green(CHECK));
+        }
+        _ => {
+            // checksums.txt not yet published — warn but continue.
+            status!(
+                "  {} Warning: no checksums.txt found for this release — skipping integrity check",
+                yellow("!")
+            );
+        }
+    }
+
+    // Sanity-check: gzip magic bytes are 0x1f 0x8b
+    if bytes.len() < 2 || bytes[0] != 0x1f || bytes[1] != 0x8b {
+        bail!(
+            "Downloaded file does not look like a gzip archive ({} bytes, first bytes: {:02x?})",
+            bytes.len(),
+            &bytes[..bytes.len().min(4)]
+        );
+    }
+
+    println!("{}", green("done"));
+
+    // Extract binary from tarball into a temp file next to the current exe
+    let exe_path = std::env::current_exe().context("Cannot locate current executable")?;
+    // On Linux, /proc/self/exe may return "…/shunt (deleted)" after a prior
+    // rename-based update.  Strip the suffix to get the real on-disk path.
+    let exe_path = {
+        let s = exe_path.to_string_lossy();
+        if let Some(stripped) = s.strip_suffix(" (deleted)") {
+            std::path::PathBuf::from(stripped)
+        } else {
+            exe_path
+        }
+    };
+    let tmp_path = exe_path.with_extension("tmp");
+
+    // #13 TOCTOU: remove any pre-existing file or symlink before writing,
+    // so we don't follow an attacker-placed symlink to an arbitrary path.
+    if tmp_path.symlink_metadata().is_ok() {
+        std::fs::remove_file(&tmp_path)
+            .context("Failed to remove stale temp file (possible symlink attack?)")?;
+    }
+
+    extract_binary_from_tarball(&bytes, &tmp_path)
+        .context("Failed to extract binary from archive")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // macOS: clear ALL extended attributes (quarantine + provenance) then ad-hoc
+    // sign the temp file BEFORE replacing the live binary so Gatekeeper never
+    // sees an unsigned/quarantined binary on disk even if killed mid-update.
+    #[cfg(target_os = "macos")]
+    {
+        let p = tmp_path.display().to_string();
+        // -c clears all xattrs including com.apple.provenance (not just quarantine)
+        std::process::Command::new("xattr")
+            .args(["-c", &p])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok();
+        std::process::Command::new("codesign")
+            .args(["--force", "--deep", "--sign", "-", &p])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok();
+    }
+
+    // Atomic replace — new binary is already signed, so this is safe.
+    std::fs::rename(&tmp_path, &exe_path)
+        .context("Failed to replace binary (try running with sudo?)")?;
+
+    // macOS: codesign the final path too — rename can reset Gatekeeper state on
+    // some macOS versions (Sonoma+), so re-sign after the rename to be sure.
+    #[cfg(target_os = "macos")]
+    {
+        let p = exe_path.display().to_string();
+        std::process::Command::new("xattr")
+            .args(["-c", &p])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok();
+        std::process::Command::new("codesign")
+            .args(["--force", "--deep", "--sign", "-", &p])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok();
+    }
+
+    status!(
+        "  {} Updated to {}",
+        green(CHECK),
+        bold_white(&format!("v{latest}"))
+    );
+    println!();
+
+    // If the daemon is running an older version, offer to restart it.
+    let config = crate::config::load_config(None).ok();
+    if let Some(cfg) = config {
+        let health_url = format!(
+            "http://{}:{}/health",
+            cfg.server.host, cfg.server.control_port
+        );
+        if let Ok(r) = reqwest::Client::new()
+            .get(&health_url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if let Ok(v) = r.json::<serde_json::Value>().await {
+                let daemon_ver = v["version"].as_str().unwrap_or("");
+                // If version field is missing, it's a pre-v0.1.137 daemon — treat as outdated.
+                let is_outdated =
+                    daemon_ver.is_empty() || parse_version(daemon_ver) < parse_version(latest);
+                if is_outdated {
+                    let ver_display = if daemon_ver.is_empty() {
+                        "old version".to_owned()
+                    } else {
+                        format!("v{daemon_ver}")
+                    };
+                    println!(
+                        "  {} Daemon is still running {}. Restart now? [Y/n] ",
+                        yellow("!"),
+                        dim(&ver_display)
+                    );
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input).ok();
+                    let input = input.trim().to_lowercase();
+                    if input.is_empty() || input == "y" || input == "yes" {
+                        println!();
+                        // Exec the *new* binary for the restart instead of calling
+                        // cmd_restart() in-process.  On Linux the current process's
+                        // /proc/self/exe still points at the deleted old binary, so
+                        // spawning via current_exe() would fail.  Using exe_path
+                        // (the on-disk path we just wrote to) avoids that entirely.
+                        let st = std::process::Command::new(&exe_path)
+                            .arg("restart")
+                            .stdin(std::process::Stdio::inherit())
+                            .stdout(std::process::Stdio::inherit())
+                            .stderr(std::process::Stdio::inherit())
+                            .status()
+                            .context("failed to exec new binary for restart")?;
+                        if !st.success() {
+                            bail!("restart exited with {}", st);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a "major.minor.patch" version string into a comparable tuple.
+/// Missing components default to 0.
+fn parse_version(s: &str) -> (u32, u32, u32) {
+    let mut it = s.split('.');
+    let maj = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let min = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let pat = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (maj, min, pat)
+}
+
+fn detect_update_target() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
+        (os, arch) => bail!(
+            "No pre-built binary for {os}/{arch}. Build from source: cargo install shunt-proxy"
+        ),
+    }
+}
+
+fn extract_binary_from_tarball(data: &[u8], dest: &std::path::Path) -> Result<()> {
+    let gz = flate2::read::GzDecoder::new(data);
+    let mut archive = tar::Archive::new(gz);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        // Reject path traversal attempts
+        if path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            bail!("Unsafe path in archive: {:?}", path);
+        }
+        // Reject symlinks and directories — only plain files allowed
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() || entry_type.is_dir() {
+            continue;
+        }
+        if path.file_name().and_then(|n| n.to_str()) == Some("shunt") {
+            let mut out = std::fs::File::create(dest)?;
+            std::io::copy(&mut entry, &mut out)?;
+            return Ok(());
+        }
+    }
+    bail!("Binary 'shunt' not found in archive")
+}
+
+// ---------------------------------------------------------------------------
+// share
+// ---------------------------------------------------------------------------
+
+async fn cmd_share(config_override: Option<PathBuf>, tunnel: bool, stop: bool) -> Result<()> {
+    tokio::spawn(crate::telemetry::track_cli_feature("share"));
+    let config_p = config_override.unwrap_or_else(config_path);
+    if !config_p.exists() {
+        bail!("No config found. Run `shunt setup` first.");
+    }
+
+    let text = std::fs::read_to_string(&config_p)?;
+
+    // If no flags given, show interactive menu
+    // use an enum to track the chosen mode cleanly
+    #[derive(Debug)]
+    enum ShareMode {
+        Lan,
+        Tunnel,
+        CustomDomain,
+        Stop,
+    }
+
+    let mode: ShareMode = if tunnel {
+        ShareMode::Tunnel
+    } else if stop {
+        ShareMode::Stop
+    } else {
+        print_splash(&[
+            format!(
+                "{}  {}",
+                brand_green("shunt"),
+                dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+            ),
+            dim("Remote sharing").to_string(),
+            String::new(),
+        ]);
+        let top_items = vec![
+            term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("Local network (LAN)"),
+                    dim("— same Wi-Fi only, no internet required")
+                ),
+                value: "lan".into(),
+            },
+            term::SelectItem {
+                label: format!("{}  {}", bold("Online"), dim("— share over the internet")),
+                value: "online".into(),
+            },
+            term::SelectItem {
+                label: format!(
+                    "{}  {}",
+                    bold("Stop sharing"),
+                    dim("— revert to localhost-only")
+                ),
+                value: "stop".into(),
+            },
+        ];
+        match term::select("How do you want to share?", &top_items, 0).as_deref() {
+            Some("lan") => ShareMode::Lan,
+            Some("stop") => ShareMode::Stop,
+            Some("online") => {
+                // Sub-menu: temporary vs custom domain
+                let existing_domain = crate::config::load_config(Some(&config_p))
+                    .ok()
+                    .and_then(|c| c.server.custom_domain.clone());
+                let domain_label = match &existing_domain {
+                    Some(d) => format!(
+                        "{}  {}",
+                        bold("Permanent (named Cloudflare tunnel)"),
+                        dim(&format!("— {} · auto-setup DNS + tunnel", d))
+                    ),
+                    None => format!(
+                        "{}  {}",
+                        bold("Permanent (named Cloudflare tunnel)"),
+                        dim("— your domain, auto-setup DNS + tunnel, always-on")
+                    ),
+                };
+                let online_items = vec![
+                    term::SelectItem {
+                        label: format!(
+                            "{}  {}",
+                            bold("Temporary (Cloudflare tunnel)"),
+                            dim("— free, random URL, session only")
+                        ),
+                        value: "tunnel".into(),
+                    },
+                    term::SelectItem {
+                        label: domain_label,
+                        value: "custom".into(),
+                    },
+                ];
+                match term::select("Online sharing type:", &online_items, 0).as_deref() {
+                    Some("tunnel") => ShareMode::Tunnel,
+                    Some("custom") => ShareMode::CustomDomain,
+                    _ => return Ok(()),
+                }
+            }
+            _ => return Ok(()),
+        }
+    };
+
+    if matches!(mode, ShareMode::Stop) {
+        // Reconfirm before disabling
+        if !term::confirm("Stop sharing and revert to localhost-only?") {
+            println!("  {} Cancelled.", dim("·"));
+            println!();
+            return Ok(());
+        }
+
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .context("Failed to parse config as TOML")?;
+        if let Some(server) = doc.get_mut("server").and_then(|t| t.as_table_mut()) {
+            server.remove("remote_key");
+            server.insert("host", toml_edit::value("127.0.0.1"));
+        }
+        write_config_atomic(&config_p, &doc.to_string())?;
+
+        print_splash(&[
+            format!(
+                "{}  {}",
+                brand_green("shunt"),
+                dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+            ),
+            dim("Remote sharing disabled").to_string(),
+            String::new(),
+        ]);
+        println!("  {} Restart to apply: {}", dim("·"), cyan("shunt start"));
+        println!();
+        return Ok(());
+    }
+
+    // #5: remote_key — read from env var first, then legacy config entry.
+    // New keys are printed for the user to save; never written to config.
+    let key = if let Ok(k) = std::env::var("SHUNT_REMOTE_KEY") {
+        if !k.is_empty() {
+            k
+        } else {
+            extract_remote_key(&text).unwrap_or_else(generate_remote_key)
+        }
+    } else if let Some(k) = extract_remote_key(&text) {
+        // Existing config entry — keep using it, but nudge migration
+        println!(
+            "  {} remote_key found in config.toml (plaintext).",
+            yellow("!")
+        );
+        println!("  {} Migrate to an env var for better security:", dim("·"));
+        println!("       export SHUNT_REMOTE_KEY='{k}'");
+        println!();
+        k
+    } else {
+        let k = generate_remote_key();
+        println!();
+        println!(
+            "  {} Generated remote key (save this in your env):",
+            dim("·")
+        );
+        println!("       export SHUNT_REMOTE_KEY='{k}'");
+        println!("  {} Add that line to your shell profile.", dim("·"));
+        println!();
+        k
+    };
+
+    // Ensure host is 0.0.0.0
+    {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .context("Failed to parse config as TOML")?;
+        if let Some(server) = doc.get_mut("server").and_then(|t| t.as_table_mut()) {
+            server.insert("host", toml_edit::value("0.0.0.0"));
+        }
+        write_config_atomic(&config_p, &doc.to_string())?;
+    }
+
+    let (port, relay_url, saved_domain) = match crate::config::load_config(Some(&config_p)) {
+        Ok(cfg) => {
+            let relay =
+                std::env::var("SHUNT_RELAY_URL").unwrap_or_else(|_| cfg.server.relay_url.clone());
+            (cfg.server.port, relay, cfg.server.custom_domain)
+        }
+        Err(_) => (
+            8082u16,
+            std::env::var("SHUNT_RELAY_URL")
+                .unwrap_or_else(|_| "https://relay.ramcharan.shop".to_string()),
+            None,
+        ),
+    };
+
+    if !relay_url.starts_with("https://") {
+        bail!("Relay URL must use HTTPS (got: {relay_url})");
+    }
+
+    match mode {
+        ShareMode::Tunnel => {
+            print_splash(&[
+                format!(
+                    "{}  {}",
+                    brand_green("shunt"),
+                    dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+                ),
+                dim("Starting Cloudflare tunnel…").to_string(),
+                String::new(),
+            ]);
+            println!(
+                "  {} Make sure the proxy is running: {}",
+                dim("·"),
+                cyan("shunt start")
+            );
+            println!();
+
+            let url = start_cloudflare_tunnel(port)?;
+            share_and_print(
+                &url,
+                &key,
+                &relay_url,
+                "Tunnel active",
+                &[
+                    format!("  {} Code expires in 10 minutes — one-time use", dim("·")),
+                    format!("  {} Tunnel is active — keep this terminal open.", dim("·")),
+                    format!("  {} Press Ctrl+C to stop.", dim("·")),
+                ],
+            )
+            .await;
+
+            tokio::signal::ctrl_c().await.ok();
+            println!("\n  {} Tunnel closed.", dim("·"));
+        }
+
+        ShareMode::CustomDomain => {
+            // Step 1: ensure cloudflared is available (downloads if needed)
+            ensure_cloudflared()?;
+
+            // Step 2: resolve domain (use saved, or prompt + save)
+            let domain = if let Some(d) = saved_domain {
+                d
+            } else {
+                use std::io::Write;
+                println!();
+                println!(
+                    "  {} Enter your domain URL (e.g. {}): ",
+                    dim("·"),
+                    dim("https://shunt.mysite.com")
+                );
+                print!("    ");
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let domain = input.trim().trim_end_matches('/').to_string();
+                if domain.is_empty() {
+                    bail!("No domain entered.");
+                }
+                let _ = url::Url::parse(&domain).context("Invalid domain URL")?;
+                if !domain.starts_with("https://") {
+                    bail!("Domain must use HTTPS (got: {domain})");
+                }
+                let mut doc = std::fs::read_to_string(&config_p)?
+                    .parse::<toml_edit::DocumentMut>()
+                    .context("Failed to parse config as TOML")?;
+                if let Some(server) = doc.get_mut("server").and_then(|t| t.as_table_mut()) {
+                    server.insert("custom_domain", toml_edit::value(&domain));
+                }
+                write_config_atomic(&config_p, &doc.to_string())?;
+                println!("  {} Saved {} to config.", green(CHECK), cyan(&domain));
+                domain
+            };
+
+            // Steps 2-6: auto-setup DNS + start named tunnel (fully CLI, no browser)
+            start_named_cloudflare_tunnel(&domain, port, &config_p)?;
+
+            share_and_print(
+                &domain,
+                &key,
+                &relay_url,
+                "Permanent tunnel active",
+                &[
+                    format!("  {} Code expires in 10 minutes — one-time use", dim("·")),
+                    format!(
+                        "  {} Tunnel is active at {} — keep this terminal open.",
+                        dim("·"),
+                        cyan(&domain)
+                    ),
+                    format!("  {} Press Ctrl+C to stop.", dim("·")),
+                ],
+            )
+            .await;
+
+            tokio::signal::ctrl_c().await.ok();
+            println!("\n  {} Tunnel closed.", dim("·"));
+        }
+
+        ShareMode::Lan => {
+            let ip = local_ip().unwrap_or_else(|| "<your-ip>".to_string());
+            let base_url = format!("http://{ip}:{port}");
+
+            share_and_print(
+                &base_url,
+                &key,
+                &relay_url,
+                "Remote sharing enabled (LAN)",
+                &[
+                    format!("  {} Code expires in 10 minutes — one-time use", dim("·")),
+                    format!("  {} Both devices must be on the same network.", dim("·")),
+                    format!("  {} Restart to apply: {}", dim("·"), cyan("shunt start")),
+                    format!(
+                        "  {} To stop sharing:  {}",
+                        dim("·"),
+                        cyan("shunt share --stop")
+                    ),
+                ],
+            )
+            .await;
+        }
+
+        ShareMode::Stop => unreachable!(),
+    }
+
+    Ok(())
+}
+
+/// Push share code to relay and print the result (code or fallback manual instructions).
+async fn share_and_print(
+    base_url: &str,
+    key: &str,
+    relay_url: &str,
+    subtitle: &str,
+    hints: &[String],
+) {
+    let share_code = crate::sync::generate_share_code();
+    match crate::sync::push_share(&share_code, base_url, key, relay_url).await {
+        Ok(()) => {
+            print_splash(&[
+                format!(
+                    "{}  {}",
+                    brand_green("shunt"),
+                    dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+                ),
+                dim(subtitle).to_string(),
+                String::new(),
+            ]);
+            println!("  {}  Share code:\n", green(CHECK));
+            println!("      {}\n", cyan(&share_code));
+            println!("  {} On the other device, run:", dim("·"));
+            println!("       {}", cyan(&format!("shunt share {share_code}")));
+            println!();
+            for hint in hints {
+                println!("{hint}");
+            }
+            println!();
+        }
+        Err(e) => {
+            // Relay unavailable — fall back to manual env var instructions
+            print_splash(&[
+                format!(
+                    "{}  {}",
+                    brand_green("shunt"),
+                    dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+                ),
+                dim(subtitle).to_string(),
+                String::new(),
+            ]);
+            println!("  {} Relay unavailable ({e}).", dim("·"));
+            println!("  {} Set on the remote device:", dim("·"));
+            println!(
+                "      {}{}",
+                dim("export ANTHROPIC_BASE_URL="),
+                cyan(base_url)
+            );
+            println!();
+            for hint in hints {
+                println!("{hint}");
+            }
+            println!();
+        }
+    }
+}
+
+/// Ensure `cloudflared` is available in PATH or a local bin dir.
+/// Downloads the binary automatically if not found.
+fn ensure_cloudflared() -> Result<String> {
+    use std::process::Command;
+
+    // Check if it's already in PATH
+    if Command::new("cloudflared")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        return Ok("cloudflared".to_string());
+    }
+
+    // Not found — download to ~/.local/bin/cloudflared
+    let local_bin = dirs::home_dir()
+        .context("Cannot find home directory")?
+        .join(".local")
+        .join("bin");
+    std::fs::create_dir_all(&local_bin)?;
+    let dest = local_bin.join("cloudflared");
+
+    let url = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos",  "aarch64") => "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64",
+        ("macos",  "x86_64")  => "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64",
+        ("linux",  "x86_64")  => "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+        ("linux",  "aarch64") => "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64",
+        (os, arch) => bail!("No cloudflared binary for {os}/{arch}. Install manually: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"),
+    };
+
+    println!("  {} cloudflared not found — downloading…", dim("·"));
+    let bytes = reqwest::blocking::get(url)
+        .and_then(|r| r.bytes())
+        .context("Failed to download cloudflared")?;
+
+    // #4: Attempt checksum verification from Cloudflare's published checksums.
+    // cloudflared publishes a checksums file alongside each release binary.
+    let checksum_url = format!("{url}.sha256sum");
+    match reqwest::blocking::get(&checksum_url).and_then(|r| r.text()) {
+        Ok(text) => {
+            use sha2::{Digest, Sha256};
+            // Format: "<sha256>  cloudflared-darwin-arm64"
+            let expected = text.split_whitespace().next().unwrap_or("");
+            let actual = hex::encode(Sha256::digest(&bytes));
+            if actual != expected {
+                bail!(
+                    "cloudflared checksum mismatch! Expected {expected}, got {actual}. Aborting."
+                );
+            }
+            println!("  {} cloudflared checksum verified", green(CHECK));
+        }
+        Err(_) => {
+            println!(
+                "  {} Warning: no .sha256sum file found — skipping cloudflared integrity check",
+                yellow("!")
+            );
+        }
+    }
+
+    std::fs::write(&dest, &bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+    println!(
+        "  {} Downloaded to {}",
+        green(CHECK),
+        dim(&dest.display().to_string())
+    );
+
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Spawn `cloudflared tunnel --url http://localhost:{port}`, wait for the public URL,
+/// and return it. The cloudflared process is left running in the background.
+fn start_cloudflare_tunnel(port: u16) -> Result<String> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let bin = ensure_cloudflared()?;
+
+    let mut child = Command::new(&bin)
+        .args(["tunnel", "--url", &format!("http://localhost:{port}")])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .with_context(|| format!("Failed to start cloudflared ({bin})"))?;
+
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let reader = BufReader::new(stderr);
+
+    for line in reader.lines() {
+        let line = line?;
+        if let Some(url) = extract_cloudflare_url(&line) {
+            // Leave the child running — it will be killed when the process exits
+            std::mem::forget(child);
+            return Ok(url);
+        }
+    }
+
+    bail!("cloudflared exited before providing a tunnel URL")
+}
+
+/// Set up and run a named Cloudflare tunnel via the Cloudflare API — no browser required.
+///
+/// Steps (all CLI, no browser dropoff):
+///   1. Prompt for / load Cloudflare API token (saved to config for reuse).
+///   2. Resolve account ID and zone ID via the API.
+///   3. Find or create the "shunt" tunnel via API → write credentials JSON.
+///   4. Create DNS CNAME record via API (idempotent).
+///   5. Write ~/.cloudflared/config.yml.
+///   6. Start `cloudflared tunnel run`, wait for "registered", return.
+fn start_named_cloudflare_tunnel(
+    domain: &str,
+    port: u16,
+    config_p: &std::path::Path,
+) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let bin = ensure_cloudflared()?;
+    let home = dirs::home_dir().context("Cannot find home directory")?;
+    let cf_dir = home.join(".cloudflared");
+    std::fs::create_dir_all(&cf_dir)?;
+
+    let hostname = domain
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+
+    // ── Step 1: get API token ────────────────────────────────────────────────
+    let token = cf_api_get_token(config_p)?;
+
+    // ── Step 2: resolve account + zone ──────────────────────────────────────
+    print!("  {} Resolving Cloudflare account…", dim("·"));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let account_id = cf_api_get_account_id(&token)?;
+    println!(" {}", green(CHECK));
+
+    let root_domain = hostname.split_once('.').map(|x| x.1).unwrap_or(hostname);
+    print!("  {} Resolving zone for {}…", dim("·"), dim(root_domain));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let zone_id = cf_api_get_zone_id(&token, root_domain)?;
+    println!(" {}", green(CHECK));
+
+    // ── Step 3: find or create "shunt" tunnel ───────────────────────────────
+    let creds_path = cf_dir.join("shunt-creds.json");
+    let tunnel_id = cf_api_find_or_create_tunnel(&token, &account_id, &creds_path)?;
+    println!("  {} Tunnel: {}", dim("·"), dim(&tunnel_id));
+
+    // ── Step 4: create / update DNS CNAME ───────────────────────────────────
+    print!("  {} Setting DNS CNAME for {}…", dim("·"), cyan(hostname));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    cf_api_upsert_dns(&token, &zone_id, hostname, &tunnel_id)?;
+    println!(" {}", green(CHECK));
+
+    // ── Step 5: write cloudflared config ────────────────────────────────────
+    let config_yml = cf_dir.join("config.yml");
+    std::fs::write(&config_yml, format!(
+        "tunnel: shunt\ncredentials-file: {creds}\ningress:\n  - hostname: {hostname}\n    service: http://127.0.0.1:{port}\n  - service: http_status:404\n",
+        creds = creds_path.display(),
+    )).context("Failed to write ~/.cloudflared/config.yml")?;
+
+    // ── Step 6: launch tunnel and wait for "registered" ─────────────────────
+    println!("  {} Starting tunnel…", dim("·"));
+    let mut child = Command::new(&bin)
+        .args([
+            "tunnel",
+            "run",
+            "--config",
+            &config_yml.to_string_lossy(),
+            "shunt",
+        ])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .context("Failed to spawn cloudflared")?;
+
+    let stderr = child.stderr.take().expect("piped");
+    for line in BufReader::new(stderr).lines() {
+        let line = line?;
+        let lower = line.to_lowercase();
+        if lower.contains("registered") || lower.contains("connection established") {
+            std::mem::forget(child);
+            println!("  {} Tunnel connected.", green(CHECK));
+            println!();
+            return Ok(());
+        }
+        if lower.contains("error") || lower.contains("failed") {
+            eprintln!("  {} {}", yellow("!"), dim(&line));
+        }
+    }
+    bail!("cloudflared exited before the tunnel became ready")
+}
+
+/// Prompt for a Cloudflare API token, or load from env var / legacy config entry.
+///
+/// #5: New tokens are never written to config — users are directed to store them
+/// in the environment instead. Existing entries in config.toml continue to work
+/// for backward compat (with a one-time migration notice).
+fn cf_api_get_token(config_p: &std::path::Path) -> Result<String> {
+    // env var takes priority
+    if let Ok(t) = std::env::var("CLOUDFLARE_API_TOKEN") {
+        if !t.is_empty() {
+            return Ok(t);
+        }
+    }
+    // backward compat: read from config (legacy), but warn once
+    if let Ok(text) = std::fs::read_to_string(config_p) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with("cloudflare_api_token") {
+                if let Some(v) = line.split_once('=').map(|x| x.1) {
+                    let t = v.trim().trim_matches('"').to_string();
+                    if !t.is_empty() {
+                        println!(
+                            "  {} Cloudflare API token found in config.toml (plaintext).",
+                            yellow("!")
+                        );
+                        println!("  {} Migrate to an env var to improve security:", dim("·"));
+                        println!("       export CLOUDFLARE_API_TOKEN='{t}'");
+                        println!("  {} Add that line to your shell profile and remove cloudflare_api_token from config.toml.", dim("·"));
+                        println!();
+                        return Ok(t);
+                    }
+                }
+            }
+        }
+    }
+    // prompt — do NOT write to config
+    println!();
+    println!(
+        "  {} A Cloudflare API token is needed to create the tunnel and DNS record.",
+        dim("·")
+    );
+    println!(
+        "  {} Create one at {} with permissions:",
+        dim("·"),
+        cyan("https://dash.cloudflare.com/profile/api-tokens")
+    );
+    println!("  {}   Account → Cloudflare Tunnel: Edit", dim("·"));
+    println!(
+        "  {}   Zone → DNS: Edit  (for your domain's zone)",
+        dim("·")
+    );
+    println!();
+    let token = rpassword::prompt_password("  Token: ").context("Failed to read token")?;
+    if token.is_empty() {
+        bail!("No API token entered.");
+    }
+
+    // Tell user how to persist — do not write to config
+    println!();
+    println!(
+        "  {} To avoid entering this each time, add to your shell profile:",
+        dim("·")
+    );
+    println!("       export CLOUDFLARE_API_TOKEN='<your-token>'");
+    println!();
+    Ok(token)
+}
+
+fn cf_api<T: serde::de::DeserializeOwned>(
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<T> {
+    let url = format!("https://api.cloudflare.com/client/v4{path}");
+    let client = reqwest::blocking::Client::new();
+    let req = match method {
+        "GET" => client.get(&url),
+        "POST" => client.post(&url),
+        "PUT" => client.put(&url),
+        "PATCH" => client.patch(&url),
+        "DELETE" => client.delete(&url),
+        m => bail!("Unknown HTTP method: {m}"),
+    };
+    let req = req
+        .bearer_auth(token)
+        .header("Content-Type", "application/json");
+    let req = if let Some(b) = body {
+        req.json(&b)
+    } else {
+        req
+    };
+    let resp: serde_json::Value = req.send()?.json()?;
+    if !resp["success"].as_bool().unwrap_or(false) {
+        let errs = resp["errors"].to_string();
+        bail!("Cloudflare API error: {errs}");
+    }
+    serde_json::from_value(resp["result"].clone())
+        .context("Failed to parse Cloudflare API response")
+}
+
+fn cf_api_get_account_id(token: &str) -> Result<String> {
+    let accounts: serde_json::Value = cf_api(token, "GET", "/accounts?per_page=1", None)?;
+    accounts
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|a| a["id"].as_str())
+        .map(|s| s.to_owned())
+        .context("No Cloudflare accounts found for this token")
+}
+
+fn cf_api_get_zone_id(token: &str, root_domain: &str) -> Result<String> {
+    let zones: serde_json::Value = cf_api(
+        token,
+        "GET",
+        &format!("/zones?name={root_domain}&per_page=1"),
+        None,
+    )?;
+    zones
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|z| z["id"].as_str())
+        .map(|s| s.to_owned())
+        .with_context(|| format!("Zone '{root_domain}' not found — is this domain on Cloudflare?"))
+}
+
+fn cf_api_find_or_create_tunnel(
+    token: &str,
+    account_id: &str,
+    creds_path: &std::path::Path,
+) -> Result<String> {
+    // Search for existing "shunt" tunnel
+    let tunnels: serde_json::Value = cf_api(
+        token,
+        "GET",
+        &format!("/accounts/{account_id}/cfd_tunnel?name=shunt&per_page=10&is_deleted=false"),
+        None,
+    )?;
+
+    if let Some(existing) = tunnels
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["name"] == "shunt"))
+    {
+        let id = existing["id"]
+            .as_str()
+            .context("Tunnel has no id")?
+            .to_owned();
+        println!("  {} Found existing 'shunt' tunnel.", green(CHECK));
+        // Write a minimal creds file if not present (tunnel run needs it)
+        if !creds_path.exists() {
+            let account_tag = existing["account_tag"].as_str().unwrap_or(account_id);
+            let creds = serde_json::json!({
+                "AccountTag": account_tag,
+                "TunnelID": id,
+                "TunnelName": "shunt"
+            });
+            std::fs::write(creds_path, creds.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(creds_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        return Ok(id);
+    }
+
+    // Create new tunnel — generate a random 32-byte secret
+    print!("  {} Creating 'shunt' tunnel…", dim("·"));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let secret_bytes = crate::oauth::rand_bytes::<32>();
+    let secret_b64 = base64_encode(&secret_bytes);
+
+    let resp: serde_json::Value = cf_api(
+        token,
+        "POST",
+        &format!("/accounts/{account_id}/cfd_tunnel"),
+        Some(serde_json::json!({"name": "shunt", "tunnel_secret": secret_b64})),
+    )?;
+
+    let tunnel_id = resp["id"]
+        .as_str()
+        .context("No tunnel id in response")?
+        .to_owned();
+    let account_tag = resp["account_tag"].as_str().unwrap_or(account_id);
+    println!(" {}", green(CHECK));
+
+    // Write credentials file
+    let creds = serde_json::json!({
+        "AccountTag":   account_tag,
+        "TunnelSecret": secret_b64,
+        "TunnelID":     tunnel_id,
+        "TunnelName":   "shunt"
+    });
+    std::fs::write(creds_path, creds.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(creds_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(tunnel_id)
+}
+
+fn cf_api_upsert_dns(token: &str, zone_id: &str, hostname: &str, tunnel_id: &str) -> Result<()> {
+    let content = format!("{tunnel_id}.cfargotunnel.com");
+
+    // Check if record already exists
+    let records: serde_json::Value = cf_api(
+        token,
+        "GET",
+        &format!("/zones/{zone_id}/dns_records?type=CNAME&name={hostname}&per_page=1"),
+        None,
+    )?;
+
+    if let Some(record) = records.as_array().and_then(|a| a.first()) {
+        let record_id = record["id"].as_str().context("DNS record has no id")?;
+        cf_api::<serde_json::Value>(
+            token,
+            "PATCH",
+            &format!("/zones/{zone_id}/dns_records/{record_id}"),
+            Some(serde_json::json!({"content": content, "proxied": true})),
+        )?;
+    } else {
+        cf_api::<serde_json::Value>(
+            token,
+            "POST",
+            &format!("/zones/{zone_id}/dns_records"),
+            Some(
+                serde_json::json!({"type": "CNAME", "name": hostname, "content": content, "proxied": true}),
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    // simple base64 without external dep — use the alphabet
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn extract_cloudflare_url(line: &str) -> Option<String> {
+    // cloudflared prints the URL in a line like:
+    //   INF | https://random-words.trycloudflare.com |
+    // or just contains the URL somewhere in the log line
+    let lower = line.to_lowercase();
+    if lower.contains("trycloudflare.com") || lower.contains("cfargotunnel.com") {
+        // Extract the https:// URL from the line
+        if let Some(start) = line.find("https://") {
+            let rest = &line[start..];
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '|' || c == '"')
+                .unwrap_or(rest.len());
+            return Some(rest[..end].trim_end_matches('/').to_owned());
+        }
+    }
+    None
+}
+
+fn generate_remote_key() -> String {
+    hex::encode(crate::oauth::rand_bytes::<16>())
+}
+
+fn extract_remote_key(config: &str) -> Option<String> {
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with("remote_key") {
+            return line
+                .split('=')
+                .nth(1)
+                .map(|s| s.trim().trim_matches('"').to_owned());
+        }
+    }
+    None
+}
+
+fn write_config_atomic(path: &std::path::Path, content: &str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn local_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+/// If the proxy is currently running, offer to restart it immediately.
+async fn offer_restart(config_override: Option<PathBuf>) {
+    use std::io::Write;
+    let Ok(cfg) = crate::config::load_config(config_override.as_deref()) else {
+        return;
+    };
+    let health_url = format!(
+        "http://{}:{}/health",
+        cfg.server.host, cfg.server.control_port
+    );
+    let running = reqwest::get(&health_url)
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    if !running {
+        return;
+    }
+
+    print!("  {} Proxy is running — restart now? [Y/n]: ", dim("·"));
+    std::io::stdout().flush().ok();
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf).ok();
+    if matches!(buf.trim().to_lowercase().as_str(), "n" | "no") {
+        println!("  {} Run {} when ready.", dim("·"), cyan("shunt restart"));
+        return;
+    }
+    if let Err(e) = cmd_restart(config_override).await {
+        println!("  {} Restart failed: {e}", red(CROSS));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// connect
+// ---------------------------------------------------------------------------
+
+async fn cmd_connect(code: String) -> Result<()> {
+    use std::io::{self, Write};
+
+    crate::sync::validate_share_code(&code)?;
+
+    let relay_url = std::env::var("SHUNT_RELAY_URL")
+        .unwrap_or_else(|_| "https://relay.ramcharan.shop".to_string());
+
+    print_splash(&[
+        format!(
+            "{}  {}",
+            brand_green("shunt"),
+            dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        ),
+        dim("Connecting to remote shunt…").to_string(),
+        String::new(),
+    ]);
+
+    println!("  {} Fetching credentials for {}…", dim("·"), cyan(&code));
+    println!();
+
+    let (base_url, api_key) = crate::sync::pull_share(&code, &relay_url).await?;
+
+    println!("  {}  Retrieved:", green(CHECK));
+    println!("      {} {}", dim("ANTHROPIC_BASE_URL ="), cyan(&base_url));
+    println!(
+        "      {} {}",
+        dim("ANTHROPIC_API_KEY  ="),
+        cyan(&format!("{}…", &api_key[..api_key.len().min(12)]))
+    );
+    println!();
+
+    // --- Offer to write to shell profile ---
+    let profile = detect_shell_profile();
+    let prompt = match &profile {
+        Some(p) => format!("  Write to {}? [Y/n]: ", dim(&p.display().to_string())),
+        None => "  Write to shell profile? [Y/n]: ".into(),
+    };
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+
+    if !matches!(buf.trim().to_lowercase().as_str(), "n" | "no") {
+        match profile {
+            Some(p) => {
+                write_connect_vars_to_profile(&p, &base_url, &api_key)?;
+            }
+            None => {
+                println!(
+                    "  {} Could not detect shell profile. Set manually:",
+                    dim("·")
+                );
+                println!("      export ANTHROPIC_BASE_URL={base_url}");
+                println!("      export ANTHROPIC_API_KEY={api_key}");
+            }
+        }
+    }
+
+    // --- Write to Claude Code settings.json ---
+    if let Err(e) = write_claude_settings(&base_url, &api_key) {
+        println!(
+            "  {} Could not write ~/.claude/settings.json: {e}",
+            dim("·")
+        );
+    } else {
+        println!(
+            "  {} Written to {}",
+            green(CHECK),
+            dim("~/.claude/settings.json")
+        );
+    }
+
+    println!();
+    println!(
+        "  {} Done! Restart shell or run: {}",
+        green(CHECK),
+        cyan(
+            detect_shell_profile()
+                .map(|p| format!("source {}", p.display()))
+                .unwrap_or_else(|| "source ~/.zshrc".to_string())
+                .as_str()
+        )
+    );
+    println!();
+
+    Ok(())
+}
+
+async fn cmd_live(
+    config_override: Option<PathBuf>,
+    subdomain: Option<String>,
+    relay_override: Option<String>,
+) -> Result<()> {
+    let config = crate::config::load_config(config_override.as_deref())
+        .context("No config found. Run `shunt setup` first.")?;
+    if config.server.telemetry {
+        tokio::spawn(crate::telemetry::track_cli_feature("live"));
+    }
+
+    let subdomain = subdomain
+        .or_else(|| std::env::var("SHUNT_TUNNEL_SUBDOMAIN").ok())
+        .unwrap_or_else(|| "shunt".to_string());
+
+    let relay_ws = relay_override
+        .or_else(|| std::env::var("SHUNT_RELAY_WS_URL").ok())
+        .unwrap_or_else(|| "wss://relay.ramcharan.shop/tunnel".to_string());
+
+    let token = match std::env::var("SHUNT_TUNNEL_TOKEN") {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            let config_p = config_override.clone().unwrap_or_else(config_path);
+            setup_live_tunnel(&subdomain, &config_p).await?
+        }
+    };
+
+    let local_url = format!("http://{}:{}", config.server.host, config.server.port);
+
+    print_splash(&[
+        format!(
+            "{}  {}",
+            brand_green("shunt"),
+            dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        ),
+        dim("Live tunnel").to_string(),
+        String::new(),
+    ]);
+    println!(
+        "  {} Subdomain:  {}",
+        dim("·"),
+        cyan(&format!("{subdomain}.ramcharan.shop"))
+    );
+    println!("  {} Local:      {}", dim("·"), dim(&local_url));
+    println!("  {} Relay:      {}", dim("·"), dim(&relay_ws));
+    println!("  {} Press Ctrl+C to disconnect.", dim("·"));
+    println!();
+
+    crate::tunnel::run_live(&relay_ws, &subdomain, &token, &local_url).await
+}
+
+/// First-run wizard for `shunt live`: generates a tunnel token, sets up DNS,
+/// waits for the relay, and saves the token to the shell profile.
+/// Returns the generated token so `cmd_live` can use it immediately.
+async fn setup_live_tunnel(subdomain: &str, config_path: &std::path::Path) -> Result<String> {
+    use std::io::Write as _;
+
+    println!();
+    println!(
+        "  {} {}",
+        brand_green("shunt live"),
+        dim("— first-time setup")
+    );
+    println!();
+
+    // Step 1: Generate token
+    println!("  {} Generating tunnel token…", dim("1/5"));
+    let token = hex::encode(crate::oauth::rand_bytes::<32>());
+    println!("  {} Token generated (64 hex chars)", green(CHECK));
+    println!();
+
+    // Step 2: DNS setup — get CF token, VPS IP, create wildcard A record
+    println!("  {} Setting up DNS…", dim("2/5"));
+    let cf_token = cf_api_get_token(config_path)?;
+
+    print!("  Enter your VPS IP address: ");
+    std::io::stdout().flush()?;
+    let mut vps_ip = String::new();
+    std::io::stdin().read_line(&mut vps_ip)?;
+    let vps_ip = vps_ip.trim().to_string();
+    vps_ip
+        .parse::<std::net::IpAddr>()
+        .with_context(|| format!("Invalid IP address: {vps_ip}"))?;
+
+    let zone_id = cf_api_get_zone_id(&cf_token, "ramcharan.shop")?;
+    let dns_name = "*.ramcharan.shop";
+    cf_api_upsert_dns_a(&cf_token, &zone_id, dns_name, &vps_ip)?;
+    println!(
+        "  {} DNS: {} → {}",
+        green(CHECK),
+        cyan(dns_name),
+        cyan(&vps_ip)
+    );
+    println!();
+
+    // Step 3: Show the relay command
+    println!("  {} Start the relay on your VPS", dim("3/5"));
+    println!("  ┌─────────────────────────────────────────────────────────────┐");
+    println!(
+        "  │  SHUNT_RELAY_TOKEN={} shunt relay serve  │",
+        &token[..20]
+    );
+    // Print the full command separately so it's easy to copy
+    println!("  └─────────────────────────────────────────────────────────────┘");
+    println!();
+    println!("  Full command:");
+    println!("    SHUNT_RELAY_TOKEN={token} shunt relay serve --port 8085");
+    println!();
+    println!("  SSH into your VPS and run the command above.");
+    print!("  Press Enter when ready…");
+    std::io::stdout().flush()?;
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    println!();
+
+    // Step 4: Wait for relay
+    println!("  {} Waiting for relay…", dim("4/5"));
+    let relay_url = "wss://relay.ramcharan.shop/tunnel";
+    poll_relay_ws(relay_url, std::time::Duration::from_secs(300)).await?;
+    println!("  {} Relay is online", green(CHECK));
+    println!();
+
+    // Step 5: Save token to shell profile
+    println!("  {} Saving config…", dim("5/5"));
+    write_tunnel_token_to_profile(&token, subdomain)?;
+    println!();
+
+    // Set in current process so the tunnel can start immediately
+    #[allow(unused_unsafe)]
+    unsafe {
+        std::env::set_var("SHUNT_TUNNEL_TOKEN", &token);
+    }
+    if subdomain != "shunt" {
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("SHUNT_TUNNEL_SUBDOMAIN", subdomain);
+        }
+    }
+
+    println!("  Setup complete! Starting tunnel…");
+    println!();
+
+    Ok(token)
+}
+
+/// Create or update an A record in Cloudflare DNS.
+fn cf_api_upsert_dns_a(token: &str, zone_id: &str, hostname: &str, ip: &str) -> Result<()> {
+    // Check if A record already exists
+    let records: serde_json::Value = cf_api(
+        token,
+        "GET",
+        &format!("/zones/{zone_id}/dns_records?type=A&name={hostname}&per_page=1"),
+        None,
+    )?;
+
+    if let Some(record) = records.as_array().and_then(|a| a.first()) {
+        let record_id = record["id"].as_str().context("DNS record has no id")?;
+        cf_api::<serde_json::Value>(
+            token,
+            "PATCH",
+            &format!("/zones/{zone_id}/dns_records/{record_id}"),
+            Some(serde_json::json!({"content": ip, "proxied": true})),
+        )?;
+    } else {
+        cf_api::<serde_json::Value>(
+            token,
+            "POST",
+            &format!("/zones/{zone_id}/dns_records"),
+            Some(
+                serde_json::json!({"type": "A", "name": hostname, "content": ip, "proxied": true}),
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+/// Poll the relay WebSocket endpoint until it responds or timeout is reached.
+async fn poll_relay_ws(url: &str, timeout: std::time::Duration) -> Result<()> {
+    let start = std::time::Instant::now();
+    let interval = std::time::Duration::from_secs(5);
+
+    loop {
+        match tokio_tungstenite::connect_async(url).await {
+            Ok((_ws, _)) => {
+                // Connected successfully — drop closes the connection
+                return Ok(());
+            }
+            Err(_) => {
+                if start.elapsed() >= timeout {
+                    bail!(
+                        "Relay did not respond after {}s. Check that the relay is running on your VPS \
+                         and that DNS has propagated (*.ramcharan.shop).",
+                        timeout.as_secs()
+                    );
+                }
+                print!(".");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                tokio::time::sleep(interval).await;
+            }
+        }
+    }
+}
+
+/// Write SHUNT_TUNNEL_TOKEN (and optionally SHUNT_TUNNEL_SUBDOMAIN) to the
+/// user's shell profile.
+fn write_tunnel_token_to_profile(token: &str, subdomain: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let profile = detect_shell_profile()
+        .context("Could not detect shell profile. Set SHUNT_TUNNEL_TOKEN manually.")?;
+
+    let token_line = format!("export SHUNT_TUNNEL_TOKEN={token}");
+    let subdomain_line = if subdomain != "shunt" {
+        Some(format!("export SHUNT_TUNNEL_SUBDOMAIN={subdomain}"))
+    } else {
+        None
+    };
+
+    if profile.exists() {
+        let contents = std::fs::read_to_string(&profile)?;
+
+        // Replace existing lines if present
+        if contents.contains("SHUNT_TUNNEL_TOKEN") {
+            let updated: String = contents
+                .lines()
+                .map(|l| {
+                    if l.contains("SHUNT_TUNNEL_TOKEN") && !l.contains("SHUNT_TUNNEL_SUBDOMAIN") {
+                        Some(token_line.as_str())
+                    } else if l.contains("SHUNT_TUNNEL_SUBDOMAIN") {
+                        subdomain_line.as_deref() // None = remove line
+                    } else {
+                        Some(l)
+                    }
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            std::fs::write(&profile, updated)?;
+            println!(
+                "  {} Updated {}",
+                green(CHECK),
+                dim(&profile.display().to_string())
+            );
+            return Ok(());
+        }
+    }
+
+    // Append
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&profile)?;
+    writeln!(f, "\n# Added by shunt live")?;
+    writeln!(f, "{token_line}")?;
+    if let Some(sub_line) = &subdomain_line {
+        writeln!(f, "{sub_line}")?;
+    }
+    println!(
+        "  {} Token saved to {}",
+        green(CHECK),
+        dim(&profile.display().to_string())
+    );
+    Ok(())
+}
+
+async fn cmd_relay_serve(port: u16) -> Result<()> {
+    let token = std::env::var("SHUNT_RELAY_TOKEN").context("SHUNT_RELAY_TOKEN env var required")?;
+    crate::live_relay::run_relay_server(port, token).await
+}
+
+async fn cmd_disconnect() -> Result<()> {
+    print_splash(&[
+        format!(
+            "{}  {}",
+            brand_green("shunt"),
+            dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        ),
+        dim("Disconnecting from remote shunt…").to_string(),
+        String::new(),
+    ]);
+
+    let mut any = false;
+
+    // 1. Shell profile — strip ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY lines
+    //    written by `shunt connect` (remote URLs, not localhost ones).
+    if let Some(profile) = detect_shell_profile() {
+        if let Ok(contents) = std::fs::read_to_string(&profile) {
+            let needs_clean = contents.lines().any(|l| {
+                (l.contains("ANTHROPIC_BASE_URL")
+                    && !l.contains("127.0.0.1")
+                    && !l.contains("localhost"))
+                    || l.contains("ANTHROPIC_API_KEY")
+                    || l.trim() == "# Added by shunt connect"
+            });
+            if needs_clean {
+                let cleaned: String = contents
+                    .lines()
+                    .filter(|l| {
+                        let is_remote_url = l.contains("ANTHROPIC_BASE_URL")
+                            && !l.contains("127.0.0.1")
+                            && !l.contains("localhost");
+                        let is_api_key = l.contains("ANTHROPIC_API_KEY");
+                        let is_comment = l.trim() == "# Added by shunt connect";
+                        !is_remote_url && !is_api_key && !is_comment
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let cleaned = if contents.ends_with('\n') {
+                    format!("{cleaned}\n")
+                } else {
+                    cleaned
+                };
+                std::fs::write(&profile, cleaned)?;
+                println!(
+                    "  {} Removed from {}",
+                    green(CHECK),
+                    dim(&profile.display().to_string())
+                );
+                any = true;
+            }
+        }
+    }
+
+    // 2. ~/.claude/settings.json — remove the env keys written by `shunt connect`.
+    let home = dirs::home_dir().context("Cannot find home directory")?;
+    let settings_path = home.join(".claude").join("settings.json");
+    if settings_path.exists() {
+        let text = std::fs::read_to_string(&settings_path)?;
+        let mut root: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Object(Default::default()));
+        let mut changed = false;
+        if let Some(env_obj) = root.get_mut("env").and_then(|e| e.as_object_mut()) {
+            // Only remove ANTHROPIC_BASE_URL if it points at a remote host
+            if let Some(url) = env_obj.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()) {
+                if !url.contains("127.0.0.1") && !url.contains("localhost") {
+                    env_obj.remove("ANTHROPIC_BASE_URL");
+                    changed = true;
+                }
+            }
+            if env_obj.remove("ANTHROPIC_API_KEY").is_some() {
+                changed = true;
+            }
+        }
+        if changed {
+            std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+            println!(
+                "  {} Removed from {}",
+                green(CHECK),
+                dim(&settings_path.display().to_string())
+            );
+            any = true;
+        }
+    }
+
+    // 3. managed_settings.json — remove remote ANTHROPIC_BASE_URL if present
+    let managed_path = managed_claude_settings_path(&home);
+    if managed_path.exists() {
+        if let Ok(text) = std::fs::read_to_string(&managed_path) {
+            if let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) {
+                let mut changed = false;
+                if let Some(env_obj) = root.get_mut("env").and_then(|e| e.as_object_mut()) {
+                    if let Some(url) = env_obj.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()) {
+                        if !url.contains("127.0.0.1") && !url.contains("localhost") {
+                            env_obj.remove("ANTHROPIC_BASE_URL");
+                            changed = true;
+                        }
+                    }
+                    if env_obj.remove("ANTHROPIC_API_KEY").is_some() {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if let Ok(t) = serde_json::to_string_pretty(&root) {
+                        let _ = std::fs::write(&managed_path, t);
+                        println!(
+                            "  {} Removed from {}",
+                            green(CHECK),
+                            dim(&managed_path.display().to_string())
+                        );
+                        any = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !any {
+        println!(
+            "  {} Nothing to remove — no remote connection found.",
+            dim("·")
+        );
+    }
+
+    println!();
+    println!(
+        "  {} Run {} to clear the current shell session.",
+        dim("·"),
+        cyan("unset ANTHROPIC_BASE_URL ANTHROPIC_API_KEY")
+    );
+    println!();
+    Ok(())
+}
+
+/// Write ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY to a shell profile, replacing
+/// existing entries in-place or appending if absent.
+fn write_connect_vars_to_profile(
+    profile: &std::path::Path,
+    base_url: &str,
+    api_key: &str,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    let url_line = format!("export ANTHROPIC_BASE_URL={base_url}");
+    let key_line = format!("export ANTHROPIC_API_KEY={api_key}");
+
+    if profile.exists() {
+        let contents = std::fs::read_to_string(profile)?;
+        let has_url = contents.contains("ANTHROPIC_BASE_URL");
+        let has_key = contents.contains("ANTHROPIC_API_KEY");
+
+        if has_url || has_key {
+            // Replace in-place
+            let updated: String = contents
+                .lines()
+                .map(|l| {
+                    if l.contains("ANTHROPIC_BASE_URL") {
+                        url_line.as_str()
+                    } else if l.contains("ANTHROPIC_API_KEY") {
+                        key_line.as_str()
+                    } else {
+                        l
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            // Append any var that wasn't already there
+            let mut final_content = updated;
+            if !has_url {
+                final_content.push_str(&format!("{url_line}\n"));
+            }
+            if !has_key {
+                final_content.push_str(&format!("{key_line}\n"));
+            }
+            std::fs::write(profile, &final_content)?;
+            println!(
+                "  {} Updated {} — {}",
+                green(CHECK),
+                dim(&profile.display().to_string()),
+                cyan("ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY")
+            );
+            return Ok(());
+        }
+    }
+
+    // Append both vars
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(profile)?;
+    writeln!(f, "\n# Added by shunt connect")?;
+    writeln!(f, "{url_line}")?;
+    writeln!(f, "{key_line}")?;
+    println!(
+        "  {} Added to {} — {}",
+        green(CHECK),
+        dim(&profile.display().to_string()),
+        cyan("ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY")
+    );
+    Ok(())
+}
+
+/// Write ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY into ~/.claude/settings.json
+/// and the managed-settings policy file under the `env` key (creating if absent).
+/// Both files must be updated so the managed policy (highest priority) does not
+/// shadow the user settings when switching between local and remote shunt.
+fn write_claude_settings(base_url: &str, api_key: &str) -> Result<()> {
+    let home = dirs::home_dir().context("Cannot find home directory")?;
+
+    for settings_path in [
+        home.join(".claude").join("settings.json"),
+        managed_claude_settings_path(&home),
+    ] {
+        let mut root: serde_json::Value = if settings_path.exists() {
+            let text = std::fs::read_to_string(&settings_path)?;
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Object(Default::default()))
+        } else {
+            serde_json::Value::Object(Default::default())
+        };
+
+        let obj = root
+            .as_object_mut()
+            .context("settings root is not an object")?;
+        let env = obj
+            .entry("env")
+            .or_insert(serde_json::Value::Object(Default::default()));
+        let env_obj = env
+            .as_object_mut()
+            .context("settings 'env' is not an object")?;
+        env_obj.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            serde_json::Value::String(base_url.to_string()),
+        );
+        env_obj.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            serde_json::Value::String(api_key.to_string()),
+        );
+
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+    }
+    Ok(())
+}
+
+/// Write `ANTHROPIC_BASE_URL` pointing at the local shunt proxy into
+/// `~/.claude/settings.json` so Claude Code picks it up immediately without
+/// requiring a shell restart.  Only sets the URL — never touches API keys.
+/// Skips if settings.json already has a non-localhost ANTHROPIC_BASE_URL
+/// (i.e. user connected to a remote shunt; don't clobber that).
+fn write_local_claude_settings(port: u16) {
+    let url = format!("http://127.0.0.1:{port}");
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+    let settings_path = home.join(".claude").join("settings.json");
+
+    let mut root: serde_json::Value = if settings_path.exists() {
+        std::fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(serde_json::Value::Object(Default::default()))
+    } else {
+        serde_json::Value::Object(Default::default())
+    };
+
+    // Don't override a remote URL that was set by `shunt connect`.
+    if let Some(existing) = root
+        .get("env")
+        .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+        .and_then(|v| v.as_str())
+    {
+        if !existing.contains("127.0.0.1") && !existing.contains("localhost") {
+            return;
+        }
+    }
+
+    let obj = match root.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    let env = obj
+        .entry("env")
+        .or_insert(serde_json::Value::Object(Default::default()));
+    if let Some(env_obj) = env.as_object_mut() {
+        env_obj.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            serde_json::Value::String(url),
+        );
+    }
+
+    if let Some(parent) = settings_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&root) {
+        if std::fs::write(&settings_path, text).is_ok() {
+            println!(
+                "  {} {} → {}",
+                green(CHECK),
+                cyan("ANTHROPIC_BASE_URL"),
+                dim(&settings_path.display().to_string())
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// managed_settings: highest-priority Claude Code policy file
+// On macOS this sits in ~/Library/Application Support/Claude/managed_settings.json
+// and takes precedence over user settings — Claude Code login cannot clear it.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn managed_claude_settings_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("Library")
+        .join("Application Support")
+        .join("Claude")
+        .join("managed_settings.json")
+}
+#[cfg(not(target_os = "macos"))]
+fn managed_claude_settings_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config")
+        .join("claude")
+        .join("managed_settings.json")
+}
+
+/// Remove ANTHROPIC_BASE_URL from a settings JSON file (user or managed).
+fn remove_from_settings_file(path: &std::path::Path) -> bool {
+    remove_from_settings_file_impl(path, false)
+}
+
+fn remove_from_settings_file_quiet(path: &std::path::Path) -> bool {
+    remove_from_settings_file_impl(path, true)
+}
+
+fn remove_from_settings_file_impl(path: &std::path::Path, quiet: bool) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let removed = if let Some(env) = root.get_mut("env").and_then(|e| e.as_object_mut()) {
+        env.remove("ANTHROPIC_BASE_URL").is_some()
+    } else {
+        false
+    };
+    if removed {
+        if let Ok(t) = serde_json::to_string_pretty(&root) {
+            let _ = std::fs::write(path, t);
+            if !quiet {
+                println!(
+                    "  {} Removed from {}",
+                    green(CHECK),
+                    dim(&path.display().to_string())
+                );
+            }
+        }
+    }
+    removed
+}
+
+/// Write ANTHROPIC_BASE_URL into both settings files without any console output.
+/// Used by the daemon on startup and by the guardian loop.
+fn apply_local_routing_silent(port: u16) {
+    let url = format!("http://127.0.0.1:{port}");
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+    let managed = managed_claude_settings_path(&home);
+
+    for settings_path in [home.join(".claude").join("settings.json"), managed.clone()] {
+        // For user settings.json: only touch if it already exists.
+        // For managed_settings: always create — it survives re-login.
+        if !settings_path.exists() && settings_path != managed {
+            continue;
+        }
+
+        let mut root: serde_json::Value = if settings_path.exists() {
+            std::fs::read_to_string(&settings_path)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or(serde_json::Value::Object(Default::default()))
+        } else {
+            serde_json::Value::Object(Default::default())
+        };
+
+        // Never clobber a remote URL written by `shunt connect` — only touch localhost URLs.
+        if let Some(existing) = root
+            .get("env")
+            .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+            .and_then(|v| v.as_str())
+        {
+            if !existing.contains("127.0.0.1") && !existing.contains("localhost") {
+                continue;
+            }
+        }
+
+        // Skip if already correct to avoid unnecessary writes.
+        let current = root
+            .get("env")
+            .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
+            .and_then(|v| v.as_str());
+        if current == Some(url.as_str()) {
+            continue;
+        }
+
+        let obj = match root.as_object_mut() {
+            Some(o) => o,
+            None => continue,
+        };
+        let env = obj
+            .entry("env")
+            .or_insert(serde_json::Value::Object(Default::default()));
+        if let Some(e) = env.as_object_mut() {
+            e.insert(
+                "ANTHROPIC_BASE_URL".to_string(),
+                serde_json::Value::String(url.clone()),
+            );
+        }
+
+        if let Some(parent) = settings_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(out) = serde_json::to_string_pretty(&root) {
+            let _ = std::fs::write(&settings_path, out);
+        }
+    }
+}
+
+/// Background task: re-inject ANTHROPIC_BASE_URL into ~/.claude/settings.json if a Claude Code
+/// re-login clears it while the shunt daemon is running.
+async fn settings_guardian_loop(port: u16) {
+    let url = format!("http://127.0.0.1:{port}");
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+    let settings_path = home.join(".claude").join("settings.json");
+
+    loop {
+        interval.tick().await;
+        if !settings_path.exists() {
+            continue;
+        }
+
+        let current = std::fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| {
+                v.get("env")?
+                    .get("ANTHROPIC_BASE_URL")?
+                    .as_str()
+                    .map(String::from)
+            });
+
+        if current.as_deref() != Some(url.as_str()) {
+            apply_local_routing_silent(port);
+        }
+    }
+}
+
+fn offer_shell_export(port: u16) -> Result<()> {
+    use std::io::{self, Write};
+
+    let line = format!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}");
+    let line = line.as_str();
+    println!();
+    println!("  For other tools (curl, Python SDK, …), set:");
+    println!("    {}", cyan(line));
+
+    let profile = detect_shell_profile();
+    let prompt = match &profile {
+        Some(p) => format!("  Add to {}? [Y/n]: ", dim(&p.display().to_string())),
+        None => "  Add to your shell profile? [Y/n]: ".into(),
+    };
+
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+
+    if matches!(buf.trim().to_lowercase().as_str(), "n" | "no") {
+        return Ok(());
+    }
+
+    let path = match profile {
+        Some(p) => p,
+        None => {
+            println!(
+                "  {} Could not detect shell profile. Add manually.",
+                dim("·")
+            );
+            return Ok(());
+        }
+    };
+
+    if path.exists() {
+        let contents = std::fs::read_to_string(&path)?;
+        if contents.contains("ANTHROPIC_BASE_URL") {
+            println!(
+                "  {} Already set in {}",
+                CHECK,
+                dim(&path.display().to_string())
+            );
+            return Ok(());
+        }
+    }
+
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    #[allow(unused_imports)]
+    use std::io::Write as _;
+    writeln!(f, "\n# Added by shunt")?;
+    writeln!(f, "{line}")?;
+    println!(
+        "  {} Added to {} — restart shell or: {}",
+        green(CHECK),
+        dim(&path.display().to_string()),
+        cyan(&format!("source {}", path.display()))
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// uninstall
+// ---------------------------------------------------------------------------
+
+async fn cmd_uninstall() -> Result<()> {
+    use std::io::Write as _;
+
+    // ── Collect what exists ───────────────────────────────────────────────────
+    let config_dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("shunt");
+
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("shunt");
+
+    let exe = std::env::current_exe().ok();
+
+    // Shell profile line to remove
+    let shell_profile = detect_shell_profile();
+    let profile_contents = shell_profile
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let profile_has_export = profile_contents
+        .as_ref()
+        .map(|s| {
+            s.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:")
+                || s.contains("ANTHROPIC_BASE_URL=http://localhost:")
+        })
+        .unwrap_or(false);
+    let profile_has_tunnel = profile_contents
+        .as_ref()
+        .map(|s| s.contains("SHUNT_TUNNEL_TOKEN"))
+        .unwrap_or(false);
+
+    let uninstall_home = dirs::home_dir();
+    let user_settings_has_shunt = uninstall_home
+        .as_ref()
+        .map(|h| {
+            let p = h.join(".claude").join("settings.json");
+            std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| {
+                    v.get("env")?
+                        .get("ANTHROPIC_BASE_URL")?
+                        .as_str()
+                        .map(|u| u.contains("127.0.0.1") || u.contains("localhost"))
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let managed_settings_has_shunt = uninstall_home
+        .as_ref()
+        .map(|h| {
+            let p = managed_claude_settings_path(h);
+            std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| {
+                    v.get("env")?
+                        .get("ANTHROPIC_BASE_URL")?
+                        .as_str()
+                        .map(|u| u.contains("127.0.0.1") || u.contains("localhost"))
+                })
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+
+    #[cfg(target_os = "macos")]
+    let service_plist = {
+        let p = service_plist_path();
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let service_plist: Option<PathBuf> = None;
+
+    #[cfg(target_os = "linux")]
+    let service_unit = {
+        let p = service_unit_path();
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let service_unit: Option<PathBuf> = None;
+
+    // ── Show plan ─────────────────────────────────────────────────────────────
+    print_splash(&[
+        format!(
+            "{}  {}",
+            brand_green("shunt"),
+            dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        ),
+        red("Uninstall").to_string(),
+        String::new(),
+    ]);
+
+    println!("  This will permanently remove:");
+    println!();
+
+    if service_plist.is_some() || service_unit.is_some() {
+        println!("  {}  Stop and unregister login service", red("✕"));
+    }
+
+    if config_dir.exists() {
+        println!(
+            "  {}  {} {}",
+            red("✕"),
+            dim("delete"),
+            cyan(&config_dir.display().to_string())
+        );
+    }
+    if data_dir.exists() && data_dir != config_dir {
+        println!(
+            "  {}  {} {}",
+            red("✕"),
+            dim("delete"),
+            cyan(&data_dir.display().to_string())
+        );
+    }
+    if let Some(ref p) = shell_profile {
+        if profile_has_export {
+            println!(
+                "  {}  {} ANTHROPIC_BASE_URL from {}",
+                red("✕"),
+                dim("remove"),
+                cyan(&p.display().to_string())
+            );
+        }
+        if profile_has_tunnel {
+            println!(
+                "  {}  {} SHUNT_TUNNEL_TOKEN from {}",
+                red("✕"),
+                dim("remove"),
+                cyan(&p.display().to_string())
+            );
+        }
+    }
+    if user_settings_has_shunt {
+        if let Some(ref h) = uninstall_home {
+            println!(
+                "  {}  {} ANTHROPIC_BASE_URL from {}",
+                red("✕"),
+                dim("remove"),
+                cyan(
+                    &h.join(".claude")
+                        .join("settings.json")
+                        .display()
+                        .to_string()
+                )
+            );
+        }
+    }
+    if managed_settings_has_shunt {
+        if let Some(ref h) = uninstall_home {
+            println!(
+                "  {}  {} ANTHROPIC_BASE_URL from {}",
+                red("✕"),
+                dim("remove"),
+                cyan(&managed_claude_settings_path(h).display().to_string())
+            );
+        }
+    }
+    if let Some(ref exe_path) = exe {
+        println!(
+            "  {}  {} {}",
+            red("✕"),
+            dim("delete"),
+            cyan(&exe_path.display().to_string())
+        );
+    }
+
+    println!();
+
+    // ── Reconfirm ─────────────────────────────────────────────────────────────
+    if !term::confirm("Are you sure you want to completely uninstall shunt?") {
+        println!("  {} Cancelled.", dim("·"));
+        println!();
+        return Ok(());
+    }
+
+    // Second confirmation — type "uninstall"
+    println!();
+    print!("  {} Type {} to confirm: ", dim("·"), bold("uninstall"));
+    std::io::stdout().flush()?;
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf)?;
+    if buf.trim() != "uninstall" {
+        println!("  {} Cancelled.", dim("·"));
+        println!();
+        return Ok(());
+    }
+
+    println!();
+
+    // ── Execute ───────────────────────────────────────────────────────────────
+
+    // 0. Stop the running daemon FIRST — its settings_guardian_loop re-injects
+    //    ANTHROPIC_BASE_URL every 5s, so we must kill it before cleaning settings.
+    cmd_stop_impl(true).await?;
+    println!("  {} Daemon stopped", green(CHECK));
+
+    // 1. Stop + unregister service
+    #[cfg(target_os = "macos")]
+    if let Some(ref p) = service_plist {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &p.display().to_string()])
+            .output();
+        let _ = std::fs::remove_file(p);
+        println!("  {} Login service removed", green(CHECK));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ref p) = service_unit {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", "shunt"])
+            .output();
+        let _ = std::fs::remove_file(p);
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output();
+        println!("  {} Login service removed", green(CHECK));
+    }
+
+    // 2. Config + credentials dir
+    if config_dir.exists() {
+        std::fs::remove_dir_all(&config_dir)
+            .with_context(|| format!("failed to remove {}", config_dir.display()))?;
+        println!(
+            "  {} Config removed  {}",
+            green(CHECK),
+            dim(&config_dir.display().to_string())
+        );
+    }
+
+    // 3. Data dir (logs, state, pid) — skip if same as config_dir (macOS)
+    if data_dir.exists() && data_dir != config_dir {
+        std::fs::remove_dir_all(&data_dir)
+            .with_context(|| format!("failed to remove {}", data_dir.display()))?;
+        println!(
+            "  {} Data removed    {}",
+            green(CHECK),
+            dim(&data_dir.display().to_string())
+        );
+    }
+
+    // 4. Shell profile — strip shunt-related lines
+    if let Some(ref profile_path) = shell_profile {
+        if profile_has_export || profile_has_tunnel {
+            if let Ok(contents) = std::fs::read_to_string(profile_path) {
+                let cleaned: String = contents
+                    .lines()
+                    .filter(|l| {
+                        // ANTHROPIC_BASE_URL pointing at local proxy
+                        !(l.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:")
+                            || l.contains("ANTHROPIC_BASE_URL=http://localhost:"))
+                        // Tunnel token/subdomain from `shunt live` wizard
+                            && !l.contains("SHUNT_TUNNEL_TOKEN")
+                            && !l.contains("SHUNT_TUNNEL_SUBDOMAIN")
+                        // Comment markers
+                            && *l != "# Added by shunt"
+                            && *l != "# Added by shunt live"
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // Preserve trailing newline if original had one
+                let cleaned = if contents.ends_with('\n') {
+                    format!("{cleaned}\n")
+                } else {
+                    cleaned
+                };
+                std::fs::write(profile_path, cleaned)?;
+                println!(
+                    "  {} Shell export removed  {}",
+                    green(CHECK),
+                    dim(&profile_path.display().to_string())
+                );
+            }
+        }
+    }
+
+    // 5. Claude Code settings — remove ANTHROPIC_BASE_URL from user + managed settings
+    if let Some(ref h) = uninstall_home {
+        remove_from_settings_file(&h.join(".claude").join("settings.json"));
+        remove_from_settings_file(&managed_claude_settings_path(h));
+        remove_managed_client_configs(h);
+    }
+
+    // 6. Binary — do this last so error messages can still print
+    if let Some(exe_path) = exe {
+        // Spawn a tiny shell to delete the binary after this process exits
+        let path_str = exe_path.display().to_string();
+        std::process::Command::new("sh")
+            .args(["-c", &format!("sleep 0.3 && rm -f '{path_str}'")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+        println!(
+            "  {} Binary removed   {}",
+            green(CHECK),
+            dim(&exe_path.display().to_string())
+        );
+    }
+
+    println!();
+    println!("  {} shunt fully removed.", green(CHECK));
+    // Only hint if the variable is actually set in this shell session.
+    if std::env::var("ANTHROPIC_BASE_URL").is_ok() {
+        println!(
+            "  {} Run {} to clear the proxy from this shell session.",
+            dim("·"),
+            cyan("unset ANTHROPIC_BASE_URL")
+        );
+    }
+    // If the user ever ran `shunt live`/`shunt share`, Cloudflare DNS records may
+    // remain — we can't delete them without their API token, so warn instead.
+    if profile_has_tunnel {
+        println!();
+        println!(
+            "  {} shunt live created Cloudflare DNS records that were {} removed.",
+            dim("·"),
+            bold("not")
+        );
+        println!(
+            "    {} Delete any leftover {} records in your Cloudflare dashboard.",
+            dim("·"),
+            cyan("*.<your-domain>")
+        );
+    }
+    println!();
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// report
+// ---------------------------------------------------------------------------
+
+async fn cmd_report(config_override: Option<PathBuf>) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    tokio::spawn(crate::telemetry::track_cli_feature("report"));
+
+    let sep = || println!("  {}", dim(&"─".repeat(60)));
+
+    println!();
+    println!(
+        "  {}  {}  {}",
+        brand_green(DIAMOND),
+        bold("shunt report"),
+        dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+    );
+    println!("  {}", dim("Paste this output when reporting an issue."));
+    println!("  {}", dim("Emails and tokens are automatically redacted."));
+    println!();
+
+    // ── environment ─────────────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("environment"));
+    sep();
+    println!("  {:<22} {}", dim("version"), env!("CARGO_PKG_VERSION"));
+    println!("  {:<22} {}", dim("os"), std::env::consts::OS);
+    println!("  {:<22} {}", dim("arch"), std::env::consts::ARCH);
+    let config_p = config_override.clone().unwrap_or_else(config_path);
+    println!("  {:<22} {}", dim("config"), config_p.display());
+    println!("  {:<22} {}", dim("log"), log_path().display());
+
+    // ── accounts ────────────────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("accounts"));
+    sep();
+    match crate::config::load_config(config_override.as_deref()) {
+        Ok(cfg) => {
+            println!("  {:<22} {}", dim("count"), cfg.accounts.len());
+            for (i, acc) in cfg.accounts.iter().enumerate() {
+                let cred_type = match &acc.credential {
+                    Some(crate::credential::Credential::Apikey { .. }) => "api-key",
+                    Some(_) => "oauth",
+                    None => "none",
+                };
+                println!(
+                    "  {}  account-{}   {}   {}",
+                    dim("·"),
+                    i + 1,
+                    acc.provider,
+                    cred_type
+                );
+            }
+        }
+        Err(e) => println!("  {} {}", red(CROSS), e),
+    }
+
+    // ── proxy status ─────────────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("proxy"));
+    sep();
+    let pid_p = pid_path();
+    let running = if pid_p.exists() {
+        let pid_str = std::fs::read_to_string(&pid_p).unwrap_or_default();
+        let pid: u32 = pid_str.trim().parse().unwrap_or(0);
+        let alive = pid > 0 && unsafe { libc::kill(pid as i32, 0) } == 0;
+        if alive {
+            println!("  {:<22} {} (PID {})", dim("status"), green("running"), pid);
+        } else {
+            println!(
+                "  {:<22} {} (stale PID {})",
+                dim("status"),
+                yellow("stale"),
+                pid
+            );
+        }
+        alive
+    } else {
+        println!("  {:<22} {}", dim("status"), red("not running"));
+        false
+    };
+
+    if running {
+        if let Ok(cfg) = crate::config::load_config(config_override.as_deref()) {
+            println!(
+                "  {:<22} {}:{}",
+                dim("port"),
+                cfg.server.host,
+                cfg.server.port
+            );
+            // Try fetching live status
+            let url = format!(
+                "http://{}:{}/status",
+                cfg.server.host, cfg.server.control_port
+            );
+            match reqwest::Client::new()
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    if let Ok(v) = r.json::<serde_json::Value>().await {
+                        if let Some(started_ms) = v["started_ms"].as_u64() {
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .ok()
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let uptime = (now_ms.saturating_sub(started_ms)) / 1000;
+                            let h = uptime / 3600;
+                            let m = (uptime % 3600) / 60;
+                            let s = uptime % 60;
+                            println!("  {:<22} {}h {}m {}s", dim("uptime"), h, m, s);
+                        }
+                        if let Some(reqs) = v["recent_requests"].as_array() {
+                            println!("  {:<22} {} (recent)", dim("requests"), reqs.len());
+                        }
+                        let alltime_usd = v["savings"]["all_time_cost_usd"].as_f64().unwrap_or(0.0);
+                        let today_usd = v["savings"]["today_cost_usd"].as_f64().unwrap_or(0.0);
+                        if alltime_usd > 0.001 {
+                            println!(
+                                "  {:<22} {}",
+                                dim("saved today"),
+                                crate::pricing::fmt_cost(today_usd)
+                            );
+                            println!(
+                                "  {:<22} {}",
+                                dim("saved all time"),
+                                crate::pricing::fmt_cost(alltime_usd)
+                            );
+                        }
+                    }
+                }
+                Ok(r) => println!("  {:<22} HTTP {}", dim("control port"), r.status()),
+                Err(e) => println!("  {:<22} {}", dim("control port"), e),
+            }
+        }
+    }
+
+    // ── routing injection ────────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("routing injection"));
+    sep();
+
+    let home = dirs::home_dir();
+    let paths: Vec<(&str, std::path::PathBuf)> = if let Some(ref h) = home {
+        vec![
+            (
+                "~/.claude/settings.json",
+                h.join(".claude").join("settings.json"),
+            ),
+            ("managed_settings.json", managed_claude_settings_path(h)),
+        ]
+    } else {
+        vec![]
+    };
+
+    for (label, path) in &paths {
+        let url = read_anthropic_base_url_from_file(path);
+        match url.as_deref() {
+            Some(u) => println!("  {:<28} {} = {}", dim(label), green(CHECK), u),
+            None if path.exists() => println!("  {:<28} {} not set", dim(label), dim("·")),
+            None => println!("  {:<28} {} file not found", dim(label), dim("·")),
+        }
+    }
+
+    let shell_val = std::env::var("ANTHROPIC_BASE_URL").ok();
+    match shell_val.as_deref() {
+        Some(v) => println!(
+            "  {:<28} {} = {}",
+            dim("shell $ANTHROPIC_BASE_URL"),
+            green(CHECK),
+            v
+        ),
+        None => println!(
+            "  {:<28} {} not set",
+            dim("shell $ANTHROPIC_BASE_URL"),
+            dim("·")
+        ),
+    }
+
+    // ── notification log ─────────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("last 50 notification triggers"));
+    sep();
+    let notify_log = crate::config::notify_log_path();
+    if notify_log.exists() {
+        let file = std::fs::File::open(&notify_log)?;
+        let reader = BufReader::new(file);
+        let mut ring: std::collections::VecDeque<String> =
+            std::collections::VecDeque::with_capacity(51);
+        for line in reader.lines().flatten() {
+            if ring.len() >= 50 {
+                ring.pop_front();
+            }
+            ring.push_back(line);
+        }
+        for l in &ring {
+            println!("  {l}");
+        }
+    } else {
+        println!(
+            "  {} no notification log found ({})",
+            dim("·"),
+            notify_log.display()
+        );
+    }
+
+    // ── last 100 log lines ───────────────────────────────────────────────
+    sep();
+    println!("  {} {}", dim("·"), bold("last 100 log lines  (redacted)"));
+    sep();
+    let log = log_path();
+    if log.exists() {
+        let file = std::fs::File::open(&log)?;
+        let reader = BufReader::new(file);
+        let mut ring: std::collections::VecDeque<String> =
+            std::collections::VecDeque::with_capacity(101);
+        for line in reader.lines().flatten() {
+            if ring.len() >= 100 {
+                ring.pop_front();
+            }
+            ring.push_back(redact_log_line(&line));
+        }
+        for l in &ring {
+            println!("  {l}");
+        }
+    } else {
+        println!("  {} no log file found", dim("·"));
+    }
+
+    sep();
+    println!();
+    Ok(())
+}
+
+/// Read ANTHROPIC_BASE_URL from the `env` key in a Claude settings JSON file.
+fn read_anthropic_base_url_from_file(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    v["env"]["ANTHROPIC_BASE_URL"]
+        .as_str()
+        .map(|s| s.to_owned())
+}
+
+/// Redact email addresses and long tokens from a log line, and strip ANSI codes.
+fn redact_log_line(line: &str) -> String {
+    let clean = strip_ansi(line);
+    // Redact email addresses: anything@anything.anything
+    let re_email = regex::Regex::new(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}").unwrap();
+    let s = re_email.replace_all(&clean, "[email]");
+    // Redact long base64/hex strings that look like tokens (≥40 chars to avoid short IDs)
+    let re_token = regex::Regex::new(r"[A-Za-z0-9+/\-_]{40,}={0,2}").unwrap();
+    let s = re_token.replace_all(&s, "[token]");
+    s.into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// service
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn service_plist_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("Library/LaunchAgents/sh.shunt.proxy.plist")
+}
+
+#[cfg(target_os = "linux")]
+fn service_unit_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".config/systemd/user/shunt.service")
+}
+
+/// Write the platform service file and enable it to run at login.
+/// Write the platform service file and attempt to activate it.
+/// Returns `true` if the service was successfully loaded/started by the init
+/// system, `false` if the plist/unit was written but activation was skipped
+/// or timed out (e.g. SSH session without a GUI bootstrap context).
+fn register_service() -> Result<bool> {
+    let exe = std::env::current_exe().context("cannot locate current executable")?;
+    let exe_str = exe.display().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = service_plist_path();
+        let plist_was_present = plist_path.exists();
+        if let Some(parent) = plist_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>sh.shunt.proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe_str}</string>
+    <string>start</string>
+    <string>--foreground</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{home}/Library/Logs/shunt.log</string>
+  <key>StandardErrorPath</key>
+  <string>{home}/Library/Logs/shunt.log</string>
+</dict>
+</plist>
+"#,
+            exe_str = exe_str,
+            home = dirs::home_dir().unwrap_or_default().display(),
+        );
+        std::fs::write(&plist_path, &plist)?;
+
+        // launchctl hangs in SSH sessions without a GUI bootstrap context.
+        // Wrap both unload and load in threads with timeouts.
+        let plist_str = plist_path.display().to_string();
+
+        // Unload only if a plist was already there (i.e. this is a reinstall)
+        if plist_was_present {
+            let p = plist_str.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["unload", &p])
+                    .output();
+                let _ = tx.send(());
+            });
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(4));
+        }
+
+        // Load
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ok = std::process::Command::new("launchctl")
+                .args(["load", "-w", &plist_str])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            let _ = tx.send(ok);
+        });
+
+        let loaded = rx
+            .recv_timeout(std::time::Duration::from_secs(4))
+            .unwrap_or(false);
+
+        return Ok(loaded);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit_path = service_unit_path();
+        if let Some(parent) = unit_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let unit = format!(
+            "[Unit]\nDescription=shunt Claude Code proxy\nAfter=network.target\n\n\
+             [Service]\nExecStart={exe_str} start --foreground\nRestart=always\nRestartSec=5\n\n\
+             [Install]\nWantedBy=default.target\n"
+        );
+        std::fs::write(&unit_path, &unit)?;
+
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output();
+
+        let out = std::process::Command::new("systemctl")
+            .args(["--user", "enable", "--now", "shunt"])
+            .output()
+            .context("failed to run systemctl")?;
+
+        return Ok(out.status.success());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    bail!("Service management is only supported on macOS and Linux.");
+
+    #[allow(unreachable_code)]
+    Ok(false)
+}
+
+async fn cmd_service_install() -> Result<()> {
+    print_splash(&[
+        format!(
+            "{}  {}",
+            brand_green("shunt"),
+            dim(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        ),
+        dim("Service install"),
+        String::new(),
+    ]);
+
+    // 1. Ensure config + credentials exist.
+    //    If stdin is not a TTY (e.g. curl | sh), skip interactive setup to
+    //    avoid blocking on keychain/OAuth. The service is still registered and
+    //    the proxy started; user runs `shunt setup` in a terminal to finish.
+    let config_p = config_path();
+    let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
+    if !config_p.exists() {
+        if stdin_is_tty {
+            cmd_setup_auto(None).await?;
+        } else {
+            println!(
+                "  {} No config — run {} in a terminal to import credentials",
+                yellow("·"),
+                cyan("shunt setup")
+            );
+        }
+    }
+
+    // 2. Read port from config for shell export
+    let port = crate::config::load_config(None)
+        .map(|c| c.server.port)
+        .unwrap_or(8082);
+
+    // 3. Register the platform service
+    print!("  {} Registering login service… ", dim("·"));
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+    let service_loaded = register_service()?;
+    if service_loaded {
+        println!("{}", green("done"));
+    } else {
+        println!("{}", dim("skipped (SSH session — activates on next login)"));
+    }
+
+    // 4. If launchd/systemd couldn't activate the service (e.g. SSH session
+    //    without a GUI bootstrap context), start the proxy directly.
+    if !service_loaded {
+        print!("  {} Starting proxy… ", dim("·"));
+        std::io::stdout().flush().ok();
+        let exe = std::env::current_exe().context("cannot locate current executable")?;
+        let _ = std::process::Command::new(&exe)
+            .args(["start", "--daemon"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    // 5. Write shell export silently
+    auto_write_shell_export(port);
+
+    // 6. Wait for proxy to be healthy
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let config = crate::config::load_config(None).ok();
+    let host = config
+        .as_ref()
+        .map(|c| c.server.host.clone())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let running = wait_for_health(&host, port, 8).await;
+    if !service_loaded {
+        println!(
+            "{}",
+            if running {
+                green("done").to_string()
+            } else {
+                dim("starting…").to_string()
+            }
+        );
+    }
+
+    println!();
+    if running {
+        println!(
+            "  {}  {}  {}",
+            green(DOT),
+            green_bold("proxy running"),
+            cyan(&format!("http://{host}:{port}"))
+        );
+    } else {
+        println!(
+            "  {}  {} — proxy starting in background",
+            yellow(DOT),
+            yellow("starting")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    if service_loaded {
+        println!(
+            "  {}  LaunchAgent registered — starts automatically at login",
+            green(CHECK)
+        );
+    } else {
+        println!(
+            "  {}  LaunchAgent written — will activate on next login",
+            yellow("·")
+        );
+        println!(
+            "  {}  To activate now (in a GUI session): {}",
+            dim("·"),
+            cyan("launchctl load -w ~/Library/LaunchAgents/sh.shunt.proxy.plist")
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if service_loaded {
+        println!(
+            "  {}  systemd user unit registered — starts automatically at login",
+            green(CHECK)
+        );
+    } else {
+        println!(
+            "  {}  systemd unit written — run {} to activate",
+            yellow("·"),
+            cyan("systemctl --user enable --now shunt")
+        );
+    }
+
+    println!();
+    println!(
+        "  {} To unregister: {}",
+        dim("·"),
+        cyan("shunt service uninstall")
+    );
+    println!();
+
+    Ok(())
+}
+
+async fn cmd_service_uninstall() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = service_plist_path();
+        if plist_path.exists() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &plist_path.display().to_string()])
+                .output();
+            std::fs::remove_file(&plist_path).context("failed to remove plist")?;
+            println!("  {} Service unregistered.", green(CHECK));
+        } else {
+            println!("  {} Service not registered.", dim("·"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit_path = service_unit_path();
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", "shunt"])
+            .output();
+        if unit_path.exists() {
+            std::fs::remove_file(&unit_path).context("failed to remove unit file")?;
+        }
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output();
+        println!("  {} Service unregistered.", green(CHECK));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    bail!("Service management is only supported on macOS and Linux.");
+
+    println!();
+    Ok(())
+}
+
+async fn cmd_service_status() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = service_plist_path();
+        let registered = plist_path.exists();
+        if registered {
+            println!(
+                "  {} Registered  {}",
+                green(CHECK),
+                dim(&plist_path.display().to_string())
+            );
+        } else {
+            println!(
+                "  {} Not registered (run {})",
+                dim("·"),
+                cyan("shunt service install")
+            );
+        }
+
+        // Check if launchd considers it running
+        let out = std::process::Command::new("launchctl")
+            .args(["list", "sh.shunt.proxy"])
+            .output();
+        let running = out.map(|o| o.status.success()).unwrap_or(false);
+        if running {
+            println!("  {} Running (launchd)", green(DOT));
+        } else {
+            println!("  {} Not running", dim(DOT));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit_path = service_unit_path();
+        let registered = unit_path.exists();
+        if registered {
+            println!(
+                "  {} Registered  {}",
+                green(CHECK),
+                dim(&unit_path.display().to_string())
+            );
+        } else {
+            println!(
+                "  {} Not registered (run {})",
+                dim("·"),
+                cyan("shunt service install")
+            );
+        }
+
+        let out = std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "shunt"])
+            .output();
+        let active = out.map(|o| o.status.success()).unwrap_or(false);
+        if active {
+            println!("  {} Running (systemd)", green(DOT));
+        } else {
+            println!("  {} Not running", dim(DOT));
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    println!(
+        "  {} Service management is only supported on macOS and Linux.",
+        dim("·")
+    );
+
+    println!();
+    Ok(())
+}
+
+fn detect_shell_profile() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    if let Ok(shell) = std::env::var("SHELL") {
+        if shell.contains("zsh") {
+            return Some(home.join(".zshrc"));
+        }
+        if shell.contains("fish") {
+            return Some(home.join(".config/fish/config.fish"));
+        }
+        if shell.contains("bash") {
+            let p = home.join(".bash_profile");
+            return Some(if p.exists() { p } else { home.join(".bashrc") });
+        }
+    }
+    for f in &[".zshrc", ".bashrc", ".bash_profile"] {
+        let p = home.join(f);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_CONFIG: &str = r#"
+[server]
+port = 8082
+
+[[accounts]]
+name = "alice"
+plan_type = "pro"
+
+[[accounts]]
+name = "bob"
+plan_type = "max"
+
+[[accounts]]
+name = "charlie"
+plan_type = "pro"
+"#;
+
+    #[test]
+    fn test_remove_account_block_removes_target() {
+        let result = remove_account_block(SAMPLE_CONFIG, "bob");
+        // bob must be gone
+        assert!(
+            !result.contains("\"bob\"") && !result.contains("'bob'") && !result.contains("bob"),
+            "removed account must not appear: {result}"
+        );
+        // others must remain
+        assert!(result.contains("alice"));
+        assert!(result.contains("charlie"));
+    }
+
+    #[test]
+    fn test_remove_account_block_preserves_others() {
+        let result = remove_account_block(SAMPLE_CONFIG, "alice");
+        assert!(!result.contains("alice"), "alice must be removed");
+        assert!(result.contains("bob"), "bob must remain");
+        assert!(result.contains("charlie"), "charlie must remain");
+    }
+
+    #[test]
+    fn test_remove_account_block_noop_when_not_found() {
+        let result = remove_account_block(SAMPLE_CONFIG, "dave");
+        // All three must still be present
+        assert!(result.contains("alice"));
+        assert!(result.contains("bob"));
+        assert!(result.contains("charlie"));
+    }
+
+    #[test]
+    fn test_remove_account_block_last_account() {
+        let cfg = "[[accounts]]\nname = \"only\"\nplan_type = \"pro\"\n";
+        let result = remove_account_block(cfg, "only");
+        assert!(!result.contains("only"), "sole account must be removed");
+    }
+
+    #[test]
+    fn test_remove_account_block_handles_unparseable_input() {
+        let bad = "not valid [[toml{{ garbage";
+        let result = remove_account_block(bad, "anything");
+        // Must return input unchanged, not panic
+        assert_eq!(result, bad);
+    }
+
+    #[test]
+    fn test_remove_account_block_with_inline_comment() {
+        let cfg = "[[accounts]]\nname = \"alice\" # main account\nplan_type = \"pro\"\n\n[[accounts]]\nname = \"bob\"\nplan_type = \"max\"\n";
+        let result = remove_account_block(cfg, "alice");
+        assert!(!result.contains("alice"));
+        assert!(result.contains("bob"));
+    }
+
+    #[test]
+    fn test_remove_account_block_handles_scoped_v2_pool() {
+        let config = crate::config::config_template(&[("main", "pro"), ("work", "max")]);
+        let result = remove_account_block(&config, "claude/main");
+        assert!(!result.contains("name = \"main\""));
+        assert!(result.contains("name = \"work\""));
+    }
+
+    #[test]
+    fn client_install_and_uninstall_touch_only_managed_entries() {
+        let root = std::env::temp_dir().join(format!("shunt-client-test-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let config_path = root.join("config.toml");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            &config_path,
+            crate::config::config_template(&[("main", "pro")]),
+        )
+        .unwrap();
+        std::fs::write(home.join(".codex/config.toml"), "custom_key = \"keep\"\n").unwrap();
+        std::fs::write(home.join(".claude.json"), r#"{"custom":"keep"}"#).unwrap();
+        let config = crate::config::load_config(Some(&config_path)).unwrap();
+        install_client_configs_into(&config, &home, std::path::Path::new("/usr/local/bin/shunt"))
+            .unwrap();
+        let codex = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        assert!(codex.contains("name = \"Shunt Codex\""));
+        assert!(codex.contains("wire_api = \"responses\""));
+        assert!(codex.contains("custom_key = \"keep\""));
+        let claude = std::fs::read_to_string(home.join(".claude.json")).unwrap();
+        assert!(claude.contains("mcpServers"));
+        remove_managed_client_configs(&home);
+        let codex = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        assert!(codex.contains("custom_key = \"keep\""));
+        assert!(!codex.contains("shunt-codex"));
+        let claude = std::fs::read_to_string(home.join(".claude.json")).unwrap();
+        assert!(claude.contains("\"custom\": \"keep\""));
+        assert!(!claude.contains("mcpServers\": {\n    \"shunt"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
