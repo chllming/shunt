@@ -1291,6 +1291,17 @@ async fn proxy_handler(
                     // Got Anthropic response; client expects OpenAI.
                     translate_response_anthropic_to_openai(response).await
                 };
+                // Classifier lane: canonicalize the verdict grammar. Small
+                // self-hosted models emit sloppy-but-obvious variants
+                // (`[block]no[/block]`, `<block>No</block>`, wrapping prose);
+                // Claude Code's parser fails CLOSED on anything that doesn't
+                // match /<block>(yes|no)\b/i, silently blocking every gated
+                // action. Rewriting here makes the verdict deterministic.
+                let response = if is_classifier {
+                    normalize_classifier_verdict(response).await
+                } else {
+                    response
+                };
                 return Ok(tap_usage(response, &s.state, s.telemetry.as_ref(), s.supabase.as_ref(), &account_name, &account.provider.to_string(), &log_model, req_start_ms, &request_id, &path, tried.len(), is_classifier, trace_id.as_deref().unwrap_or("")).await);
             }
             429 => {
@@ -1582,7 +1593,7 @@ async fn tap_usage(
     let (parts, body) = resp.into_parts();
     let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return Response::from_parts(parts, Body::empty()),
+        Err(_) => return Response::from_parts(parts, axum::body::Body::empty()),
     };
     let (input, output) = quota::extract_usage_from_json(&bytes);
     let duration_ms = now_ms().saturating_sub(req_start_ms);
@@ -2867,6 +2878,109 @@ fn normalize_model_suffix(val: &mut serde_json::Value) -> bool {
 /// system prompt begins "You are a security monitor for autonomous AI coding
 /// agents." The `system` field may be a plain string or an array of content
 /// blocks ({"type":"text","text":...}); check both shapes.
+/// Leniently read an allow/block verdict from classifier model output.
+///
+/// Accepts the canonical `<block>yes|no</block>` plus the sloppy variants a
+/// small self-hosted model actually emits: `[block]no[/block]`, mixed case
+/// (`<block>No</block>`), stray whitespace or quotes after the marker, and a
+/// thinking/prose preamble. Returns Some(true)=block, Some(false)=allow,
+/// None=no recognizable verdict.
+fn lenient_classifier_verdict(text: &str) -> Option<bool> {
+    let lower = text.to_ascii_lowercase();
+    for marker in ["<block>", "[block]", "<block]", "[block>"] {
+        let mut search = lower.as_str();
+        while let Some(idx) = search.find(marker) {
+            let after = search[idx + marker.len()..]
+                .trim_start_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '*' || c == '`');
+            for (word, verdict) in [("yes", true), ("no", false)] {
+                if let Some(rest) = after.strip_prefix(word) {
+                    if !rest.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                        return Some(verdict);
+                    }
+                }
+            }
+            search = &search[idx + marker.len()..];
+        }
+    }
+    None
+}
+
+/// Extract the inner text of a loosely-tagged section like `<category>…</category>`
+/// (or the square-bracket variant), sanitized for re-emission.
+fn lenient_tag_text(text: &str, tag: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for (open, close) in [
+        (format!("<{tag}>"), format!("</{tag}>")),
+        (format!("[{tag}]"), format!("[/{tag}]")),
+    ] {
+        if let Some(start) = lower.find(&open) {
+            let from = start + open.len();
+            let end = lower[from..].find(&close).map(|e| from + e).unwrap_or(text.len());
+            let inner = text[from..end].trim();
+            if !inner.is_empty() {
+                return Some(inner.chars().take(200).collect());
+            }
+        }
+    }
+    None
+}
+
+/// Canonicalize a classifier response body to the exact grammar Claude Code
+/// parses. Claude Code fails CLOSED on unparseable verdicts, so a model that
+/// answered "allow" in a sloppy format would otherwise block the action.
+/// Non-streaming Anthropic-shaped bodies only (the classifier lane is
+/// non-streaming); anything unrecognizable passes through untouched.
+async fn normalize_classifier_verdict(resp: Response<axum::body::Body>) -> Response<axum::body::Body> {
+    if quota::is_streaming_response(&resp) {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return Response::from_parts(parts, axum::body::Body::empty()),
+    };
+    let mut val: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return Response::from_parts(parts, axum::body::Body::from(bytes)),
+    };
+    let text: String = val["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b["type"] == "text")
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let canonical = match lenient_classifier_verdict(&text) {
+        Some(false) => "<block>no</block>".to_owned(),
+        Some(true) => {
+            let category = lenient_tag_text(&text, "category").unwrap_or_else(|| "Policy".to_owned());
+            // <category> must stay letters/digits/spaces for downstream parsing.
+            let category: String = category
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == ' ')
+                .collect();
+            let category = if category.trim().is_empty() { "Policy".to_owned() } else { category };
+            let reason = lenient_tag_text(&text, "reason")
+                .unwrap_or_else(|| format!("[{category}] blocked by classifier"));
+            format!("<block>yes</block><category>{category}</category><reason>{reason}</reason>")
+        }
+        // No verdict found at all — leave the body alone (Claude Code will
+        // fail closed, which is the correct behavior for a broken reply).
+        None => return Response::from_parts(parts, axum::body::Body::from(bytes)),
+    };
+    if text.trim() != canonical {
+        tracing::debug!(raw = %text.chars().take(120).collect::<String>(), %canonical, "normalized classifier verdict");
+    }
+    val["content"] = json!([{ "type": "text", "text": canonical }]);
+    let out = serde_json::to_vec(&val).unwrap_or_else(|_| bytes.to_vec());
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(out))
+}
+
 fn is_safety_classifier(val: &serde_json::Value) -> bool {
     const NEEDLE: &str = "security monitor for autonomous AI coding agents";
     match val.get("system") {
@@ -3224,6 +3338,67 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn lenient_verdict_accepts_sloppy_small_model_output() {
+        // Canonical forms.
+        assert_eq!(lenient_classifier_verdict("<block>no</block>"), Some(false));
+        assert_eq!(lenient_classifier_verdict("<block>yes</block>"), Some(true));
+        // The sloppy variants observed from qwen2.5:7b on the classifier lane.
+        assert_eq!(lenient_classifier_verdict("[block]no[/block]"), Some(false));
+        assert_eq!(lenient_classifier_verdict("[block]no</block>"), Some(false));
+        assert_eq!(lenient_classifier_verdict("<block>No</block>"), Some(false));
+        assert_eq!(lenient_classifier_verdict("<block> no </block>"), Some(false));
+        assert_eq!(lenient_classifier_verdict("Sure — <block>no</block>"), Some(false));
+        assert_eq!(lenient_classifier_verdict("`<block>no</block>`"), Some(false));
+        assert_eq!(lenient_classifier_verdict("[block]Yes[/block] bad"), Some(true));
+        // "noise"/"yesterday" must not match via the word boundary.
+        assert_eq!(lenient_classifier_verdict("<block>noise</block>"), None);
+        assert_eq!(lenient_classifier_verdict("I think this is fine."), None);
+    }
+
+    #[tokio::test]
+    async fn normalize_classifier_verdict_canonicalizes_allow_and_block() {
+        let mk = |text: &str| {
+            Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&json!({
+                        "type": "message",
+                        "content": [{"type": "text", "text": text}]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+        let read = |resp: Response<axum::body::Body>| async {
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            v["content"][0]["text"].as_str().unwrap().to_owned()
+        };
+
+        // Sloppy allow -> exact canonical allow, parseable by Claude Code.
+        let out = read(normalize_classifier_verdict(mk("[block]No</block>")).await).await;
+        assert_eq!(out, "<block>no</block>");
+        assert_eq!(parse_claude_code_verdict(&out), Some(false));
+
+        // Sloppy block keeps category/reason and stays a block.
+        let out = read(
+            normalize_classifier_verdict(mk(
+                "[block]yes[/block][category]Secret Exfiltration[/category][reason][Secret Exfiltration] sends creds off-box[/reason]",
+            ))
+            .await,
+        )
+        .await;
+        assert_eq!(parse_claude_code_verdict(&out), Some(true));
+        assert!(out.contains("<category>Secret Exfiltration</category>"), "category preserved: {out}");
+
+        // Unparseable output is left alone so Claude Code still fails closed.
+        let out = read(normalize_classifier_verdict(mk("cannot decide, sorry")).await).await;
+        assert_eq!(out, "cannot decide, sorry");
+        assert_eq!(parse_claude_code_verdict(&out), None);
     }
 
     #[test]
